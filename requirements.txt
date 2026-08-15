@@ -1,0 +1,9 @@
+torch
+torchvision
+transformers
+sam2
+huggingface_hub
+opencv-python-headless
+pillow
+numpy
+pytest

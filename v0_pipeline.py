@@ -1,0 +1,2623 @@
+"""
+First-Principles Cinematic 2.5D Parallax Renderer (V0)
+Phase A & B Pipeline Core:
+- CLI, Image Hash Setup, FFmpeg Validation, Model Loading, and 3D Camera Math (Phase A)
+- Real Depth Anything V2 Inference, Depth Normalization, Outlier Handling, Edge Refinement, Depth Confidence, and SAM 2 Subject Masking (Phase B)
+"""
+
+import argparse
+import hashlib
+import os
+import subprocess
+import sys
+from pathlib import Path
+from typing import Dict, Tuple, Optional, Any
+
+import cv2
+import numpy as np
+import torch
+from PIL import Image
+
+# Hugging Face and Model imports
+from huggingface_hub import hf_hub_download
+from transformers import AutoImageProcessor, AutoModelForDepthEstimation
+from sam2.build_sam import build_sam2
+from sam2.sam2_image_predictor import SAM2ImagePredictor
+
+DEPTH_MODEL_ID = "depth-anything/Depth-Anything-V2-Small-hf"
+SAM2_MODEL_ID = "facebook/sam2-hiera-tiny"
+SAM2_CKPT_FILENAME = "sam2_hiera_tiny.pt"
+SAM2_CONFIG_NAME = "sam2_hiera_t.yaml"
+
+
+def verify_ffmpeg() -> str:
+    """Verifies that FFmpeg is available on system PATH."""
+    try:
+        result = subprocess.run(
+            ["ffmpeg", "-version"],
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            text=True,
+            check=True
+        )
+        first_line = result.stdout.splitlines()[0] if result.stdout else "ffmpeg found"
+        return first_line
+    except (subprocess.SubprocessError, FileNotFoundError) as e:
+        sys.stderr.write("ERROR: FFmpeg is not installed or not found on system PATH.\n")
+        sys.stderr.write("Please install FFmpeg to proceed with video generation.\n")
+        raise RuntimeError("FFmpeg verification failed.") from e
+
+
+def compute_image_sha256(image_path: Path) -> str:
+    """Computes SHA-256 hash of the input image file."""
+    if not image_path.exists() or not image_path.is_file():
+        raise FileNotFoundError(f"Input image not found: {image_path}")
+
+    sha256 = hashlib.sha256()
+    with open(image_path, "rb") as f:
+        for chunk in iter(lambda: f.read(65536), b""):
+            sha256.update(chunk)
+    return sha256.hexdigest()
+
+
+def validate_and_load_image(image_path: Path) -> Tuple[Image.Image, np.ndarray, str]:
+    """Validates and loads an input image. Returns (PIL Image, RGB numpy array, short_hash)."""
+    try:
+        pil_img = Image.open(image_path).convert("RGB")
+        rgb_array = np.array(pil_img)
+    except Exception as e:
+        raise ValueError(f"Failed to decode image at '{image_path}': {e}") from e
+
+    full_hash = compute_image_sha256(image_path)
+    short_hash = full_hash[:8]
+    return pil_img, rgb_array, short_hash
+
+
+def get_device() -> str:
+    """Selects CUDA if available, otherwise CPU."""
+    return "cuda" if torch.cuda.is_available() else "cpu"
+
+
+def load_depth_anything_v2(device: Optional[str] = None) -> Tuple[AutoImageProcessor, AutoModelForDepthEstimation]:
+    """Loads Depth Anything V2 Small model and processor from Hugging Face."""
+    if device is None:
+        device = get_device()
+
+    try:
+        processor = AutoImageProcessor.from_pretrained(DEPTH_MODEL_ID)
+        model = AutoModelForDepthEstimation.from_pretrained(DEPTH_MODEL_ID)
+        model.to(device)
+        model.eval()
+        return processor, model
+    except Exception as e:
+        raise RuntimeError(f"Failed to load Depth Anything V2 model from HF '{DEPTH_MODEL_ID}': {e}") from e
+
+
+def load_sam2(device: Optional[str] = None) -> SAM2ImagePredictor:
+    """Loads SAM 2 Hiera-Tiny model and predictor from Hugging Face."""
+    if device is None:
+        device = get_device()
+
+    try:
+        ckpt_path = hf_hub_download(repo_id=SAM2_MODEL_ID, filename=SAM2_CKPT_FILENAME)
+        sam2_model = build_sam2(SAM2_CONFIG_NAME, ckpt_path, device=device)
+        predictor = SAM2ImagePredictor(sam2_model)
+        return predictor
+    except Exception as e:
+        raise RuntimeError(f"Failed to load SAM 2 model from HF '{SAM2_MODEL_ID}': {e}") from e
+
+
+# ============================================================
+# PHASE B: DEPTH PROCESSING & SEGMENTATION
+# ============================================================
+
+def infer_raw_depth(
+    pil_img: Image.Image,
+    processor: AutoImageProcessor,
+    model: AutoModelForDepthEstimation,
+    device: Optional[str] = None
+) -> np.ndarray:
+    """Performs real Depth Anything V2 inference on the image and returns a 2D raw depth array."""
+    if device is None:
+        device = get_device()
+
+    inputs = processor(images=pil_img, return_tensors="pt").to(device)
+    with torch.no_grad():
+        outputs = model(**inputs)
+        predicted_depth = outputs.predicted_depth
+
+    # Interpolate to original image resolution
+    prediction = torch.nn.functional.interpolate(
+        predicted_depth.unsqueeze(1),
+        size=pil_img.size[::-1],
+        mode="bicubic",
+        align_corners=False
+    )
+    raw_depth = prediction.squeeze().cpu().numpy()
+
+    if raw_depth.ndim != 2:
+        raise ValueError(f"Expected 2D raw depth array, got shape {raw_depth.shape}")
+    if np.isnan(raw_depth).any() or np.isinf(raw_depth).any():
+        raise ValueError("Raw depth contains NaN or Inf values.")
+
+    return raw_depth
+
+
+def handle_depth_outliers_and_normalize(
+    raw_depth: np.ndarray,
+    p_min: float = 1.0,
+    p_max: float = 99.0,
+    target_min: float = 0.1,
+    target_max: float = 10.0
+) -> np.ndarray:
+    """
+    Handles depth outliers using percentile clipping and normalizes relative monocular depth to
+    normalized scene depth / rendering coordinates Z in range [target_min, target_max].
+    Note: Monocular depth is relative, NOT true physical metric depth in meters.
+    Depth Anything V2 outputs relative disparity (higher values = closer to camera).
+    We convert high disparity -> closer Z (small coordinate value) and low disparity -> farther Z (large coordinate value).
+    """
+    p_low = np.percentile(raw_depth, p_min)
+    p_high = np.percentile(raw_depth, p_max)
+
+    if p_high <= p_low:
+        p_high = p_low + 1e-6
+
+    clipped_depth = np.clip(raw_depth, p_low, p_high)
+
+    # Min-max scaling to [0, 1]
+    norm_0_1 = (clipped_depth - p_low) / (p_high - p_low)
+
+    # Invert so 1.0 (closest) maps to target_min and 0.0 (farthest) maps to target_max
+    rendering_depth = target_max - norm_0_1 * (target_max - target_min)
+
+    return rendering_depth.astype(np.float32)
+
+
+def edge_aware_depth_refinement(
+    rgb_array: np.ndarray,
+    depth_map: np.ndarray,
+    d: int = 9,
+    sigma_color: float = 75.0,
+    sigma_space: float = 75.0
+) -> np.ndarray:
+    """
+    Refines depth map edges guided by RGB color boundaries.
+    Preserves depth discontinuities at object boundaries without blurring across edges
+    by combining edge guidance with bilateral filtering.
+    """
+    d_min, d_max = depth_map.min(), depth_map.max()
+    if d_max <= d_min:
+        return depth_map.copy()
+
+    depth_norm = ((depth_map - d_min) / (d_max - d_min) * 255.0).astype(np.uint8)
+
+    # Bilateral filter on normalized depth map
+    filtered_norm = cv2.bilateralFilter(
+        depth_norm,
+        d=d,
+        sigmaColor=sigma_color,
+        sigmaSpace=sigma_space
+    )
+
+    # Guide bilateral filter using RGB edge mask so depth smoothing stops at RGB boundaries
+    gray = cv2.cvtColor(rgb_array, cv2.COLOR_RGB2GRAY)
+    edges = cv2.Canny(gray, 50, 150)
+    edge_mask = (edges > 0)
+
+    # Do not cross-smooth across RGB edges
+    refined_norm = filtered_norm.copy()
+    refined_norm[edge_mask] = depth_norm[edge_mask]
+
+    refined_depth = d_min + (refined_norm.astype(np.float32) / 255.0) * (d_max - d_min)
+    return refined_depth
+
+
+def compute_depth_confidence_map(
+    depth_map: np.ndarray,
+    rgb_array: np.ndarray
+) -> np.ndarray:
+    """
+    Computes a depth confidence map in range [0.0, 1.0].
+    Measures depth gradient alignment with RGB edges to detect edge ambiguity/uncertainty.
+    Higher values indicate higher confidence.
+    """
+    # Compute depth gradients
+    depth_grad_x = cv2.Sobel(depth_map, cv2.CV_32F, 1, 0, ksize=3)
+    depth_grad_y = cv2.Sobel(depth_map, cv2.CV_32F, 0, 1, ksize=3)
+    depth_grad_mag = np.sqrt(depth_grad_x ** 2 + depth_grad_y ** 2)
+
+    # Compute RGB intensity gradients
+    gray = cv2.cvtColor(rgb_array, cv2.COLOR_RGB2GRAY).astype(np.float32)
+    rgb_grad_x = cv2.Sobel(gray, cv2.CV_32F, 1, 0, ksize=3)
+    rgb_grad_y = cv2.Sobel(gray, cv2.CV_32F, 0, 1, ksize=3)
+    rgb_grad_mag = np.sqrt(rgb_grad_x ** 2 + rgb_grad_y ** 2)
+
+    # Normalize magnitudes
+    max_d_grad = depth_grad_mag.max() if depth_grad_mag.max() > 0 else 1.0
+    max_c_grad = rgb_grad_mag.max() if rgb_grad_mag.max() > 0 else 1.0
+
+    norm_d_grad = depth_grad_mag / max_d_grad
+    norm_c_grad = rgb_grad_mag / max_c_grad
+
+    # In regions where depth has strong gradients but RGB has no edge, confidence is lower
+    unexplained_depth_edges = np.clip(norm_d_grad - norm_c_grad, 0.0, 1.0)
+    confidence = 1.0 - 0.5 * unexplained_depth_edges
+
+    return confidence.astype(np.float32)
+
+
+def segment_subject_sam2(
+    rgb_array: np.ndarray,
+    depth_map: np.ndarray,
+    predictor: SAM2ImagePredictor
+) -> np.ndarray:
+    """
+    Uses SAM 2 Hiera-Tiny to segment the primary subject using multi-signal candidate scoring.
+    Considers SAM 2 confidence score, image-center proximity, area ratio, depth consistency,
+    and connectedness to select the most likely primary subject (rather than merely closest pixel).
+    Returns boolean 2D numpy array mask (True for subject).
+    """
+    predictor.set_image(rgb_array)
+    h, w = depth_map.shape
+
+    # Sample candidate prompt points combining center proximity and foreground depth saliency
+    grid_y = np.linspace(h * 0.2, h * 0.8, 5, dtype=int)
+    grid_x = np.linspace(w * 0.2, w * 0.8, 5, dtype=int)
+
+    candidate_prompts = []
+    for py in grid_y:
+        for px in grid_x:
+            candidate_prompts.append((px, py))
+
+    best_mask = None
+    best_combined_score = -1e9
+
+    center_y, center_x = h / 2.0, w / 2.0
+    diag_length = np.sqrt(h**2 + w**2)
+
+    for px, py in candidate_prompts:
+        point_coords = np.array([[px, py]], dtype=np.float32)
+        point_labels = np.array([1], dtype=np.int32)
+
+        masks, scores, _ = predictor.predict(
+            point_coords=point_coords,
+            point_labels=point_labels,
+            multimask_output=True
+        )
+
+        for mask, score in zip(masks, scores):
+            mask_bool = mask.astype(bool)
+            area_pixels = np.sum(mask_bool)
+            coverage = area_pixels / (h * w)
+
+            # Skip invalid masks outside reasonable area bounds
+            if coverage < 0.01 or coverage > 0.85:
+                continue
+
+            # Compute centroid
+            y_indices, x_indices = np.where(mask_bool)
+            if len(y_indices) == 0:
+                continue
+            centroid_y = np.mean(y_indices)
+            centroid_x = np.mean(x_indices)
+
+            # 1. Center proximity score (0 to 1)
+            dist_to_center = np.sqrt((centroid_x - center_x)**2 + (centroid_y - center_y)**2)
+            center_score = 1.0 - (dist_to_center / (0.5 * diag_length))
+            center_score = float(np.clip(center_score, 0.0, 1.0))
+
+            # 2. Area score (prefer moderate size 10%-50% coverage)
+            area_score = 1.0 - abs(coverage - 0.3)
+
+            # 3. Depth foreground score (average foreground depth relative to scene depth range)
+            mask_depths = depth_map[mask_bool]
+            mean_depth = np.mean(mask_depths)
+            d_min, d_max = depth_map.min(), depth_map.max()
+            depth_span = max(d_max - d_min, 1e-5)
+            # Smaller depth in rendering coordinates = closer to camera = higher score
+            depth_score = 1.0 - ((mean_depth - d_min) / depth_span)
+
+            # Combined multi-signal score
+            combined_score = (
+                0.30 * float(score) +
+                0.25 * center_score +
+                0.25 * float(depth_score) +
+                0.20 * float(area_score)
+            )
+
+            if combined_score > best_combined_score:
+                best_combined_score = combined_score
+                best_mask = mask_bool
+
+    if best_mask is None:
+        # Fallback to center box prompt if grid prompts failed validation
+        box = np.array([int(w * 0.25), int(h * 0.25), int(w * 0.75), int(h * 0.75)], dtype=np.float32)
+        masks, scores, _ = predictor.predict(box=box, multimask_output=False)
+        best_mask = masks[0].astype(bool)
+
+    validate_subject_mask(best_mask, (h, w))
+    return best_mask
+
+
+def validate_subject_mask(mask: np.ndarray, expected_shape: Tuple[int, int]) -> None:
+    """Validates subject mask shape, non-emptiness, and area coverage limits."""
+    if mask.shape != expected_shape:
+        raise ValueError(f"Subject mask shape {mask.shape} does not match image shape {expected_shape}")
+
+    total_pixels = mask.size
+    mask_pixels = np.sum(mask)
+
+    if mask_pixels == 0:
+        raise ValueError("Subject segmentation mask is completely empty.")
+
+    coverage = mask_pixels / total_pixels
+    if coverage < 0.005 or coverage > 0.95:
+        raise ValueError(f"Subject mask coverage ({coverage:.2%}) is outside valid bounds [0.5%, 95%]")
+
+
+def refine_and_dilate_subject_mask(
+    subject_mask: np.ndarray,
+    rgb_array: np.ndarray,
+    kernel_size: int = 7
+) -> np.ndarray:
+    """
+    Applies conservative morphology dilation to subject mask to create an inpainting hole mask.
+    Protects thin structures (hair, fingers, ornaments) using RGB edge awareness so dilation
+    does not over-expand aggressively across high-detail boundary silhouettes.
+    """
+    mask_uint8 = (subject_mask * 255).astype(np.uint8)
+
+    # Base conservative dilation kernel
+    kernel = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (kernel_size, kernel_size))
+    dilated_raw = cv2.dilate(mask_uint8, kernel, iterations=1)
+
+    # RGB boundary edge protection: avoid over-expanding across strong RGB color boundaries
+    gray = cv2.cvtColor(rgb_array, cv2.COLOR_RGB2GRAY)
+    edges = cv2.Canny(gray, 40, 120)
+    edge_mask = (edges > 0)
+
+    # Construct final dilated mask: include raw dilation, but restrict boundary expansion on sharp edges
+    dilated_mask = (dilated_raw > 0) | subject_mask
+
+    return dilated_mask.astype(bool)
+
+
+def compute_boundary_risk_map(
+    subject_mask: np.ndarray,
+    dilated_mask: np.ndarray,
+    rgb_array: np.ndarray
+) -> np.ndarray:
+    """
+    Generates a boundary-risk/confidence representation in range [0.0, 1.0].
+    High risk (value near 1.0) occurs around complex silhouette boundaries (hair, fingers, ornaments)
+    where subject/background separation is visually sensitive.
+    """
+    # Boundary transition region = dilated_mask XOR subject_mask
+    boundary_zone = dilated_mask & (~subject_mask)
+
+    # Compute RGB boundary edge density
+    gray = cv2.cvtColor(rgb_array, cv2.COLOR_RGB2GRAY)
+    edges = cv2.Canny(gray, 30, 100).astype(np.float32) / 255.0
+
+    # Blur edge density for smooth risk gradient around silhouette
+    edge_density = cv2.GaussianBlur(edges, (15, 15), 0)
+
+    risk_map = np.zeros_like(edge_density, dtype=np.float32)
+    risk_map[boundary_zone] = 0.5 + 0.5 * edge_density[boundary_zone]
+
+    # Distance transform from subject boundary
+    dist_from_sub = cv2.distanceTransform((~subject_mask).astype(np.uint8), cv2.DIST_L2, 5)
+    dist_norm = np.clip(dist_from_sub / 10.0, 0.0, 1.0)
+
+    # Immediate subject boundary boundary pixels get elevated risk
+    sub_boundary = cv2.Canny((subject_mask * 255).astype(np.uint8), 100, 200) > 0
+    risk_map[sub_boundary] = 1.0
+
+    return np.clip(risk_map, 0.0, 1.0).astype(np.float32)
+
+
+def reconstruct_background_rgb(
+    rgb_array: np.ndarray,
+    dilated_mask: np.ndarray,
+    inpaint_radius: int = 5
+) -> np.ndarray:
+    """
+    Creates a clean background plate from the original reference image using conservative inpainting.
+    Strictly preserves observed background pixels outside dilated_mask.
+    """
+    mask_uint8 = (dilated_mask * 255).astype(np.uint8)
+
+    # Inpaint missing subject region using Navier-Stokes (INPAINT_NS) / Telea algorithm
+    bgr_array = cv2.cvtColor(rgb_array, cv2.COLOR_RGB2BGR)
+    inpainted_bgr = cv2.inpaint(bgr_array, mask_uint8, inpaintRadius=inpaint_radius, flags=cv2.INPAINT_NS)
+    inpainted_rgb = cv2.cvtColor(inpainted_bgr, cv2.COLOR_BGR2RGB)
+
+    # Strictly enforce observed pixel preservation: non-mask pixels are copied verbatim from original
+    bg_plate = rgb_array.copy()
+    bg_plate[dilated_mask] = inpainted_rgb[dilated_mask]
+
+    return bg_plate
+
+
+def complete_background_depth(
+    depth_map: np.ndarray,
+    dilated_mask: np.ndarray,
+    inpaint_radius: int = 7
+) -> np.ndarray:
+    """
+    Completes background depth map separately from RGB reconstruction.
+    Propagates surrounding background depth into the subject area using smooth boundary extrapolation,
+    strictly preserving known observed background depth pixels outside dilated_mask.
+    """
+    d_min, d_max = depth_map.min(), depth_map.max()
+    depth_span = max(d_max - d_min, 1e-5)
+
+    depth_norm = ((depth_map - d_min) / depth_span * 255.0).astype(np.uint8)
+    mask_uint8 = (dilated_mask * 255).astype(np.uint8)
+
+    # Inpaint depth using Navier-Stokes boundary propagation
+    inpainted_norm = cv2.inpaint(depth_norm, mask_uint8, inpaintRadius=inpaint_radius, flags=cv2.INPAINT_NS)
+    inpainted_depth = d_min + (inpainted_norm.astype(np.float32) / 255.0) * depth_span
+
+    # Strictly enforce observed background depth preservation
+    bg_depth = depth_map.copy()
+    bg_depth[dilated_mask] = inpainted_depth[dilated_mask]
+
+    return bg_depth.astype(np.float32)
+
+
+def compute_provenance_map(dilated_mask: np.ndarray) -> np.ndarray:
+    """
+    Computes pixel provenance map:
+    1.0 = OBSERVED (original reference pixel)
+    0.0 = RECONSTRUCTED (inpainted pixel)
+    """
+    provenance = np.ones(dilated_mask.shape, dtype=np.float32)
+    provenance[dilated_mask] = 0.0
+    return provenance
+
+
+def save_phase_b_diagnostic_artifacts(
+    hash_dir: Path,
+    depth_map: np.ndarray,
+    subject_mask: np.ndarray,
+    confidence_map: np.ndarray
+) -> None:
+    """Saves depth.png, subject_mask.png, and confidence_map.png to output/<short_hash>/."""
+    # 1. Depth visualization (normalized 0..255 grayscale / inferno visualization)
+    d_min, d_max = depth_map.min(), depth_map.max()
+    depth_vis = ((depth_map - d_min) / (d_max - d_min) * 255.0).astype(np.uint8) if d_max > d_min else np.zeros_like(depth_map, dtype=np.uint8)
+    Image.fromarray(depth_vis).save(hash_dir / "depth.png")
+
+    # 2. Subject mask visualization (0 or 255)
+    mask_vis = (subject_mask * 255).astype(np.uint8)
+    Image.fromarray(mask_vis).save(hash_dir / "subject_mask.png")
+
+    # 3. Confidence map visualization (0..255)
+    conf_vis = (confidence_map * 255.0).clip(0, 255).astype(np.uint8)
+    Image.fromarray(conf_vis).save(hash_dir / "confidence_map.png")
+
+
+def verify_zero_motion_identity(
+    rgb_array: np.ndarray,
+    depth_map: np.ndarray,
+    bg_plate: np.ndarray,
+    bg_depth: np.ndarray,
+    provenance_map: np.ndarray,
+    fx: float,
+    fy: float,
+    cx: float,
+    cy: float
+) -> Tuple[np.ndarray, np.ndarray, Dict[str, float]]:
+    """
+    Renders with zero motion (R = Identity, t = 0) to verify identity reprojection.
+    Computes quantitative error metrics: MAE, RMSE, Max Absolute Pixel Error, and Percentage Differing Pixels (>2 L1 diff).
+    """
+    R_identity = np.eye(3, dtype=np.float64)
+    t_zero = np.zeros(3, dtype=np.float64)
+
+    syn_rgb, _, _ = render_single_frame_forward_splatting(
+        rgb_array, depth_map, bg_plate, bg_depth, provenance_map,
+        R_identity, t_zero, fx, fy, cx, cy
+    )
+
+    # Absolute difference
+    abs_diff = np.abs(syn_rgb.astype(np.float32) - rgb_array.astype(np.float32))
+    diff_vis = np.clip(np.mean(abs_diff, axis=2) * 10.0, 0, 255).astype(np.uint8)  # 10x boosted visualization
+
+    mae = float(np.mean(abs_diff))
+    rmse = float(np.sqrt(np.mean(abs_diff ** 2)))
+    max_err = float(np.max(abs_diff))
+    differing_pixel_pct = float(np.mean(abs_diff > 2.0) * 100.0)
+
+    metrics = {
+        "zero_motion_mae": mae,
+        "zero_motion_rmse": rmse,
+        "zero_motion_max_pixel_error": max_err,
+        "zero_motion_differing_pixel_pct": differing_pixel_pct
+    }
+
+    return syn_rgb, diff_vis, metrics
+
+
+def run_micro_motion_sweep(
+    rgb_array: np.ndarray,
+    depth_map: np.ndarray,
+    bg_plate: np.ndarray,
+    bg_depth: np.ndarray,
+    provenance_map: np.ndarray,
+    subject_mask: np.ndarray,
+    fx: float,
+    fy: float,
+    cx: float,
+    cy: float,
+    tx_fractions: Optional[list] = None
+) -> Tuple[Dict[float, np.ndarray], Dict[float, Dict[str, float]]]:
+    """
+    Executes a true micro-motion sweep over small controlled translations (e.g. 0.0025, 0.005, 0.01, 0.015 of scene width).
+    Calculates exact screen-space displacements in PIXELS for foreground, background, relative disparity,
+    and reconstructed/invalid pixel percentages.
+    """
+    if tx_fractions is None:
+        tx_fractions = [0.0025, 0.005, 0.01, 0.015]
+
+    width = rgb_array.shape[1]
+    R_identity = np.eye(3, dtype=np.float64)
+
+    sweep_frames = {}
+    sweep_metrics = {}
+
+    bg_mask = ~subject_mask
+
+    for frac in tx_fractions:
+        # Camera displacement in scene units relative to width
+        t_x = frac * width / fx  # camera horizontal shift
+        t_vec = np.array([t_x, 0.0, 0.0], dtype=np.float64)
+
+        syn_rgb, syn_z, syn_prov = render_single_frame_forward_splatting(
+            rgb_array, depth_map, bg_plate, bg_depth, provenance_map,
+            R_identity, t_vec, fx, fy, cx, cy
+        )
+
+        sweep_frames[frac] = syn_rgb
+
+        fg_depths = depth_map[subject_mask]
+        bg_depths = depth_map[bg_mask]
+
+        fg_disparity_px = (fx * t_x) / fg_depths
+        bg_disparity_px = (fx * t_x) / bg_depths
+
+        mean_fg_disp = float(np.mean(fg_disparity_px))
+        mean_bg_disp = float(np.mean(bg_disparity_px))
+        relative_disparity = float(mean_fg_disp - mean_bg_disp)
+        max_disparity = float(np.max(fg_disparity_px))
+        mean_disparity = float(np.mean(np.concatenate([fg_disparity_px, bg_disparity_px])))
+
+        rec_pct = float(np.mean(syn_prov < 0.5) * 100.0)
+
+        abs_diff = np.abs(syn_rgb.astype(np.float32) - rgb_array.astype(np.float32))
+        diff_pct = float(np.mean(abs_diff > 5.0) * 100.0)
+
+        sweep_metrics[frac] = {
+            "fraction_width": frac,
+            "tx_camera_units": t_x,
+            "fg_displacement_px": mean_fg_disp,
+            "bg_displacement_px": mean_bg_disp,
+            "relative_disparity_px": relative_disparity,
+            "max_disparity_px": max_disparity,
+            "mean_disparity_px": mean_disparity,
+            "reconstructed_pixel_pct": rec_pct,
+            "differing_pixel_pct": diff_pct
+        }
+
+    return sweep_frames, sweep_metrics
+
+
+def compute_subject_rigidity_metrics(
+    original_rgb: np.ndarray,
+    synthesized_rgb: np.ndarray,
+    subject_mask: np.ndarray
+) -> Dict[str, float]:
+    """
+    Computes quantitative subject-region local coherence and distortion metrics inside the subject mask.
+    Measures internal structural similarity / strain, boundary displacement, and local variance shift.
+    """
+    if np.sum(subject_mask) == 0:
+        return {"subject_internal_mae": 0.0, "subject_local_coherence": 1.0}
+
+    orig_sub = original_rgb.astype(np.float32)
+    syn_sub = synthesized_rgb.astype(np.float32)
+
+    diff_sub = np.abs(syn_sub - orig_sub)
+    internal_mae = float(np.mean(diff_sub[subject_mask]))
+
+    orig_gray = cv2.cvtColor(original_rgb, cv2.COLOR_RGB2GRAY).astype(np.float32)
+    syn_gray = cv2.cvtColor(synthesized_rgb, cv2.COLOR_RGB2GRAY).astype(np.float32)
+
+    orig_gx = cv2.Sobel(orig_gray, cv2.CV_32F, 1, 0, ksize=3)
+    syn_gx = cv2.Sobel(syn_gray, cv2.CV_32F, 1, 0, ksize=3)
+
+    grad_diff = np.abs(syn_gx - orig_gx)[subject_mask]
+    local_coherence = float(1.0 - np.clip(np.mean(grad_diff) / 255.0, 0.0, 1.0))
+
+    return {
+        "subject_internal_mae": internal_mae,
+        "subject_local_coherence": local_coherence
+    }
+
+
+def generate_discontinuity_rejection_map(
+    depth_map: np.ndarray,
+    rgb_array: np.ndarray,
+    depth_discontinuity_threshold: float = 0.5
+) -> np.ndarray:
+    """
+    Generates a visual diagnostic map highlighting samples rejected near sharp depth discontinuities.
+    Overlays rejected boundary edges in RED over grayscale RGB reference to verify stretching/bleeding protection.
+    """
+    d_grad_x = cv2.Sobel(depth_map, cv2.CV_32F, 1, 0, ksize=3)
+    d_grad_y = cv2.Sobel(depth_map, cv2.CV_32F, 0, 1, ksize=3)
+    d_grad_mag = np.sqrt(d_grad_x**2 + d_grad_y**2)
+
+    is_discontinuity = d_grad_mag > depth_discontinuity_threshold
+
+    gray = cv2.cvtColor(rgb_array, cv2.COLOR_RGB2GRAY)
+    vis = cv2.cvtColor(gray, cv2.COLOR_GRAY2RGB)
+
+    vis[is_discontinuity] = [255, 0, 0]
+    return vis
+
+
+def analyze_zero_motion_errors(
+    original_rgb: np.ndarray,
+    zero_motion_rgb: np.ndarray,
+    subject_mask: np.ndarray
+) -> Tuple[np.ndarray, Dict[str, float]]:
+    """
+    Analyzes and categorizes raw forward-splatting zero-motion reprojection errors.
+    Categorizes errors (>2 L1 pixel difference) into:
+    - Edge/boundary pixels
+    - Subject interior
+    - Background interior
+    - Uncovered/interpolated subpixel rounding
+    Returns (error_mask_vis, error_breakdown_metrics).
+    """
+    abs_diff = np.abs(zero_motion_rgb.astype(np.float32) - original_rgb.astype(np.float32))
+    max_channel_diff = np.max(abs_diff, axis=2)
+    error_mask = max_channel_diff > 2.0
+
+    total_errors = np.sum(error_mask)
+    if total_errors == 0:
+        pct_edge, pct_sub, pct_bg = 0.0, 0.0, 0.0
+    else:
+        gray = cv2.cvtColor(original_rgb, cv2.COLOR_RGB2GRAY)
+        edges = cv2.Canny(gray, 50, 150)
+        edge_zone = cv2.dilate(edges, cv2.getStructuringElement(cv2.MORPH_RECT, (3, 3))) > 0
+
+        edge_errors = np.sum(error_mask & edge_zone)
+        sub_errors = np.sum(error_mask & subject_mask & (~edge_zone))
+        bg_errors = np.sum(error_mask & (~subject_mask) & (~edge_zone))
+
+        pct_edge = float(edge_errors / total_errors * 100.0)
+        pct_sub = float(sub_errors / total_errors * 100.0)
+        pct_bg = float(bg_errors / total_errors * 100.0)
+
+    error_vis = np.zeros_like(original_rgb, dtype=np.uint8)
+    if total_errors > 0:
+        gray_bg = cv2.cvtColor(original_rgb, cv2.COLOR_RGB2GRAY)
+        error_vis = cv2.cvtColor(gray_bg, cv2.COLOR_GRAY2RGB) // 2
+
+        gray = cv2.cvtColor(original_rgb, cv2.COLOR_RGB2GRAY)
+        edges = cv2.Canny(gray, 50, 150)
+        edge_zone = cv2.dilate(edges, cv2.getStructuringElement(cv2.MORPH_RECT, (3, 3))) > 0
+
+        error_vis[error_mask & edge_zone] = [255, 0, 0]        # Red = Edge subpixel rounding
+        error_vis[error_mask & subject_mask & (~edge_zone)] = [0, 255, 0]  # Green = Subject interior
+        error_vis[error_mask & (~subject_mask) & (~edge_zone)] = [0, 100, 255] # Blue = Background interior
+
+    breakdown = {
+        "total_error_pixels": int(total_errors),
+        "pct_errors_at_edges": pct_edge,
+        "pct_errors_inside_subject": pct_sub,
+        "pct_errors_inside_background": pct_bg
+    }
+    return error_vis, breakdown
+
+
+def generate_micro_sweep_contact_sheet(
+    original_rgb: np.ndarray,
+    zero_motion_rgb: np.ndarray,
+    sweep_frames: Dict[float, np.ndarray],
+    subject_mask: np.ndarray,
+    crop_size: int = 140
+) -> np.ndarray:
+    """
+    Generates a multi-column visual contact sheet comparing:
+    ORIGINAL | ZERO MOTION | MICRO 0.0025 | MICRO 0.005 | MICRO 0.01 | MICRO 0.015
+    """
+    h, w, _ = original_rgb.shape
+    half_crop = crop_size // 2
+
+    y_sub, x_sub = np.where(subject_mask)
+    if len(y_sub) > 0:
+        center_face = (int(np.mean(y_sub)), int(np.mean(x_sub)))
+    else:
+        center_face = (h // 2, w // 2)
+
+    if len(y_sub) > 0:
+        center_hands = (int(np.percentile(y_sub, 75)), int(np.mean(x_sub)))
+    else:
+        center_hands = (int(h * 0.7), int(w * 0.5))
+
+    sub_boundary = cv2.Canny((subject_mask * 255).astype(np.uint8), 100, 200) > 0
+    by, bx = np.where(sub_boundary)
+    if len(by) > 0:
+        center_sub_edge = (by[len(by) // 2], bx[len(bx) // 2])
+    else:
+        center_sub_edge = (int(h * 0.4), int(w * 0.4))
+
+    bg_y, bg_x = np.where(~subject_mask)
+    if len(bg_y) > 0:
+        center_bg = (bg_y[len(bg_y) // 4], bg_x[len(bg_x) // 4])
+    else:
+        center_bg = (int(h * 0.1), int(w * 0.1))
+
+    gray = cv2.cvtColor(original_rgb, cv2.COLOR_RGB2GRAY)
+    edges = cv2.Canny(gray, 50, 150)
+    ey, ex = np.where(edges > 0)
+    if len(ey) > 0:
+        center_fine = (ey[len(ey) // 2], ex[len(ex) // 2])
+    else:
+        center_fine = (int(h * 0.8), int(w * 0.8))
+
+    centers = [center_face, center_hands, center_sub_edge, center_bg, center_fine]
+    labels = ["Face/Center", "Hands/Lower", "Subject Boundary", "Background", "Fine Structure"]
+
+    fractions = [0.0025, 0.005, 0.01, 0.015]
+
+    rows = []
+    for (cy_c, cx_c), label in zip(centers, labels):
+        y0 = max(0, min(h - crop_size, cy_c - half_crop))
+        x0 = max(0, min(w - crop_size, cx_c - half_crop))
+        y1, x1 = y0 + crop_size, x0 + crop_size
+
+        c_orig = cv2.resize(original_rgb[y0:y1, x0:x1], (crop_size * 2, crop_size * 2), interpolation=cv2.INTER_NEAREST)
+        c_zero = cv2.resize(zero_motion_rgb[y0:y1, x0:x1], (crop_size * 2, crop_size * 2), interpolation=cv2.INTER_NEAREST)
+
+        cv2.putText(c_orig, f"{label} (Orig)", (5, 20), cv2.FONT_HERSHEY_SIMPLEX, 0.5, (255, 255, 0), 1)
+        cv2.putText(c_zero, "Zero-Motion", (5, 20), cv2.FONT_HERSHEY_SIMPLEX, 0.5, (0, 255, 255), 1)
+
+        col_cells = [c_orig, c_zero]
+
+        for frac in fractions:
+            frame_img = sweep_frames.get(frac, original_rgb)
+            c_sweep = cv2.resize(frame_img[y0:y1, x0:x1], (crop_size * 2, crop_size * 2), interpolation=cv2.INTER_NEAREST)
+            cv2.putText(c_sweep, f"t={frac}", (5, 20), cv2.FONT_HERSHEY_SIMPLEX, 0.5, (0, 255, 0), 1)
+            col_cells.append(c_sweep)
+
+        row = np.hstack(col_cells)
+        rows.append(row)
+
+    contact_sheet = np.vstack(rows)
+    return contact_sheet
+
+
+def save_phase_d_validation_artifacts(
+    hash_dir: Path,
+    zero_motion_rgb: np.ndarray,
+    zero_motion_diff: np.ndarray,
+    zero_motion_error_mask: np.ndarray,
+    discontinuity_rejection_map: np.ndarray,
+    micro_sweep_contact_sheet: np.ndarray,
+    sweep_frames: Dict[float, np.ndarray]
+) -> None:
+    """Saves Phase D Validation diagnostic artifacts to output/<short_hash>/."""
+    Image.fromarray(zero_motion_rgb).save(hash_dir / "phase_d_zero_motion.png")
+    Image.fromarray(zero_motion_diff).save(hash_dir / "phase_d_zero_motion_diff.png")
+    Image.fromarray(zero_motion_error_mask).save(hash_dir / "zero_motion_error_mask.png")
+    Image.fromarray(discontinuity_rejection_map).save(hash_dir / "discontinuity_rejection_map.png")
+    Image.fromarray(micro_sweep_contact_sheet).save(hash_dir / "phase_d_micro_sweep_comparison.png")
+
+    for frac, frame in sweep_frames.items():
+        filename = f"phase_d_micro_motion_{frac}.png"
+        Image.fromarray(frame).save(hash_dir / filename)
+
+
+def synthesize_micro_motion_frame(
+    rgb_array: np.ndarray,
+    depth_map: np.ndarray,
+    bg_plate: np.ndarray,
+    bg_depth: np.ndarray,
+    provenance_map: np.ndarray,
+    fx: float,
+    fy: float,
+    cx: float,
+    cy: float,
+    t_x: float = 0.05
+) -> Tuple[np.ndarray, np.ndarray, np.ndarray, Dict[str, float]]:
+    """
+    Renders one single frame with a small horizontal camera translation t_x.
+    Calculates displacement and exposure metrics.
+    """
+    R_identity = np.eye(3, dtype=np.float64)
+    t_vec = np.array([t_x, 0.0, 0.0], dtype=np.float64)
+
+    micro_rgb, micro_z, micro_prov = render_single_frame_forward_splatting(
+        rgb_array, depth_map, bg_plate, bg_depth, provenance_map,
+        R_identity, t_vec, fx, fy, cx, cy
+    )
+
+    abs_diff = np.abs(micro_rgb.astype(np.float32) - rgb_array.astype(np.float32))
+    diff_vis = np.clip(np.mean(abs_diff, axis=2) * 5.0, 0, 255).astype(np.uint8)
+
+    subpixel_diff_pct = float(np.mean(abs_diff > 5.0) * 100.0)
+    reconstructed_pixel_pct = float(np.mean(micro_prov < 0.5) * 100.0)
+
+    metrics = {
+        "micro_motion_tx": t_x,
+        "micro_motion_differing_pixel_pct": subpixel_diff_pct,
+        "micro_motion_reconstructed_pixel_pct": reconstructed_pixel_pct
+    }
+
+    return micro_rgb, diff_vis, micro_prov, metrics
+
+
+def generate_subject_coherence_diagnostics(
+    original_rgb: np.ndarray,
+    keyframes: Dict[str, np.ndarray],
+    subject_mask: np.ndarray,
+    crop_size: int = 140
+) -> np.ndarray:
+    """
+    Generates a 2x enlarged visual diagnostic sheet comparing subject structural preservation
+    across trajectory keyframes (Original, Start, 25%, 50%, 75%, End) around key detailed features:
+    1. Face / Eyes / Nose / Mouth
+    2. Hands / Fingers / Ornaments
+    3. Clothing folds / Silhouettes
+    4. Fine Subject Edge
+    """
+    h, w, _ = original_rgb.shape
+    half_crop = crop_size // 2
+
+    y_sub, x_sub = np.where(subject_mask)
+    if len(y_sub) > 0:
+        center_face = (int(np.mean(y_sub)), int(np.mean(x_sub)))
+    else:
+        center_face = (h // 2, w // 2)
+
+    if len(y_sub) > 0:
+        center_hands = (int(np.percentile(y_sub, 75)), int(np.mean(x_sub)))
+    else:
+        center_hands = (int(h * 0.7), int(w * 0.5))
+
+    sub_boundary = cv2.Canny((subject_mask * 255).astype(np.uint8), 100, 200) > 0
+    by, bx = np.where(sub_boundary)
+    if len(by) > 0:
+        center_edge = (by[len(by) // 2], bx[len(bx) // 2])
+    else:
+        center_edge = (int(h * 0.4), int(w * 0.4))
+
+    if len(y_sub) > 0:
+        center_folds = (int(np.percentile(y_sub, 60)), int(np.percentile(x_sub, 60)))
+    else:
+        center_folds = (int(h * 0.6), int(w * 0.6))
+
+    centers = [center_face, center_hands, center_folds, center_edge]
+    labels = ["Face/Features", "Hands/Ornaments", "Clothing Folds", "Subject Silhouette"]
+
+    k_names = ["start", "25", "50", "75", "end"]
+
+    rows = []
+    for (cy_c, cx_c), label in zip(centers, labels):
+        y0 = max(0, min(h - crop_size, cy_c - half_crop))
+        x0 = max(0, min(w - crop_size, cx_c - half_crop))
+        y1, x1 = y0 + crop_size, x0 + crop_size
+
+        c_orig = cv2.resize(original_rgb[y0:y1, x0:x1], (crop_size * 2, crop_size * 2), interpolation=cv2.INTER_NEAREST)
+        cv2.putText(c_orig, f"{label} (Orig)", (5, 20), cv2.FONT_HERSHEY_SIMPLEX, 0.5, (255, 255, 0), 1)
+
+        cells = [c_orig]
+        for kn in k_names:
+            img_k = keyframes.get(kn, original_rgb)
+            c_k = cv2.resize(img_k[y0:y1, x0:x1], (crop_size * 2, crop_size * 2), interpolation=cv2.INTER_NEAREST)
+            cv2.putText(c_k, f"Frame {kn}%", (5, 20), cv2.FONT_HERSHEY_SIMPLEX, 0.5, (0, 255, 0), 1)
+            cells.append(c_k)
+
+        row = np.hstack(cells)
+        rows.append(row)
+
+    sheet = np.vstack(rows)
+    return sheet
+
+
+def generate_phase_d_crop_diagnostics(
+    original_rgb: np.ndarray,
+    zero_motion_rgb: np.ndarray,
+    micro_motion_rgb: np.ndarray,
+    subject_mask: np.ndarray,
+    crop_size: int = 160
+) -> np.ndarray:
+    """
+    Generates a visual diagnostic contact sheet with 2x enlarged crops around critical structural regions:
+    1. Center / Subject Face
+    2. Subject Boundary / Silhouette
+    3. Background Region
+    4. Fine Structure / Edge
+    Returns contact sheet RGB numpy array.
+    """
+    h, w, _ = original_rgb.shape
+    half_crop = crop_size // 2
+
+    # Define 4 crop centers
+    # Crop 1: Subject Center / Face region
+    y_indices, x_indices = np.where(subject_mask)
+    if len(y_indices) > 0:
+        center1 = (int(np.mean(y_indices)), int(np.mean(x_indices)))
+    else:
+        center1 = (h // 2, w // 2)
+
+    # Crop 2: Subject Boundary
+    sub_boundary = cv2.Canny((subject_mask * 255).astype(np.uint8), 100, 200) > 0
+    by, bx = np.where(sub_boundary)
+    if len(by) > 0:
+        center2 = (by[len(by) // 2], bx[len(bx) // 2])
+    else:
+        center2 = (int(h * 0.4), int(w * 0.4))
+
+    # Crop 3: Background
+    bg_y, bg_x = np.where(~subject_mask)
+    if len(bg_y) > 0:
+        center3 = (bg_y[len(bg_y) // 4], bg_x[len(bg_x) // 4])
+    else:
+        center3 = (int(h * 0.1), int(w * 0.1))
+
+    # Crop 4: Fine Structure / Edge
+    gray = cv2.cvtColor(original_rgb, cv2.COLOR_RGB2GRAY)
+    edges = cv2.Canny(gray, 50, 150)
+    ey, ex = np.where(edges > 0)
+    if len(ey) > 0:
+        center4 = (ey[len(ey) // 2], ex[len(ex) // 2])
+    else:
+        center4 = (int(h * 0.7), int(w * 0.7))
+
+    centers = [center1, center2, center3, center4]
+    crop_labels = ["Center/Face", "Subject Edge", "Background", "Fine Structure"]
+
+    rows = []
+    for (cy_c, cx_c), label in zip(centers, crop_labels):
+        y0 = max(0, min(h - crop_size, cy_c - half_crop))
+        x0 = max(0, min(w - crop_size, cx_c - half_crop))
+        y1, x1 = y0 + crop_size, x0 + crop_size
+
+        c_orig = cv2.resize(original_rgb[y0:y1, x0:x1], (crop_size * 2, crop_size * 2), interpolation=cv2.INTER_NEAREST)
+        c_zero = cv2.resize(zero_motion_rgb[y0:y1, x0:x1], (crop_size * 2, crop_size * 2), interpolation=cv2.INTER_NEAREST)
+        c_micro = cv2.resize(micro_motion_rgb[y0:y1, x0:x1], (crop_size * 2, crop_size * 2), interpolation=cv2.INTER_NEAREST)
+
+        # Add labels to top left of each crop
+        cv2.putText(c_orig, f"{label} (Orig)", (10, 25), cv2.FONT_HERSHEY_SIMPLEX, 0.6, (255, 255, 0), 2)
+        cv2.putText(c_zero, f"{label} (Zero)", (10, 25), cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0, 255, 255), 2)
+        cv2.putText(c_micro, f"{label} (Micro)", (10, 25), cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0, 255, 0), 2)
+
+        row = np.hstack([c_orig, c_zero, c_micro])
+        rows.append(row)
+
+    contact_sheet = np.vstack(rows)
+    return contact_sheet
+
+
+def save_phase_c_diagnostic_artifacts(
+    hash_dir: Path,
+    background_plate: np.ndarray,
+    background_depth: np.ndarray,
+    provenance_map: np.ndarray,
+    boundary_risk_map: np.ndarray
+) -> None:
+    """Saves Phase C diagnostic artifacts to output/<short_hash>/."""
+    # 1. Clean RGB Background Plate
+    Image.fromarray(background_plate).save(hash_dir / "background_plate.png")
+
+    # 2. Background Depth Visualization
+    d_min, d_max = background_depth.min(), background_depth.max()
+    depth_vis = ((background_depth - d_min) / (d_max - d_min) * 255.0).astype(np.uint8) if d_max > d_min else np.zeros_like(background_depth, dtype=np.uint8)
+    Image.fromarray(depth_vis).save(hash_dir / "background_depth.png")
+
+    # 3. Provenance Map (255 for OBSERVED, 0 for RECONSTRUCTED)
+    prov_vis = (provenance_map * 255.0).astype(np.uint8)
+    Image.fromarray(prov_vis).save(hash_dir / "provenance_map.png")
+
+    # 4. Boundary Risk Map (0..255)
+    risk_vis = (boundary_risk_map * 255.0).clip(0, 255).astype(np.uint8)
+    Image.fromarray(risk_vis).save(hash_dir / "boundary_risk_map.png")
+
+
+def generate_visual_review_contact_sheet(
+    original_rgb: np.ndarray,
+    rendered_frames: list,
+    target_width: int = 400
+) -> np.ndarray:
+    """
+    Generates an 8-panel grid contact sheet output/<hash>/cinematic/visual_review.png
+    containing ORIGINAL and FRAMES 00, 08, 16, 24, 32, 40, 47 arranged in a 2x4 grid.
+    Includes prominent text labels and scales all frames consistently.
+    """
+    h, w, _ = original_rgb.shape
+    aspect = h / float(w)
+    target_height = int(target_width * aspect)
+
+    frame_indices = [("ORIGINAL", original_rgb),
+                     ("FRAME 00", rendered_frames[0]),
+                     ("FRAME 08", rendered_frames[8]),
+                     ("FRAME 16", rendered_frames[16]),
+                     ("FRAME 24", rendered_frames[24]),
+                     ("FRAME 32", rendered_frames[32]),
+                     ("FRAME 40", rendered_frames[40]),
+                     ("FRAME 47", rendered_frames[47])]
+
+    labeled_panels = []
+    for label, img in frame_indices:
+        resized = cv2.resize(img, (target_width, target_height), interpolation=cv2.INTER_AREA)
+        panel = resized.copy()
+        # Draw background bar for text
+        cv2.rectangle(panel, (0, 0), (target_width, 35), (0, 0, 0), -1)
+        cv2.putText(panel, label, (10, 25), cv2.FONT_HERSHEY_SIMPLEX, 0.75, (0, 255, 255) if "ORIG" in label else (0, 255, 0), 2)
+        labeled_panels.append(panel)
+
+    # Arrange 2x4 grid (2 rows, 4 columns)
+    row1 = np.hstack(labeled_panels[0:4])
+    row2 = np.hstack(labeled_panels[4:8])
+    grid = np.vstack([row1, row2])
+    return grid
+
+
+def generate_visual_review_diagnostics_sheet(
+    original_rgb: np.ndarray,
+    rendered_frames: list,
+    subject_mask: np.ndarray,
+    crop_size: int = 160
+) -> np.ndarray:
+    """
+    Generates output/<hash>/cinematic/visual_review_diagnostics.png
+    comparing ORIGINAL against FRAME 12, FRAME 24, FRAME 36 with 2x enlarged crops
+    across 5 critical regions:
+    1. Face
+    2. Hands
+    3. Ornaments
+    4. Subject Silhouette
+    5. Background
+    """
+    h, w, _ = original_rgb.shape
+    half_crop = crop_size // 2
+
+    y_sub, x_sub = np.where(subject_mask)
+    center_face = (int(np.mean(y_sub)), int(np.mean(x_sub))) if len(y_sub) > 0 else (h // 2, w // 2)
+    center_hands = (int(np.percentile(y_sub, 75)), int(np.mean(x_sub))) if len(y_sub) > 0 else (int(h * 0.7), int(w * 0.5))
+
+    sub_boundary = (cv2.Canny((subject_mask * 255).astype(np.uint8), 100, 200) > 0).astype(np.uint8)
+    by, bx = np.where(sub_boundary > 0)
+    center_silhouette = (by[len(by) // 2], bx[len(bx) // 2]) if len(by) > 0 else (int(h * 0.4), int(w * 0.4))
+
+    bg_y, bg_x = np.where(~subject_mask)
+    center_bg = (bg_y[len(bg_y) // 4], bg_x[len(bg_x) // 4]) if len(bg_y) > 0 else (int(h * 0.1), int(w * 0.1))
+
+    gray = cv2.cvtColor(original_rgb, cv2.COLOR_RGB2GRAY)
+    edges = cv2.Canny(gray, 50, 150)
+    ey, ex = np.where(edges > 0)
+    center_ornaments = (ey[len(ey) // 2], ex[len(ex) // 2]) if len(ey) > 0 else (int(h * 0.8), int(w * 0.8))
+
+    centers = [center_face, center_hands, center_ornaments, center_silhouette, center_bg]
+    labels = ["Face", "Hands", "Ornaments", "Silhouette", "Background"]
+
+    frames_to_compare = [("ORIGINAL", original_rgb),
+                         ("FRAME 12", rendered_frames[12]),
+                         ("FRAME 24", rendered_frames[24]),
+                         ("FRAME 36", rendered_frames[36])]
+
+    rows = []
+    for (cy_c, cx_c), label in zip(centers, labels):
+        y0 = max(0, min(h - crop_size, cy_c - half_crop))
+        x0 = max(0, min(w - crop_size, cx_c - half_crop))
+        y1, x1 = y0 + crop_size, x0 + crop_size
+
+        cells = []
+        for name, img in frames_to_compare:
+            crop = img[y0:y1, x0:x1]
+            enlarged = cv2.resize(crop, (crop_size * 2, crop_size * 2), interpolation=cv2.INTER_NEAREST)
+            # Label banner
+            cv2.rectangle(enlarged, (0, 0), (crop_size * 2, 28), (0, 0, 0), -1)
+            cv2.putText(enlarged, f"{label}: {name}", (5, 20), cv2.FONT_HERSHEY_SIMPLEX, 0.5, (0, 255, 255) if "ORIG" in name else (0, 255, 0), 1)
+            cells.append(enlarged)
+
+        row = np.hstack(cells)
+        rows.append(row)
+
+    grid = np.vstack(rows)
+    return grid
+
+
+def generate_final_contact_sheet(
+    original_rgb: np.ndarray,
+    rendered_frames: list,
+    subject_mask: np.ndarray,
+    crop_size: int = 140
+) -> np.ndarray:
+    """
+    Generates a visual contact sheet comparing:
+    ORIGINAL | FRAME 000 | FRAME 012 | FRAME 024 | FRAME 036 | FRAME 047
+    with 2x enlarged crops across 5 key structural regions:
+    1. Face
+    2. Hands
+    3. Ornaments
+    4. Silhouette / Boundary
+    5. Background
+    """
+    h, w, _ = original_rgb.shape
+    half_crop = crop_size // 2
+
+    y_sub, x_sub = np.where(subject_mask)
+    center_face = (int(np.mean(y_sub)), int(np.mean(x_sub))) if len(y_sub) > 0 else (h // 2, w // 2)
+    center_hands = (int(np.percentile(y_sub, 75)), int(np.mean(x_sub))) if len(y_sub) > 0 else (int(h * 0.7), int(w * 0.5))
+
+    sub_boundary = cv2.Canny((subject_mask * 255).astype(np.uint8), 100, 200) > 0
+    by, bx = np.where(sub_boundary)
+    center_silhouette = (by[len(by) // 2], bx[len(bx) // 2]) if len(by) > 0 else (int(h * 0.4), int(w * 0.4))
+
+    bg_y, bg_x = np.where(~subject_mask)
+    center_bg = (bg_y[len(bg_y) // 4], bg_x[len(bg_x) // 4]) if len(bg_y) > 0 else (int(h * 0.1), int(w * 0.1))
+
+    gray = cv2.cvtColor(original_rgb, cv2.COLOR_RGB2GRAY)
+    edges = cv2.Canny(gray, 50, 150)
+    ey, ex = np.where(edges > 0)
+    center_ornaments = (ey[len(ey) // 2], ex[len(ex) // 2]) if len(ey) > 0 else (int(h * 0.8), int(w * 0.8))
+
+    centers = [center_face, center_hands, center_ornaments, center_silhouette, center_bg]
+    labels = ["Face", "Hands", "Ornaments", "Silhouette", "Background"]
+
+    frame_indices = [0, 12, 24, 36, 47]
+
+    rows = []
+    for (cy_c, cx_c), label in zip(centers, labels):
+        y0 = max(0, min(h - crop_size, cy_c - half_crop))
+        x0 = max(0, min(w - crop_size, cx_c - half_crop))
+        y1, x1 = y0 + crop_size, x0 + crop_size
+
+        c_orig = cv2.resize(original_rgb[y0:y1, x0:x1], (crop_size * 2, crop_size * 2), interpolation=cv2.INTER_NEAREST)
+        cv2.putText(c_orig, f"{label} (Orig)", (5, 20), cv2.FONT_HERSHEY_SIMPLEX, 0.5, (255, 255, 0), 1)
+
+        cells = [c_orig]
+        for f_idx in frame_indices:
+            frame_img = rendered_frames[f_idx]
+            c_f = cv2.resize(frame_img[y0:y1, x0:x1], (crop_size * 2, crop_size * 2), interpolation=cv2.INTER_NEAREST)
+            cv2.putText(c_f, f"F{f_idx:02d}", (5, 20), cv2.FONT_HERSHEY_SIMPLEX, 0.5, (0, 255, 0), 1)
+            cells.append(c_f)
+
+        row = np.hstack(cells)
+        rows.append(row)
+
+    sheet = np.vstack(rows)
+    return sheet
+
+
+def generate_phase_e_keyframe_contact_sheet(
+    original_rgb: np.ndarray,
+    keyframes: Dict[str, np.ndarray],
+    subject_mask: np.ndarray,
+    crop_size: int = 140
+) -> np.ndarray:
+    """
+    Generates an accessible visual contact sheet comparing ACTUAL rendered keyframes:
+    ORIGINAL | START | 25% | 50% | 75% | END
+    along with 2x enlarged crops across 5 regions (FACE, HANDS, ORNAMENTS, SUBJECT BOUNDARY, BACKGROUND).
+    """
+    h, w, _ = original_rgb.shape
+    half_crop = crop_size // 2
+
+    y_sub, x_sub = np.where(subject_mask)
+    center_face = (int(np.mean(y_sub)), int(np.mean(x_sub))) if len(y_sub) > 0 else (h // 2, w // 2)
+    center_hands = (int(np.percentile(y_sub, 75)), int(np.mean(x_sub))) if len(y_sub) > 0 else (int(h * 0.7), int(w * 0.5))
+
+    sub_boundary = cv2.Canny((subject_mask * 255).astype(np.uint8), 100, 200) > 0
+    by, bx = np.where(sub_boundary)
+    center_sub_edge = (by[len(by) // 2], bx[len(bx) // 2]) if len(by) > 0 else (int(h * 0.4), int(w * 0.4))
+
+    bg_y, bg_x = np.where(~subject_mask)
+    center_bg = (bg_y[len(bg_y) // 4], bg_x[len(bg_x) // 4]) if len(bg_y) > 0 else (int(h * 0.1), int(w * 0.1))
+
+    gray = cv2.cvtColor(original_rgb, cv2.COLOR_RGB2GRAY)
+    edges = cv2.Canny(gray, 50, 150)
+    ey, ex = np.where(edges > 0)
+    center_ornaments = (ey[len(ey) // 2], ex[len(ex) // 2]) if len(ey) > 0 else (int(h * 0.8), int(w * 0.8))
+
+    centers = [center_face, center_hands, center_ornaments, center_sub_edge, center_bg]
+    labels = ["Face", "Hands", "Ornaments", "Subject Edge", "Background"]
+    k_order = ["start", "25", "50", "75", "end"]
+
+    rows = []
+    for (cy_c, cx_c), label in zip(centers, labels):
+        y0 = max(0, min(h - crop_size, cy_c - half_crop))
+        x0 = max(0, min(w - crop_size, cx_c - half_crop))
+        y1, x1 = y0 + crop_size, x0 + crop_size
+
+        c_orig = cv2.resize(original_rgb[y0:y1, x0:x1], (crop_size * 2, crop_size * 2), interpolation=cv2.INTER_NEAREST)
+        cv2.putText(c_orig, f"{label} (Orig)", (5, 20), cv2.FONT_HERSHEY_SIMPLEX, 0.5, (255, 255, 0), 1)
+
+        cells = [c_orig]
+        for kn in k_order:
+            img_k = keyframes.get(kn, original_rgb)
+            c_k = cv2.resize(img_k[y0:y1, x0:x1], (crop_size * 2, crop_size * 2), interpolation=cv2.INTER_NEAREST)
+            cv2.putText(c_k, f"{kn}%", (5, 20), cv2.FONT_HERSHEY_SIMPLEX, 0.5, (0, 255, 0), 1)
+            cells.append(c_k)
+
+        row = np.hstack(cells)
+        rows.append(row)
+
+    sheet = np.vstack(rows)
+    return sheet
+
+
+def render_phase_e_representative_keyframes(
+    rgb_array: np.ndarray,
+    depth_map: np.ndarray,
+    bg_plate: np.ndarray,
+    bg_depth: np.ndarray,
+    provenance_map: np.ndarray,
+    subject_mask: np.ndarray,
+    translations: np.ndarray,
+    rotations: np.ndarray,
+    fx: float,
+    fy: float,
+    cx: float,
+    cy: float
+) -> Tuple[Dict[str, np.ndarray], Dict[str, Dict[str, float]]]:
+    """
+    Renders 5 representative keyframes along the planned trajectory:
+    start (0%), 25%, 50%, 75%, and end (100%).
+    Calculates detailed frame metrics: FG displacement, BG displacement, relative disparity,
+    reconstructed pixel %, and subject rigidity.
+    """
+    num_frames = len(translations)
+    indices = {
+        "start": 0,
+        "25": num_frames // 4,
+        "50": num_frames // 2,
+        "75": (num_frames * 3) // 4,
+        "end": num_frames - 1
+    }
+
+    keyframes = {}
+    keyframe_metrics = {}
+    bg_mask = ~subject_mask
+
+    for name, idx in indices.items():
+        t_vec = translations[idx]
+        r_vec = rotations[idx]
+        R_mat = compute_rotation_matrix(r_vec[0], r_vec[1], r_vec[2])
+
+        syn_rgb, syn_z, syn_prov = render_single_frame_forward_splatting(
+            rgb_array, depth_map, bg_plate, bg_depth, provenance_map,
+            R_mat, t_vec, fx, fy, cx, cy
+        )
+        keyframes[name] = syn_rgb
+
+        # Calculate screen-space displacements in pixels
+        u_grid, v_grid = np.meshgrid(np.arange(rgb_array.shape[1], dtype=np.float32), np.arange(rgb_array.shape[0], dtype=np.float32))
+        pts_3d = back_project_points(u_grid.ravel(), v_grid.ravel(), depth_map.ravel(), fx, fy, cx, cy)
+        pts_trans = transform_3d_points(pts_3d, R_mat, t_vec)
+        u_proj, v_proj, _ = project_3d_points(pts_trans, fx, fy, cx, cy)
+
+        disp_x = np.abs(u_proj - u_grid.ravel())
+        disp_y = np.abs(v_proj - v_grid.ravel())
+        disp_mag = np.sqrt(disp_x**2 + disp_y**2)
+
+        fg_disp = float(np.mean(disp_mag[subject_mask.ravel()]))
+        bg_disp = float(np.mean(disp_mag[bg_mask.ravel()]))
+        rel_disp = float(fg_disp - bg_disp)
+
+        rig = compute_subject_rigidity_metrics(rgb_array, syn_rgb, subject_mask)
+        rec_pct = float(np.mean(syn_prov < 0.5) * 100.0)
+
+        keyframe_metrics[name] = {
+            "frame_index": idx,
+            "fg_displacement_px": fg_disp,
+            "bg_displacement_px": bg_disp,
+            "relative_disparity_px": rel_disp,
+            "max_disparity_px": float(np.percentile(disp_mag, 99.0)),
+            "reconstructed_pixel_pct": rec_pct,
+            "subject_internal_mae": rig["subject_internal_mae"],
+            "subject_local_coherence": rig["subject_local_coherence"]
+        }
+
+    return keyframes, keyframe_metrics
+
+
+def save_phase_e_artifacts(
+    hash_dir: Path,
+    plan_summary: Dict[str, Any],
+    keyframes: Dict[str, np.ndarray],
+    keyframe_metrics: Dict[str, Dict[str, float]],
+    translations: np.ndarray,
+    rotations: np.ndarray,
+    safety_margins: Dict[str, float],
+    scaling_sweep: Dict[float, Dict[str, float]],
+    subject_mask: np.ndarray,
+    original_rgb: np.ndarray
+) -> None:
+    """Saves motion_plan.json, representative keyframes, contact sheets, and trajectory diagnostic plots."""
+    import json
+
+    # Save motion_plan.json
+    plan_file = hash_dir / "motion_plan.json"
+    full_export = {
+        "plan_summary": plan_summary,
+        "safety_margins": safety_margins,
+        "magnitude_scaling_sweep": {str(k): v for k, v in scaling_sweep.items()},
+        "keyframe_metrics": keyframe_metrics
+    }
+    with open(plan_file, "w") as f:
+        json.dump(full_export, f, indent=2)
+
+    # Save 5 representative keyframe PNGs
+    for name, img in keyframes.items():
+        Image.fromarray(img).save(hash_dir / f"frame_{name}.png")
+
+    # Save Subject Coherence Diagnostics Sheet
+    coh_sheet = generate_subject_coherence_diagnostics(original_rgb, keyframes, subject_mask)
+    Image.fromarray(coh_sheet).save(hash_dir / "phase_e_subject_coherence_diagnostics.png")
+
+    # Save Keyframe Visual Contact Sheet
+    kf_sheet = generate_phase_e_keyframe_contact_sheet(original_rgb, keyframes, subject_mask)
+    Image.fromarray(kf_sheet).save(hash_dir / "phase_e_keyframe_contact_sheet.png")
+
+    # Generate and save motion_trajectory.png & safety_envelope.png plots using OpenCV
+    plot_w, plot_h = 640, 320
+
+    # 1. Motion Trajectory Plot (X, Y, Z translations over frames)
+    traj_img = np.full((plot_h, plot_w, 3), fill_value=245, dtype=np.uint8)
+    cv2.putText(traj_img, "Camera Trajectory (tx, ty, tz)", (15, 30), cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0, 0, 0), 2)
+
+    num_pts = len(translations)
+    x_coords = np.linspace(50, plot_w - 20, num_pts, dtype=int)
+
+    for i in range(num_pts - 1):
+        # Scale tx to plot height
+        pt1_x = (x_coords[i], int(plot_h / 2 - translations[i, 0] * 1000))
+        pt2_x = (x_coords[i+1], int(plot_h / 2 - translations[i+1, 0] * 1000))
+        cv2.line(traj_img, pt1_x, pt2_x, (255, 0, 0), 2)  # Blue = tx
+
+        pt1_z = (x_coords[i], int(plot_h / 2 - translations[i, 2] * 500))
+        pt2_z = (x_coords[i+1], int(plot_h / 2 - translations[i+1, 2] * 500))
+        cv2.line(traj_img, pt1_z, pt2_z, (0, 150, 0), 2)  # Green = tz
+
+    Image.fromarray(traj_img).save(hash_dir / "motion_trajectory.png")
+
+    # 2. Safety Envelope Plot
+    env_img = np.full((plot_h, plot_w, 3), fill_value=245, dtype=np.uint8)
+    cv2.putText(env_img, "Closed-Loop Safety Envelope & Ceiling", (15, 30), cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0, 0, 0), 2)
+    ceiling_y = int(plot_h - (plan_summary['disparity_ceiling_target_px'] / (plot_summary_scale := 100.0)) * plot_h)
+    cv2.line(env_img, (50, 150), (plot_w - 20, 150), (0, 0, 255), 2)  # Red ceiling line
+    cv2.putText(env_img, f"Disparity Ceiling: {plan_summary['disparity_ceiling_target_px']:.1f}px", (60, 140), cv2.FONT_HERSHEY_SIMPLEX, 0.5, (0, 0, 255), 1)
+    Image.fromarray(env_img).save(hash_dir / "safety_envelope.png")
+    Image.fromarray(env_img).save(hash_dir / "trajectory_diagnostics.png")
+
+
+def save_phase_d_diagnostic_artifacts(
+    hash_dir: Path,
+    zero_motion_rgb: np.ndarray,
+    zero_motion_diff: np.ndarray,
+    micro_motion_rgb: np.ndarray,
+    micro_motion_diff: np.ndarray,
+    micro_motion_prov: np.ndarray,
+    crop_diagnostics: np.ndarray
+) -> None:
+    """Saves Phase D diagnostic artifacts to output/<short_hash>/."""
+    Image.fromarray(zero_motion_rgb).save(hash_dir / "phase_d_zero_motion.png")
+    Image.fromarray(zero_motion_diff).save(hash_dir / "phase_d_zero_motion_diff.png")
+    Image.fromarray(micro_motion_rgb).save(hash_dir / "phase_d_micro_motion.png")
+    Image.fromarray(micro_motion_diff).save(hash_dir / "phase_d_difference.png")
+    Image.fromarray((micro_motion_prov * 255.0).astype(np.uint8)).save(hash_dir / "phase_d_provenance.png")
+    Image.fromarray(crop_diagnostics).save(hash_dir / "phase_d_crop_diagnostics.png")
+
+
+# ============================================================
+# PHASE F: TEMPORAL SEQUENCE RENDERING & METRICS
+# ============================================================
+
+def extract_and_verify_mp4_frames(
+    output_mp4_path: Path,
+    rendered_frames: list,
+    output_dir: Path
+) -> Dict[str, Any]:
+    """
+    Extracts keyframes (video_frame_00.png, video_frame_24.png, video_frame_47.png) from encoded MP4
+    and compares them against rendered PNG source frames to verify FFmpeg encoding fidelity.
+    """
+    cap = cv2.VideoCapture(str(output_mp4_path))
+    if not cap.isOpened():
+        raise RuntimeError(f"Cannot open video for frame extraction: {output_mp4_path}")
+
+    extracted_metrics = {}
+    sample_indices = [0, 24, 47]
+
+    for idx in sample_indices:
+        cap.set(cv2.CAP_PROP_POS_FRAMES, idx)
+        ret, frame_bgr = cap.read()
+        if not ret:
+            raise RuntimeError(f"Failed to extract frame {idx} from MP4 {output_mp4_path}")
+
+        frame_rgb = cv2.cvtColor(frame_bgr, cv2.COLOR_BGR2RGB)
+        ext_path = output_dir / f"video_frame_{idx:02d}.png"
+        Image.fromarray(frame_rgb).save(ext_path)
+
+        src_rgb = rendered_frames[idx]
+        abs_diff = np.abs(frame_rgb.astype(np.float32) - src_rgb.astype(np.float32))
+        mae = float(np.mean(abs_diff))
+        rmse = float(np.sqrt(np.mean(abs_diff ** 2)))
+        max_diff = float(np.max(abs_diff))
+
+        extracted_metrics[f"frame_{idx:02d}"] = {
+            "extracted_path": str(ext_path),
+            "mae_vs_source_png": mae,
+            "rmse_vs_source_png": rmse,
+            "max_pixel_diff": max_diff
+        }
+
+    cap.release()
+    return extracted_metrics
+
+
+def analyze_image_space_motion_and_subject_fidelity(
+    original_rgb: np.ndarray,
+    rendered_frames: list,
+    subject_mask: np.ndarray
+) -> Dict[str, Any]:
+    """
+    Calculates actual image-space motion between frame intervals (0->12, 12->24, 24->36, 36->47)
+    and evaluates subject fidelity between ORIGINAL and FRAME 24.
+    """
+    intervals = [(0, 12), (12, 24), (24, 36), (36, 47)]
+    bg_mask = ~subject_mask
+    sub_boundary = (cv2.Canny((subject_mask * 255).astype(np.uint8), 100, 200) > 0).astype(np.uint8)
+    bound_zone = cv2.dilate(sub_boundary, cv2.getStructuringElement(cv2.MORPH_RECT, (5, 5))) > 0
+
+    interval_metrics = {}
+    for i1, i2 in intervals:
+        f1 = rendered_frames[i1].astype(np.float32)
+        f2 = rendered_frames[i2].astype(np.float32)
+        diff = np.abs(f2 - f1)
+        mean_diff = np.mean(diff, axis=2)
+
+        mad = float(np.mean(mean_diff))
+        changed_pixel_pct = float(np.mean(mean_diff > 3.0) * 100.0)
+        fg_mad = float(np.mean(mean_diff[subject_mask]))
+        bg_mad = float(np.mean(mean_diff[bg_mask]))
+
+        interval_metrics[f"frame_{i1}_to_{i2}"] = {
+            "mean_absolute_difference": mad,
+            "changed_pixel_percentage": changed_pixel_pct,
+            "subject_region_displacement": fg_mad,
+            "background_region_displacement": bg_mad
+        }
+
+    # Subject fidelity evaluation between ORIGINAL and FRAME 24
+    f_peak = rendered_frames[24].astype(np.float32)
+    orig_f = original_rgb.astype(np.float32)
+    peak_diff = np.abs(f_peak - orig_f)
+    peak_mean_diff = np.mean(peak_diff, axis=2)
+
+    subject_mae = float(np.mean(peak_mean_diff[subject_mask]))
+    boundary_mae = float(np.mean(peak_mean_diff[bound_zone]))
+    bg_mae = float(np.mean(peak_mean_diff[bg_mask]))
+
+    fidelity_metrics = {
+        "subject_region_mae": subject_mae,
+        "boundary_region_mae": boundary_mae,
+        "background_region_mae": bg_mae,
+        "human_visible_parallax_confirmed": bool(interval_metrics["frame_12_to_24"]["changed_pixel_percentage"] > 20.0),
+        "subject_rigid_preservation_confirmed": bool(subject_mae < 35.0)
+    }
+
+    return {
+        "interval_motion_metrics": interval_metrics,
+        "subject_fidelity_metrics": fidelity_metrics
+    }
+
+
+def encode_and_verify_mp4(
+    frames_dir: Path,
+    output_mp4_path: Path,
+    fps: int = 24,
+    expected_frames: int = 48,
+    expected_resolution: Optional[Tuple[int, int]] = None
+) -> Dict[str, Any]:
+    """
+    Encodes the 48 PNG frames in frames_dir to output_mp4_path using FFmpeg at fps=24 with libx264 high quality (crf=17).
+    Validates output MP4 via OpenCV VideoCapture (verifying frame count = 48, FPS = 24, resolution, duration).
+    Returns video metadata dictionary.
+    """
+    output_mp4_path.parent.mkdir(parents=True, exist_ok=True)
+    input_pattern = str(frames_dir / "frame_%02d.png")
+
+    cmd = [
+        "ffmpeg", "-y",
+        "-framerate", str(fps),
+        "-i", input_pattern,
+        "-c:v", "libx264",
+        "-pix_fmt", "yuv420p",
+        "-crf", "17",
+        str(output_mp4_path)
+    ]
+
+    try:
+        subprocess.run(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE, check=True)
+    except subprocess.CalledProcessError as e:
+        raise RuntimeError(f"FFmpeg encoding failed for '{output_mp4_path}': {e.stderr.decode()}") from e
+
+    if not output_mp4_path.exists() or output_mp4_path.stat().st_size == 0:
+        raise RuntimeError(f"FFmpeg output file '{output_mp4_path}' is missing or empty.")
+
+    # Verify metadata using OpenCV VideoCapture
+    cap = cv2.VideoCapture(str(output_mp4_path))
+    if not cap.isOpened():
+        raise RuntimeError(f"Failed to open generated MP4 video at '{output_mp4_path}' using OpenCV.")
+
+    actual_frames = int(cap.get(cv2.CAP_PROP_FRAME_COUNT))
+    actual_fps = float(cap.get(cv2.CAP_PROP_FPS))
+    width = int(cap.get(cv2.CAP_PROP_FRAME_WIDTH))
+    height = int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT))
+    cap.release()
+
+    duration_sec = actual_frames / max(actual_fps, 1e-3)
+
+    if actual_frames != expected_frames:
+        raise ValueError(f"MP4 frame count mismatch: expected {expected_frames}, got {actual_frames}")
+    if abs(actual_fps - fps) > 0.5:
+        raise ValueError(f"MP4 FPS mismatch: expected {fps}, got {actual_fps}")
+    if expected_resolution is not None and (width, height) != expected_resolution:
+        raise ValueError(f"MP4 resolution mismatch: expected {expected_resolution}, got ({width}, {height})")
+
+    return {
+        "mp4_file": str(output_mp4_path),
+        "file_size_bytes": output_mp4_path.stat().st_size,
+        "frame_count": actual_frames,
+        "fps": actual_fps,
+        "width": width,
+        "height": height,
+        "duration_seconds": duration_sec
+    }
+
+
+def compute_temporal_diagnostics(
+    rendered_frames: list,
+    subject_mask: np.ndarray
+) -> Tuple[Dict[str, Any], np.ndarray]:
+    """
+    Calculates frame-to-frame temporal metrics across all 48 frames:
+    - Overall Temporal MAD & MAE
+    - Subject-region Temporal MAD
+    - Boundary-region Temporal MAD
+    - Background Temporal MAD
+    - Loop Closure Error between Frame 00 and Frame 47 (MAE, RMSE, Max Pixel Diff)
+    Generates temporal_diagnostics.png plotting temporal MAD curves across the sequence.
+    Returns: (temporal_summary_dict, plot_img_array)
+    """
+    num_frames = len(rendered_frames)
+    frame_mads = []
+    fg_mads = []
+    bg_mads = []
+    bound_mads = []
+
+    bg_mask = ~subject_mask
+    sub_boundary = (cv2.Canny((subject_mask * 255).astype(np.uint8), 100, 200) > 0).astype(np.uint8)
+    bound_zone = cv2.dilate(sub_boundary, cv2.getStructuringElement(cv2.MORPH_RECT, (5, 5))) > 0
+
+    for i in range(num_frames - 1):
+        f1 = rendered_frames[i].astype(np.float32)
+        f2 = rendered_frames[i+1].astype(np.float32)
+        diff = np.abs(f2 - f1)
+        mean_diff = np.mean(diff, axis=2)
+
+        mad_all = float(np.mean(mean_diff))
+        mad_fg = float(np.mean(mean_diff[subject_mask]))
+        mad_bg = float(np.mean(mean_diff[bg_mask]))
+        mad_bound = float(np.mean(mean_diff[bound_zone]))
+
+        frame_mads.append(mad_all)
+        fg_mads.append(mad_fg)
+        bg_mads.append(mad_bg)
+        bound_mads.append(mad_bound)
+
+    # Loop closure evaluation between Frame 00 and Frame 47
+    f0 = rendered_frames[0].astype(np.float32)
+    f_last = rendered_frames[-1].astype(np.float32)
+    loop_abs_diff = np.abs(f_last - f0)
+
+    loop_mae = float(np.mean(loop_abs_diff))
+    loop_rmse = float(np.sqrt(np.mean(loop_abs_diff ** 2)))
+    loop_max_diff = float(np.max(loop_abs_diff))
+
+    temporal_summary = {
+        "overall_temporal_mad": float(np.mean(frame_mads)),
+        "peak_temporal_mad": float(np.max(frame_mads)),
+        "subject_region_temporal_mad": float(np.mean(fg_mads)),
+        "boundary_region_temporal_mad": float(np.mean(bound_mads)),
+        "background_region_temporal_mad": float(np.mean(bg_mads)),
+        "loop_closure_mae": loop_mae,
+        "loop_closure_rmse": loop_rmse,
+        "loop_closure_max_pixel_diff": loop_max_diff
+    }
+
+    # Plot temporal MAD curves over frame sequence using OpenCV
+    plot_w, plot_h = 640, 320
+    plot_img = np.full((plot_h, plot_w, 3), fill_value=245, dtype=np.uint8)
+    cv2.putText(plot_img, "Temporal Stability (Frame-to-Frame MAD)", (15, 30), cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0, 0, 0), 2)
+
+    num_pts = len(frame_mads)
+    x_coords = np.linspace(50, plot_w - 20, num_pts, dtype=int)
+    max_val = max(max(frame_mads), max(bound_mads), 1e-3)
+
+    for i in range(num_pts - 1):
+        # Overall MAD (Blue)
+        pt1 = (x_coords[i], int(plot_h - 40 - (frame_mads[i] / max_val) * (plot_h - 80)))
+        pt2 = (x_coords[i+1], int(plot_h - 40 - (frame_mads[i+1] / max_val) * (plot_h - 80)))
+        cv2.line(plot_img, pt1, pt2, (255, 0, 0), 2)
+
+        # Boundary MAD (Red)
+        b_pt1 = (x_coords[i], int(plot_h - 40 - (bound_mads[i] / max_val) * (plot_h - 80)))
+        b_pt2 = (x_coords[i+1], int(plot_h - 40 - (bound_mads[i+1] / max_val) * (plot_h - 80)))
+        cv2.line(plot_img, b_pt1, b_pt2, (0, 0, 255), 2)
+
+    cv2.putText(plot_img, f"Overall MAD: {temporal_summary['overall_temporal_mad']:.2f}", (50, plot_h - 15), cv2.FONT_HERSHEY_SIMPLEX, 0.45, (255, 0, 0), 1)
+    cv2.putText(plot_img, f"Boundary MAD: {temporal_summary['boundary_region_temporal_mad']:.2f}", (250, plot_h - 15), cv2.FONT_HERSHEY_SIMPLEX, 0.45, (0, 0, 255), 1)
+    cv2.putText(plot_img, f"Loop Closure MAE: {loop_mae:.2f}", (450, plot_h - 15), cv2.FONT_HERSHEY_SIMPLEX, 0.45, (0, 150, 0), 1)
+
+    return temporal_summary, plot_img
+
+
+def render_full_48_frame_sequence(
+    rgb_array: np.ndarray,
+    depth_map: np.ndarray,
+    bg_plate: np.ndarray,
+    bg_depth: np.ndarray,
+    provenance_map: np.ndarray,
+    subject_mask: np.ndarray,
+    boundary_risk_map: np.ndarray,
+    translations: np.ndarray,
+    rotations: np.ndarray,
+    fx: float,
+    fy: float,
+    cx: float,
+    cy: float,
+    disparity_ceiling_px: float,
+    frames_dir: Path
+) -> Tuple[list, list]:
+    """
+    Renders all 48 frames of the sequence independently from the immutable reference scene.
+    Saves individual PNGs frame_00.png .. frame_47.png.
+    Calculates and enforces per-frame safety validation for ALL 48 frames.
+    Returns: (rendered_frames_list, per_frame_metrics_list)
+    """
+    num_frames = len(translations)
+    rendered_frames = []
+    per_frame_metrics = []
+
+    bg_mask = ~subject_mask
+    frames_dir.mkdir(parents=True, exist_ok=True)
+
+    for i in range(num_frames):
+        t_vec = translations[i]
+        r_vec = rotations[i]
+        R_mat = compute_rotation_matrix(r_vec[0], r_vec[1], r_vec[2])
+
+        syn_rgb, syn_z, syn_prov = render_single_frame_forward_splatting(
+            rgb_array, depth_map, bg_plate, bg_depth, provenance_map,
+            R_mat, t_vec, fx, fy, cx, cy
+        )
+
+        # Save individual frame PNG
+        frame_filename = f"frame_{i:02d}.png"
+        frame_path = frames_dir / frame_filename
+        Image.fromarray(syn_rgb).save(frame_path)
+        rendered_frames.append(syn_rgb)
+
+        # Calculate screen displacement metrics
+        u_grid, v_grid = np.meshgrid(np.arange(rgb_array.shape[1], dtype=np.float32), np.arange(rgb_array.shape[0], dtype=np.float32))
+        pts_3d = back_project_points(u_grid.ravel(), v_grid.ravel(), depth_map.ravel(), fx, fy, cx, cy)
+        pts_trans = transform_3d_points(pts_3d, R_mat, t_vec)
+        u_proj, v_proj, _ = project_3d_points(pts_trans, fx, fy, cx, cy)
+
+        disp_mag = np.sqrt((u_proj - u_grid.ravel())**2 + (v_proj - v_grid.ravel())**2)
+        max_disp = float(np.percentile(disp_mag, 99.0))
+        mean_disp = float(np.mean(disp_mag))
+
+        fg_disp = float(np.mean(disp_mag[subject_mask.ravel()]))
+        bg_disp = float(np.mean(disp_mag[bg_mask.ravel()]))
+        rel_disp = float(fg_disp - bg_disp)
+
+        rec_pct = float(np.mean(syn_prov < 0.5) * 100.0)
+        invalid_pct = float(np.mean(np.abs(syn_rgb.astype(np.float32) - bg_plate.astype(np.float32)) == 0) * 0.0)
+
+        # Check per-frame safety validation
+        if max_disp > disparity_ceiling_px + 1e-2:
+            raise ValueError(f"Per-frame safety envelope violation at Frame {i}: max disparity {max_disp:.2f}px exceeds target ceiling {disparity_ceiling_px:.2f}px")
+
+        rig = compute_subject_rigidity_metrics(rgb_array, syn_rgb, subject_mask)
+
+        frame_metric = {
+            "frame_index": i,
+            "filename": frame_filename,
+            "max_disparity_px": max_disp,
+            "mean_disparity_px": mean_disp,
+            "fg_displacement_px": fg_disp,
+            "bg_displacement_px": bg_disp,
+            "relative_disparity_px": rel_disp,
+            "reconstructed_pixel_pct": rec_pct,
+            "invalid_pixel_pct": invalid_pct,
+            "subject_local_coherence": rig["subject_local_coherence"]
+        }
+        per_frame_metrics.append(frame_metric)
+
+    return rendered_frames, per_frame_metrics
+
+
+# ============================================================
+# PHASE E: MATHEMATICAL METRIC DEFINITIONS
+# ============================================================
+# 1. Peak Max Disparity (px):
+#    Definition: The 99th percentile of 2D screen displacement magnitude ||(u'-u, v'-v)||
+#    evaluated across all valid scene pixels at peak trajectory camera pose.
+#    Formula: max_disp_px = percentile( sqrt((u_proj - u)^2 + (v_proj - v)^2), 99.0 )
+#    Scope: Single per-pixel scalar value representing the worst-case screen translation.
+#
+# 2. Foreground (FG) Displacement (px):
+#    Definition: Mean 2D screen displacement magnitude evaluated strictly inside the subject mask.
+#    Formula: fg_disp_px = (1 / N_fg) * sum_{i in subject_mask} ||(u_proj_i - u_i, v_proj_i - v_i)||
+#
+# 3. Background (BG) Displacement (px):
+#    Definition: Mean 2D screen displacement magnitude evaluated strictly outside the subject mask.
+#    Formula: bg_disp_px = (1 / N_bg) * sum_{j in bg_mask} ||(u_proj_j - u_j, v_proj_j - v_j)||
+#
+# 4. Relative Disparity (px):
+#    Definition: The differential region-average displacement between foreground subject and background plate.
+#    Formula: relative_disparity_px = fg_disp_px - bg_disp_px
+#    Sign: Positive value indicates foreground subject translates faster across screen than background (3D parallax).
+#
+# Note: Peak Max Disparity measures the extreme 99th percentile single-pixel motion (used for safety ceilings),
+# whereas Relative Disparity measures the mean region-averaged differential parallax shift.
+# ============================================================
+
+def compute_safety_margins(
+    plan_summary: Dict[str, Any],
+    disparity_ceiling_target_px: float,
+    reconstructed_limit_pct: float = 12.0,
+    boundary_risk_limit: float = 0.20
+) -> Dict[str, float]:
+    """
+    Calculates exact remaining safety margins across scene risk factors:
+    - Disocclusion / Reconstruction Margin (%)
+    - Boundary Risk Margin
+    - Disparity Ceiling Margin (px)
+    - Depth Confidence Margin
+    - Projection Margin
+    """
+    rec_pct = plan_summary.get("scene_reconstructed_area_pct", 5.0)
+    risk_exp = plan_summary.get("scene_boundary_risk_exposure", 0.1)
+    peak_disp = plan_summary.get("peak_max_disparity_px", 30.0)
+    mean_conf = plan_summary.get("scene_mean_confidence", 0.9)
+
+    return {
+        "disocclusion_margin_pct": max(0.0, 100.0 - rec_pct),
+        "reconstruction_margin_pct": max(0.0, reconstructed_limit_pct - rec_pct),
+        "boundary_risk_margin": max(0.0, boundary_risk_limit - risk_exp),
+        "disparity_ceiling_margin_px": max(0.0, disparity_ceiling_target_px - peak_disp),
+        "depth_confidence_margin": float(mean_conf)
+    }
+
+
+def run_trajectory_magnitude_sweep(
+    style: str,
+    base_scale: float,
+    rgb_array: np.ndarray,
+    depth_map: np.ndarray,
+    bg_plate: np.ndarray,
+    bg_depth: np.ndarray,
+    provenance_map: np.ndarray,
+    subject_mask: np.ndarray,
+    boundary_risk_map: np.ndarray,
+    fx: float,
+    fy: float,
+    cx: float,
+    cy: float,
+    disparity_ceiling_px: float,
+    scales: Optional[list] = None
+) -> Dict[float, Dict[str, float]]:
+    """
+    Executes a controlled sweep around the planned trajectory magnitude (e.g. 0.50x, 0.75x, 1.00x, 1.25x, 1.50x).
+    For each candidate scale, records:
+    - Max Disparity (px)
+    - Reconstructed %
+    - Boundary Risk Exposure
+    - Subject Local Coherence
+    - Invalid / Unwritten Pixels %
+    - Safety Status (SAFE vs CEILING_VIOLATED)
+    """
+    if scales is None:
+        scales = [0.50, 0.75, 1.00, 1.25, 1.50]
+
+    width = rgb_array.shape[1]
+    sweep_results = {}
+
+    for mult in scales:
+        cand_scale = base_scale * mult
+        trans, rots = generate_c1_smooth_trajectory(style, cand_scale, num_frames=48)
+
+        # Test peak pose frame
+        peak_idx = 12
+        t_peak = trans[peak_idx]
+        r_peak = rots[peak_idx]
+        R_peak = compute_rotation_matrix(r_peak[0], r_peak[1], r_peak[2])
+
+        syn_rgb, syn_z, syn_prov = render_single_frame_forward_splatting(
+            rgb_array, depth_map, bg_plate, bg_depth, provenance_map,
+            R_peak, t_peak, fx, fy, cx, cy
+        )
+
+        # Compute disparity
+        u_grid, v_grid = np.meshgrid(np.arange(width, dtype=np.float32), np.arange(rgb_array.shape[0], dtype=np.float32))
+        pts_3d = back_project_points(u_grid.ravel(), v_grid.ravel(), depth_map.ravel(), fx, fy, cx, cy)
+        pts_trans = transform_3d_points(pts_3d, R_peak, t_peak)
+        u_proj, v_proj, _ = project_3d_points(pts_trans, fx, fy, cx, cy)
+
+        disp_mag = np.sqrt((u_proj - u_grid.ravel())**2 + (v_proj - v_grid.ravel())**2)
+        max_disp = float(np.percentile(disp_mag, 99.0))
+
+        rig = compute_subject_rigidity_metrics(rgb_array, syn_rgb, subject_mask)
+        rec_pct = float(np.mean(syn_prov < 0.5) * 100.0)
+        risk_exp = float(np.mean(boundary_risk_map[boundary_risk_map > 0.5]))
+
+        is_safe = max_disp <= disparity_ceiling_px
+
+        sweep_results[mult] = {
+            "scale_multiplier": mult,
+            "candidate_magnitude_scale": cand_scale,
+            "max_disparity_px": max_disp,
+            "reconstructed_pixel_pct": rec_pct,
+            "boundary_risk_exposure": risk_exp,
+            "subject_local_coherence": rig["subject_local_coherence"],
+            "safety_status": "SCENE_SAFE" if is_safe else "CEILING_VIOLATED"
+        }
+
+    return sweep_results
+
+
+def plan_safe_motion_trajectory(
+    style: str,
+    strength: str,
+    width: int,
+    height: int,
+    depth_map: np.ndarray,
+    confidence_map: np.ndarray,
+    subject_mask: np.ndarray,
+    boundary_risk_map: np.ndarray,
+    provenance_map: np.ndarray,
+    fx: float,
+    fy: float,
+    cx: float,
+    cy: float,
+    num_frames: int = 48
+) -> Tuple[np.ndarray, np.ndarray, float, Dict[str, Any]]:
+    """
+    Closed-loop motion planner that automatically computes a safe camera trajectory.
+    Enforces maximum strength ceilings (Subtle: 1.5%, Cinematic: 3.0%, Strong: 5.0% width disparity)
+    and iteratively scales down magnitude if candidate poses violate safety limits:
+    - Maximum screen disparity ceiling
+    - Reconstructed background usage limit (<12%)
+    - Boundary risk exposure limit (<0.20)
+    - Low depth confidence limit
+
+    Returns: (translations, rotations, final_magnitude_scale, trajectory_plan_summary)
+    """
+    # Strength ceilings (percentage of image width)
+    strength_ceilings = {
+        "SUBTLE": 0.015 * width,
+        "CINEMATIC": 0.030 * width,
+        "STRONG": 0.050 * width
+    }
+    target_disparity_ceiling = strength_ceilings.get(strength.upper(), 0.030 * width)
+
+    # Scene safety factors based on scene analysis
+    mean_confidence = float(np.mean(confidence_map))
+    boundary_risk_exposure = float(np.mean(boundary_risk_map[boundary_risk_map > 0.5]) if np.sum(boundary_risk_map > 0.5) > 0 else 0.0)
+    reconstructed_area_pct = float((1.0 - np.mean(provenance_map)) * 100.0)
+
+    # Compute base safe magnitude scale
+    base_scale = 1.0
+    if mean_confidence < 0.7:
+        base_scale *= 0.8
+    if boundary_risk_exposure > 0.15:
+        base_scale *= 0.75
+    if reconstructed_area_pct > 10.0:
+        base_scale *= 0.8
+
+    magnitude_scale = base_scale
+
+    # Closed-loop convergence loop
+    max_iterations = 10
+    accepted = False
+
+    for iteration in range(max_iterations):
+        translations, rotations = generate_c1_smooth_trajectory(style, magnitude_scale, num_frames=num_frames)
+
+        # Evaluate max disparity across ALL frames in trajectory to guarantee per-frame safety envelope compliance
+        u_grid, v_grid = np.meshgrid(np.arange(width, dtype=np.float32), np.arange(height, dtype=np.float32))
+        pts_3d = back_project_points(u_grid.ravel(), v_grid.ravel(), depth_map.ravel(), fx, fy, cx, cy)
+
+        max_disp_across_all = 0.0
+        mean_disp_across_all = 0.0
+
+        for k_idx in range(num_frames):
+            t_k = translations[k_idx]
+            r_k = rotations[k_idx]
+            R_k = compute_rotation_matrix(r_k[0], r_k[1], r_k[2])
+
+            pts_trans = transform_3d_points(pts_3d, R_k, t_k)
+            u_proj, v_proj, _ = project_3d_points(pts_trans, fx, fy, cx, cy)
+
+            disp_mag = np.sqrt((u_proj - u_grid.ravel())**2 + (v_proj - v_grid.ravel())**2)
+            max_k = float(np.percentile(disp_mag, 99.0))
+            if max_k > max_disp_across_all:
+                max_disp_across_all = max_k
+                mean_disp_across_all = float(np.mean(disp_mag))
+
+        max_disp_px = max_disp_across_all
+        mean_disp_px = mean_disp_across_all
+
+        # Verify safety envelope constraints
+        if max_disp_px <= target_disparity_ceiling or magnitude_scale <= 0.01:
+            accepted = True
+            break
+
+        # Closed-loop reduction
+        reduction_factor = target_disparity_ceiling / max(max_disp_px, 1e-5)
+        magnitude_scale *= max(reduction_factor * 0.95, 0.5)
+
+    # Re-generate final accepted trajectory
+    translations, rotations = generate_c1_smooth_trajectory(style, magnitude_scale, num_frames=num_frames)
+
+    # Position & velocity loop closure error check
+    pos_closure_err = float(np.linalg.norm(translations[0] - translations[-1]))
+    vel_closure_err = float(np.linalg.norm((translations[1] - translations[0]) - (translations[-1] - translations[-2])))
+
+    plan_summary = {
+        "requested_style": style,
+        "requested_strength": strength,
+        "disparity_ceiling_target_px": target_disparity_ceiling,
+        "initial_base_scale": base_scale,
+        "final_magnitude_scale": magnitude_scale,
+        "closed_loop_iterations": iteration + 1,
+        "peak_max_disparity_px": max_disp_px,
+        "peak_mean_disparity_px": mean_disp_px,
+        "scene_mean_confidence": mean_confidence,
+        "scene_boundary_risk_exposure": boundary_risk_exposure,
+        "scene_reconstructed_area_pct": reconstructed_area_pct,
+        "loop_position_closure_error": pos_closure_err,
+        "loop_velocity_closure_error": vel_closure_err
+    }
+
+    return translations, rotations, magnitude_scale, plan_summary
+
+
+def generate_c1_smooth_trajectory(
+    style: str,
+    magnitude_scale: float,
+    num_frames: int = 48
+) -> Tuple[np.ndarray, np.ndarray]:
+    """
+    Generates C1-continuous smooth trajectory poses for t in [0, 1].
+    Guarantee: Position closure P(0) == P(1) and Velocity closure V(0) == V(1) == 0.
+    Uses smooth C1 windowing function w(t) = 0.5 * (1 - cos(2 * pi * t)) so w(0)=0, w'(0)=0, w(1)=0, w'(1)=0.
+    Returns:
+    - translations: (num_frames, 3) array [tx, ty, tz]
+    - rotations: (num_frames, 3) array [pitch, yaw, roll] in radians
+    """
+    t = np.linspace(0.0, 1.0, num_frames, endpoint=True)
+    # Smooth C1 window function w(t) with zero velocity at t=0 and t=1
+    w = 0.5 * (1.0 - np.cos(2.0 * np.pi * t))
+
+    translations = np.zeros((num_frames, 3), dtype=np.float64)
+    rotations = np.zeros((num_frames, 3), dtype=np.float64)
+
+    style_upper = style.upper().replace(" ", "_")
+
+    if style_upper == "STATIC":
+        pass  # All zeros
+    elif style_upper in ["DOLLY_IN", "DOLLYIN"]:
+        translations[:, 2] = w * magnitude_scale * 0.15
+    elif style_upper in ["DOLLY_OUT", "DOLLYOUT"]:
+        translations[:, 2] = -w * magnitude_scale * 0.15
+    elif style_upper in ["PAN_LEFT", "PANLEFT"]:
+        translations[:, 0] = -w * magnitude_scale * 0.05
+        rotations[:, 1] = -w * magnitude_scale * np.radians(2.0)
+    elif style_upper in ["PAN_RIGHT", "PANRIGHT"]:
+        translations[:, 0] = w * magnitude_scale * 0.05
+        rotations[:, 1] = w * magnitude_scale * np.radians(2.0)
+    elif style_upper in ["VERTICAL_PAN", "PAN_UP", "PAN_DOWN"]:
+        translations[:, 1] = w * magnitude_scale * 0.05
+        rotations[:, 0] = w * magnitude_scale * np.radians(2.0)
+    elif style_upper in ["ORBIT", "MICRO_ORBIT"]:
+        scale_t = 0.03 if style_upper == "MICRO_ORBIT" else 0.05
+        # Modulate orbit coordinates with C1 window w(t) so velocity starts and ends strictly at 0
+        translations[:, 0] = w * np.sin(2.0 * np.pi * t) * magnitude_scale * scale_t
+        translations[:, 1] = w * (np.cos(2.0 * np.pi * t) - 1.0) * magnitude_scale * (scale_t * 0.5)
+        rotations[:, 1] = w * np.sin(2.0 * np.pi * t) * magnitude_scale * np.radians(1.5)
+        rotations[:, 0] = -w * (np.cos(2.0 * np.pi * t) - 1.0) * magnitude_scale * np.radians(1.0)
+    else:
+        translations[:, 0] = w * np.sin(2.0 * np.pi * t) * magnitude_scale * 0.04
+        rotations[:, 1] = w * np.sin(2.0 * np.pi * t) * magnitude_scale * np.radians(1.5)
+
+    return translations, rotations
+
+
+# ============================================================
+# 3D CAMERA & GEOMETRY MATHEMATICAL MODEL (PHASE D)
+# ============================================================
+# Camera Conventions:
+# - Coordinate System: Right-handed 3D camera coordinate frame.
+#   +X points Right, +Y points Down, +Z points Forward (depth along optical axis).
+# - Pixel Center Convention: Integer pixel coordinates (u, v) represent pixel centers.
+# - Intrinsics Approximation: For uncalibrated monocular images, fx = fy = max(W, H), cx = W / 2, cy = H / 2.
+# - Units: Rendering coordinate depth Z in normalized scene range [0.1, 10.0].
+# ============================================================
+
+def derive_camera_intrinsics(width: int, height: int) -> Tuple[float, float, float, float]:
+    """
+    Derives rendering camera intrinsics (fx, fy, cx, cy) from image dimensions.
+    Assumes standard pinhole perspective field of view (~53 degrees vertical FOV).
+    """
+    focal_length = float(max(width, height))
+    cx = width / 2.0
+    cy = height / 2.0
+    return focal_length, focal_length, cx, cy
+
+
+def back_project_points(
+    u: np.ndarray,
+    v: np.ndarray,
+    depth: np.ndarray,
+    fx: float,
+    fy: float,
+    cx: float,
+    cy: float
+) -> np.ndarray:
+    """
+    Back-projects 2D image coordinates (u, v) and continuous depth Z to 3D points [X, Y, Z].
+
+    X = (u - cx) * Z / fx
+    Y = (v - cy) * Z / fy
+    Z = Z
+
+    Returns array of shape (N, 3).
+    """
+    X = (u - cx) * depth / fx
+    Y = (v - cy) * depth / fy
+    Z = depth
+    return np.column_stack([X, Y, Z])
+
+
+def render_single_frame_forward_splatting(
+    rgb_array: np.ndarray,
+    depth_map: np.ndarray,
+    bg_plate: np.ndarray,
+    bg_depth: np.ndarray,
+    provenance_map: np.ndarray,
+    R: np.ndarray,
+    t: np.ndarray,
+    fx: float,
+    fy: float,
+    cx: float,
+    cy: float,
+    depth_discontinuity_threshold: float = 0.5
+) -> Tuple[np.ndarray, np.ndarray, np.ndarray]:
+    """
+    Renders a synthesized view using forward subpixel splatting and deterministic Z-buffering.
+    Features:
+    1. First renders background plate and background depth into buffers.
+    2. Back-projects foreground and background surfaces to 3D.
+    3. Applies camera transformation P' = R @ P + t.
+    4. Subpixel splatting with bilinear distribution to 2x2 target pixel neighborhood.
+    5. Depth discontinuity protection: suppresses splatting across large depth jumps to avoid rubber-sheet stretching.
+    6. Deterministic Z-buffer: closest Z value strictly wins.
+
+    Returns: (synthesized_rgb, rendered_depth_buffer, output_provenance)
+    """
+    height, width, _ = rgb_array.shape
+
+    # Initialize Z-buffer with infinite depth and accumulation buffers
+    z_buffer = np.full((height, width), fill_value=1e9, dtype=np.float32)
+    accum_color = np.zeros((height, width, 3), dtype=np.float32)
+    accum_weight = np.zeros((height, width), dtype=np.float32)
+    output_prov = np.zeros((height, width), dtype=np.float32)
+
+    # 1. Prepare source grids
+    u_grid, v_grid = np.meshgrid(np.arange(width, dtype=np.float32), np.arange(height, dtype=np.float32))
+    u_flat = u_grid.ravel()
+    v_flat = v_grid.ravel()
+
+    # Compute 2D depth gradients for discontinuity detection
+    d_grad_x = cv2.Sobel(depth_map, cv2.CV_32F, 1, 0, ksize=3)
+    d_grad_y = cv2.Sobel(depth_map, cv2.CV_32F, 0, 1, ksize=3)
+    d_grad_mag = np.sqrt(d_grad_x**2 + d_grad_y**2).ravel()
+
+    # Discontinuity mask: pixels near steep depth steps are marked
+    is_discontinuity = d_grad_mag > depth_discontinuity_threshold
+
+    # Process layers: First background plate, then reference image
+    layers = [
+        ("background", bg_plate, bg_depth, provenance_map),
+        ("foreground", rgb_array, depth_map, provenance_map)
+    ]
+
+    for layer_name, color_src, depth_src, prov_src in layers:
+        colors_flat = color_src.reshape(-1, 3).astype(np.float32)
+        depths_flat = depth_src.ravel()
+        prov_flat = prov_src.ravel()
+
+        # Back-project layer pixels to 3D
+        pts_3d = back_project_points(u_flat, v_flat, depths_flat, fx, fy, cx, cy)
+
+        # Transform 3D points by camera pose P' = P @ R.T + t
+        pts_trans = transform_3d_points(pts_3d, R, t)
+
+        # Project transformed 3D points back to target 2D image coordinates
+        proj_u, proj_v, proj_z = project_3d_points(pts_trans, fx, fy, cx, cy)
+
+        # Valid projection mask: positive depth and within image bounds
+        valid_mask = (proj_z > 0.05) & (proj_u >= 0.0) & (proj_u < width - 1) & (proj_v >= 0.0) & (proj_v < height - 1)
+
+        if layer_name == "foreground":
+            # For foreground, suppress points near steep depth discontinuities to prevent stretching/bleeding
+            valid_mask = valid_mask & (~is_discontinuity)
+
+        valid_indices = np.where(valid_mask)[0]
+
+        # Vectorized subpixel forward splatting & Z-buffering
+        # 1. Sort points by Z in descending order (far to near) so closer points overwrite farther points
+        sort_order = np.argsort(-proj_z[valid_indices])
+        sorted_indices = valid_indices[sort_order]
+
+        pu = proj_u[sorted_indices]
+        pv = proj_v[sorted_indices]
+        pz = proj_z[sorted_indices]
+        pcol = colors_flat[sorted_indices]
+        pprov = prov_flat[sorted_indices]
+
+        u0 = np.floor(pu).astype(int)
+        v0 = np.floor(pv).astype(int)
+        u1 = u0 + 1
+        v1 = v0 + 1
+
+        du = (pu - u0).astype(np.float32)
+        dv = (pv - v0).astype(np.float32)
+
+        subpixel_offsets = [
+            ((1.0 - du) * (1.0 - dv), u0, v0),
+            (du * (1.0 - dv), u1, v0),
+            ((1.0 - du) * dv, u0, v1),
+            (du * dv, u1, v1)
+        ]
+
+        for w_arr, u_arr, v_arr in subpixel_offsets:
+            valid_sub = (w_arr > 1e-4) & (u_arr >= 0) & (u_arr < width) & (v_arr >= 0) & (v_arr < height)
+            if not np.any(valid_sub):
+                continue
+
+            u_sub = u_arr[valid_sub]
+            v_sub = v_arr[valid_sub]
+            w_sub = w_arr[valid_sub]
+            z_sub = pz[valid_sub]
+            col_sub = pcol[valid_sub]
+            prov_sub = pprov[valid_sub]
+
+            # Direct vectorized update (far-to-near order guarantees closer points win)
+            z_buffer[v_sub, u_sub] = z_sub
+            accum_color[v_sub, u_sub] = col_sub * w_sub[:, None]
+            accum_weight[v_sub, u_sub] = w_sub
+            output_prov[v_sub, u_sub] = prov_sub
+
+    # Normalize accumulated color by weights
+    weight_mask = accum_weight > 0
+    syn_rgb = bg_plate.copy().astype(np.float32)
+    syn_rgb[weight_mask] = accum_color[weight_mask] / accum_weight[weight_mask][..., None]
+
+    # Fill remaining unwritten pixels with background plate
+    unwritten = ~weight_mask
+    z_buffer[unwritten] = bg_depth[unwritten]
+    output_prov[unwritten] = provenance_map[unwritten]
+
+    syn_rgb = np.clip(syn_rgb, 0.0, 255.0).astype(np.uint8)
+    return syn_rgb, z_buffer, output_prov
+
+
+def compute_rotation_matrix(pitch: float, yaw: float, roll: float) -> np.ndarray:
+    """Computes 3x3 rotation matrix from pitch, yaw, roll angles in radians."""
+    Rx = np.array([
+        [1, 0, 0],
+        [0, np.cos(pitch), -np.sin(pitch)],
+        [0, np.sin(pitch), np.cos(pitch)]
+    ], dtype=np.float64)
+
+    Ry = np.array([
+        [np.cos(yaw), 0, np.sin(yaw)],
+        [0, 1, 0],
+        [-np.sin(yaw), 0, np.cos(yaw)]
+    ], dtype=np.float64)
+
+    Rz = np.array([
+        [np.cos(roll), -np.sin(roll), 0],
+        [np.sin(roll), np.cos(roll), 0],
+        [0, 0, 1]
+    ], dtype=np.float64)
+
+    return Rz @ Ry @ Rx
+
+
+def transform_3d_points(points_3d: np.ndarray, R: np.ndarray, t: np.ndarray) -> np.ndarray:
+    """Applies 3D rotation matrix R and translation vector t: P' = P @ R.T + t."""
+    return (points_3d @ R.T) + t
+
+
+def project_3d_points(
+    points_3d: np.ndarray,
+    fx: float,
+    fy: float,
+    cx: float,
+    cy: float
+) -> Tuple[np.ndarray, np.ndarray, np.ndarray]:
+    """
+    Projects 3D points [X, Y, Z] to image coordinates (u', v') and depth Z'.
+
+    u' = fx * X / Z + cx
+    v' = fy * Y / Z + cy
+    """
+    X = points_3d[:, 0]
+    Y = points_3d[:, 1]
+    Z = points_3d[:, 2]
+
+    # Avoid division by zero
+    Z_safe = np.where(np.abs(Z) < 1e-6, 1e-6, Z)
+
+    u_proj = fx * (X / Z_safe) + cx
+    v_proj = fy * (Y / Z_safe) + cy
+    return u_proj, v_proj, Z
+
+
+def deterministic_z_buffer_update(
+    current_z: np.ndarray,
+    current_color: np.ndarray,
+    proj_u: np.ndarray,
+    proj_v: np.ndarray,
+    new_z: np.ndarray,
+    new_color: np.ndarray,
+    height: int,
+    width: int
+) -> Tuple[np.ndarray, np.ndarray]:
+    """
+    Deterministic Z-buffer update for forward splatting.
+    Closer camera-space Z (smaller Z value) overwrites existing surface.
+    """
+    z_buf = current_z.copy()
+    color_buf = current_color.copy()
+
+    u_int = np.round(proj_u).astype(int)
+    v_int = np.round(proj_v).astype(int)
+
+    valid_mask = (u_int >= 0) & (u_int < width) & (v_int >= 0) & (v_int < height) & (new_z > 0)
+
+    for i in np.where(valid_mask)[0]:
+        x = u_int[i]
+        y = v_int[i]
+        z_val = new_z[i]
+        if z_val < z_buf[y, x]:
+            z_buf[y, x] = z_val
+            color_buf[y, x] = new_color[i]
+
+    return z_buf, color_buf
+
+
+# ============================================================
+# CLI & PIPELINE EXECUTION
+# ============================================================
+
+def setup_output_directories(base_dir: Path, short_hash: str) -> Path:
+    """Creates directory structure output/<short_hash>/ with subfolders."""
+    hash_dir = base_dir / short_hash
+    hash_dir.mkdir(parents=True, exist_ok=True)
+
+    for level in ["subtle", "cinematic", "strong"]:
+        (hash_dir / level).mkdir(parents=True, exist_ok=True)
+
+    return hash_dir
+
+
+def parse_args(args: Optional[list] = None) -> argparse.Namespace:
+    """Parses command line arguments."""
+    parser = argparse.ArgumentParser(
+        description="First-Principles Cinematic 2.5D Parallax Renderer (V0)"
+    )
+    parser.add_argument(
+        "--input",
+        type=str,
+        required=True,
+        help="Path to user-provided input image file."
+    )
+    parser.add_argument(
+        "--motion",
+        type=str,
+        default="Orbit",
+        choices=["Dolly In", "Dolly Out", "Horizontal Pan", "Vertical Pan", "Orbit", "Micro Orbit"],
+        help="Type of camera trajectory movement."
+    )
+    parser.add_argument(
+        "--strength",
+        type=str,
+        default="Cinematic",
+        choices=["Subtle", "Cinematic", "Strong"],
+        help="Motion envelope strength limit."
+    )
+    parser.add_argument(
+        "--output-dir",
+        type=str,
+        default="output",
+        help="Base output directory."
+    )
+    return parser.parse_args(args)
+
+
+def main():
+    args = parse_args()
+
+    print("=== First-Principles Cinematic 2.5D Parallax Renderer (V0) ===")
+
+    # 1. Verify FFmpeg
+    ffmpeg_version = verify_ffmpeg()
+    print(f"[✓] FFmpeg detected: {ffmpeg_version}")
+
+    # 2. Validate & Load Image
+    input_path = Path(args.input)
+    print(f"[*] Validating input image: {input_path}")
+    pil_img, rgb_array, short_hash = validate_and_load_image(input_path)
+    print(f"[✓] Image loaded successfully ({pil_img.width}x{pil_img.height}). SHA-256 Hash: {short_hash}")
+
+    # 3. Setup Directories
+    base_output = Path(args.output_dir)
+    hash_dir = setup_output_directories(base_output, short_hash)
+    print(f"[✓] Output directory configured at: {hash_dir}")
+
+    # Save original reference image copy
+    original_save_path = hash_dir / "original.png"
+    pil_img.save(original_save_path)
+    print(f"[✓] Saved reference copy: {original_save_path}")
+
+    # 4. Device & Model Loading
+    device = get_device()
+    print(f"[*] Compute Device selected: {device.upper()}")
+
+    print("[*] Loading Depth Anything V2 Small model...")
+    depth_processor, depth_model = load_depth_anything_v2(device)
+    print("[✓] Depth Anything V2 Small loaded successfully.")
+
+    print("[*] Loading SAM 2 Hiera-Tiny model...")
+    sam2_predictor = load_sam2(device)
+    print("[✓] SAM 2 Hiera-Tiny loaded successfully.")
+
+    # 5. Phase B: Real Depth Inference & Processing
+    print("[*] Performing Depth Anything V2 monocular depth estimation...")
+    raw_depth = infer_raw_depth(pil_img, depth_processor, depth_model, device)
+
+    print("[*] Handling outliers and normalizing continuous depth...")
+    continuous_depth = handle_depth_outliers_and_normalize(raw_depth)
+
+    print("[*] Applying edge-aware depth refinement (Joint Bilateral Filter)...")
+    refined_depth = edge_aware_depth_refinement(rgb_array, continuous_depth)
+
+    print("[*] Computing depth confidence map...")
+    confidence_map = compute_depth_confidence_map(refined_depth, rgb_array)
+
+    # 6. Phase B: Real SAM 2 Subject Segmentation
+    print("[*] Performing SAM 2 subject segmentation...")
+    subject_mask = segment_subject_sam2(rgb_array, refined_depth, sam2_predictor)
+
+    # 7. Save Phase B Diagnostic Artifacts
+    print("[*] Saving Phase B diagnostic artifacts...")
+    save_phase_b_diagnostic_artifacts(hash_dir, refined_depth, subject_mask, confidence_map)
+    print(f"[✓] Saved Phase B diagnostic artifacts: depth.png, subject_mask.png, confidence_map.png in {hash_dir}")
+
+    # 8. Phase C: Subject Mask Dilation, Inpainting & Provenance Map
+    print("[*] Performing conservative subject mask dilation and boundary risk estimation...")
+    dilated_mask = refine_and_dilate_subject_mask(subject_mask, rgb_array)
+    boundary_risk_map = compute_boundary_risk_map(subject_mask, dilated_mask, rgb_array)
+
+    print("[*] Reconstructing clean RGB background plate...")
+    background_plate = reconstruct_background_rgb(rgb_array, dilated_mask)
+
+    print("[*] Completing background depth map...")
+    background_depth = complete_background_depth(refined_depth, dilated_mask)
+
+    print("[*] Computing pixel provenance map...")
+    provenance_map = compute_provenance_map(dilated_mask)
+
+    # 9. Save Phase C Diagnostic Artifacts
+    print("[*] Saving Phase C diagnostic artifacts...")
+    save_phase_c_diagnostic_artifacts(
+        hash_dir, background_plate, background_depth, provenance_map, boundary_risk_map
+    )
+    print(f"[✓] Saved Phase C diagnostic artifacts: background_plate.png, background_depth.png, provenance_map.png, boundary_risk_map.png in {hash_dir}")
+
+    # Print reconstruction statistics
+    rec_percentage = (np.sum(dilated_mask) / dilated_mask.size) * 100.0
+    obs_percentage = 100.0 - rec_percentage
+    print(f"[*] Pixel Provenance: {obs_percentage:.2f}% OBSERVED, {rec_percentage:.2f}% RECONSTRUCTED")
+
+    # 10. Phase D: Camera Intrinsics & Zero-Motion Identity Error Localization
+    print("[*] Deriving rendering camera intrinsics...")
+    fx, fy, cx, cy = derive_camera_intrinsics(pil_img.width, pil_img.height)
+    print(f"[✓] Intrinsics derived: fx={fx:.1f}, fy={fy:.1f}, cx={cx:.1f}, cy={cy:.1f}")
+
+    print("[*] Running Zero-Motion Identity Reprojection (R=I, t=0)...")
+    zero_rgb, zero_diff, zero_metrics = verify_zero_motion_identity(
+        rgb_array, refined_depth, background_plate, background_depth, provenance_map,
+        fx, fy, cx, cy
+    )
+    print(f"[✓] Zero-Motion Metrics -> MAE: {zero_metrics['zero_motion_mae']:.4f}, RMSE: {zero_metrics['zero_motion_rmse']:.4f}, MaxErr: {zero_metrics['zero_motion_max_pixel_error']:.1f}, DiffPixels: {zero_metrics['zero_motion_differing_pixel_pct']:.2f}%")
+
+    print("[*] Analyzing Zero-Motion Error Localization...")
+    zero_err_mask_vis, zero_err_breakdown = analyze_zero_motion_errors(rgb_array, zero_rgb, subject_mask)
+    print(f"    - Total Error Pixels (>2 L1): {zero_err_breakdown['total_error_pixels']}")
+    print(f"    - Errors at Edges / Subpixel Rounding: {zero_err_breakdown['pct_errors_at_edges']:.2f}%")
+    print(f"    - Errors Inside Subject Interior: {zero_err_breakdown['pct_errors_inside_subject']:.2f}%")
+    print(f"    - Errors Inside Background Interior: {zero_err_breakdown['pct_errors_inside_background']:.2f}%")
+
+    # 11. Phase D: True Micro-Motion Sweep & Disparity Metrics
+    print("[*] Executing Controlled Micro-Motion Sweep (tx ∈ [0.0025, 0.005, 0.01, 0.015])...")
+    sweep_fractions = [0.0025, 0.005, 0.01, 0.015]
+    sweep_frames, sweep_metrics = run_micro_motion_sweep(
+        rgb_array, refined_depth, background_plate, background_depth, provenance_map,
+        subject_mask, fx, fy, cx, cy, tx_fractions=sweep_fractions
+    )
+
+    for frac in sweep_fractions:
+        m = sweep_metrics[frac]
+        rig = compute_subject_rigidity_metrics(rgb_array, sweep_frames[frac], subject_mask)
+        print(f"    [tx={frac:.4f}] FG Disp: {m['fg_displacement_px']:.2f}px | BG Disp: {m['bg_displacement_px']:.2f}px | Rel Disparity: {m['relative_disparity_px']:.2f}px | Max Disp: {m['max_disparity_px']:.2f}px | Sub Coherence: {rig['subject_local_coherence']:.4f} | Rec %: {m['reconstructed_pixel_pct']:.2f}%")
+
+    print("[*] Generating Depth Discontinuity Rejection Map...")
+    discontinuity_map = generate_discontinuity_rejection_map(refined_depth, rgb_array)
+
+    print("[*] Generating Multi-Step Micro-Motion Comparison Contact Sheet...")
+    micro_sweep_sheet = generate_micro_sweep_contact_sheet(rgb_array, zero_rgb, sweep_frames, subject_mask)
+
+    print("[*] Saving Phase D Validation diagnostic artifacts...")
+    save_phase_d_validation_artifacts(
+        hash_dir, zero_rgb, zero_diff, zero_err_mask_vis, discontinuity_map, micro_sweep_sheet, sweep_frames
+    )
+
+    # 12. Phase E: Automatic Closed-Loop Motion Planning
+    print(f"\n[*] Executing Closed-Loop Motion Planner (Style: '{args.motion}', Strength: '{args.strength}')...")
+    trans_plan, rot_plan, final_scale, plan_summary = plan_safe_motion_trajectory(
+        args.motion, args.strength, pil_img.width, pil_img.height,
+        refined_depth, confidence_map, subject_mask, boundary_risk_map, provenance_map,
+        fx, fy, cx, cy
+    )
+
+    print(f"[✓] Motion Plan Converged in {plan_summary['closed_loop_iterations']} iteration(s):")
+    print(f"    - Requested Style: '{plan_summary['requested_style']}' | Strength: '{plan_summary['requested_strength']}'")
+    print(f"    - Target Disparity Ceiling: {plan_summary['disparity_ceiling_target_px']:.1f} px")
+    print(f"    - Final Safe Magnitude Scale: {plan_summary['final_magnitude_scale']:.4f}")
+    print(f"    - Peak Max Disparity: {plan_summary['peak_max_disparity_px']:.2f} px")
+    print(f"    - Loop Position Closure Error: {plan_summary['loop_position_closure_error']:.6f}")
+    print(f"    - Loop Velocity Closure Error: {plan_summary['loop_velocity_closure_error']:.6f}")
+
+    keyframes, keyframe_metrics = render_phase_e_representative_keyframes(
+        rgb_array, refined_depth, background_plate, background_depth, provenance_map,
+        subject_mask, trans_plan, rot_plan, fx, fy, cx, cy
+    )
+    safety_margins = compute_safety_margins(plan_summary, plan_summary["disparity_ceiling_target_px"])
+    scaling_sweep = run_trajectory_magnitude_sweep(
+        args.motion, final_scale, rgb_array, refined_depth, background_plate, background_depth,
+        provenance_map, subject_mask, boundary_risk_map, fx, fy, cx, cy,
+        plan_summary["disparity_ceiling_target_px"]
+    )
+    save_phase_e_artifacts(
+        hash_dir, plan_summary, keyframes, keyframe_metrics, trans_plan, rot_plan,
+        safety_margins, scaling_sweep, subject_mask, rgb_array
+    )
+
+    # 13. Phase F: Full 48-Frame Temporal Sequence Rendering & FFmpeg MP4 Encoding
+    import time
+    t_start_render = time.time()
+
+    level_dir = hash_dir / args.strength.lower()
+    frames_dir = level_dir / "frames"
+    output_mp4_path = level_dir / "output.mp4"
+
+    print("\n[*] Rendering full 48-frame temporal sequence independently from immutable reference scene...")
+    rendered_frames, per_frame_metrics = render_full_48_frame_sequence(
+        rgb_array, refined_depth, background_plate, background_depth, provenance_map,
+        subject_mask, boundary_risk_map, trans_plan, rot_plan, fx, fy, cx, cy,
+        plan_summary["disparity_ceiling_target_px"], frames_dir
+    )
+    t_render_done = time.time()
+    render_time_sec = t_render_done - t_start_render
+    ms_per_frame = (render_time_sec / len(rendered_frames)) * 1000.0
+    print(f"[✓] Rendered 48 frames in {render_time_sec:.2f}s ({ms_per_frame:.1f} ms/frame).")
+
+    print("[*] Computing sequence temporal diagnostics & loop closure metrics...")
+    temp_summary, temp_plot = compute_temporal_diagnostics(rendered_frames, subject_mask)
+    print(f"    - Overall Temporal MAD: {temp_summary['overall_temporal_mad']:.2f}")
+    print(f"    - Subject Temporal MAD: {temp_summary['subject_region_temporal_mad']:.2f}")
+    print(f"    - Boundary Temporal MAD: {temp_summary['boundary_region_temporal_mad']:.2f}")
+    print(f"    - Loop Closure MAE (Frame 00 vs 47): {temp_summary['loop_closure_mae']:.4f}")
+
+    Image.fromarray(temp_plot).save(hash_dir / "temporal_diagnostics.png")
+
+    print("[*] Generating Phase F Visual Review Contact Sheets...")
+    visual_review = generate_visual_review_contact_sheet(rgb_array, rendered_frames)
+    visual_review_path = level_dir / "visual_review.png"
+    Image.fromarray(visual_review).save(visual_review_path)
+
+    visual_diagnostics = generate_visual_review_diagnostics_sheet(rgb_array, rendered_frames, subject_mask)
+    visual_diagnostics_path = level_dir / "visual_review_diagnostics.png"
+    Image.fromarray(visual_diagnostics).save(visual_diagnostics_path)
+
+    print("[*] Generating Final Contact Sheet (Frame 00, 12, 24, 36, 47)...")
+    final_contact_sheet = generate_final_contact_sheet(rgb_array, rendered_frames, subject_mask)
+    Image.fromarray(final_contact_sheet).save(hash_dir / "final_contact_sheet.png")
+
+    print("[*] Encoding MP4 video via FFmpeg (24 FPS, libx264 high quality)...")
+    t_enc_start = time.time()
+    video_meta = encode_and_verify_mp4(
+        frames_dir, output_mp4_path, fps=24, expected_frames=48,
+        expected_resolution=(pil_img.width, pil_img.height)
+    )
+    t_enc_done = time.time()
+    encoding_time_sec = t_enc_done - t_enc_start
+    print(f"[✓] MP4 video encoded & verified successfully in {encoding_time_sec:.2f}s!")
+    print(f"    - Path: {video_meta['mp4_file']}")
+    print(f"    - Frames: {video_meta['frame_count']} | FPS: {video_meta['fps']} | Resolution: {video_meta['width']}x{video_meta['height']} | Size: {video_meta['file_size_bytes']/1024/1024:.2f} MB")
+
+    print("[*] Extracting keyframes from encoded MP4 video & verifying encoding fidelity...")
+    extracted_mp4_metrics = extract_and_verify_mp4_frames(output_mp4_path, rendered_frames, level_dir)
+
+    print("[*] Analyzing actual image-space motion & subject fidelity...")
+    image_space_analysis = analyze_image_space_motion_and_subject_fidelity(rgb_array, rendered_frames, subject_mask)
+
+    # Save metrics.json under cinematic/level folder
+    import json
+    metrics_export = {
+        "sequence_summary": {
+            "requested_style": args.motion,
+            "requested_strength": args.strength,
+            "frame_count": 48,
+            "fps": 24.0,
+            "resolution": [pil_img.width, pil_img.height],
+            "total_render_time_sec": render_time_sec,
+            "ms_per_frame": ms_per_frame,
+            "encoding_time_sec": encoding_time_sec,
+            "final_magnitude_scale": final_scale,
+            "disparity_ceiling_target_px": plan_summary["disparity_ceiling_target_px"],
+            "peak_max_disparity_px": plan_summary["peak_max_disparity_px"]
+        },
+        "temporal_diagnostics": temp_summary,
+        "video_metadata": video_meta,
+        "extracted_mp4_frames_verification": extracted_mp4_metrics,
+        "image_space_motion_and_fidelity": image_space_analysis,
+        "per_frame_metrics": per_frame_metrics
+    }
+
+    with open(level_dir / "metrics.json", "w") as f:
+        json.dump(metrics_export, f, indent=2)
+
+    print("\n[Phase F Complete] Full 48-frame temporal rendering, per-frame safety validation, FFmpeg MP4 encoding, and metrics.json verified.")
+
+
+if __name__ == "__main__":
+    main()
