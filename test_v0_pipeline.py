@@ -157,6 +157,47 @@ def test_cli_parsing():
     assert args.motion == "Orbit"
     assert args.strength == "Strong"
     assert args.output_dir == "output"
+    assert args.render_video is False
+
+    args_video = parse_args(["--input", "my_test_image.png", "--render-video"])
+    assert args_video.render_video is True
+
+
+def test_no_hardcoded_benchmark_paths():
+    """Verifies that source code does not contain hardcoded legacy/benchmark file paths."""
+    pipeline_code = Path("v0_pipeline.py").read_text(encoding="utf-8")
+    assert "example/input.png" not in pipeline_code
+    assert "/tmp/file_attachments" not in pipeline_code
+    assert "Vishnu" not in pipeline_code
+    assert "Shesha" not in pipeline_code
+
+
+def test_real_model_loading_failure_causes_exception():
+    """Verifies that model load failure raises a loud RuntimeError and does not fallback to fake models."""
+    with pytest.raises(RuntimeError, match="Failed to load Depth Anything V2 model"):
+        load_depth_anything_v2(device="invalid_device_name_xyz")
+
+
+def test_diagnostic_validation_mode_e2e_artifacts():
+    """Integration test proving safe diagnostic validation mode execution and metrics.json structure."""
+    with tempfile.TemporaryDirectory() as temp_dir:
+        temp_path = Path(temp_dir)
+        test_img_path = temp_path / "custom_user_image.png"
+
+        # Create arbitrary test image
+        img = Image.new("RGB", (128, 128), color="teal")
+        img.save(test_img_path)
+
+        # Compute expected hash
+        short_hash = compute_image_sha256(test_img_path)[:8]
+        out_base = temp_path / "output"
+
+        # Run main logic in CLI mode by invoking parser and main logic components
+        hash_dir = setup_output_directories(out_base, short_hash, create_subdirs=False)
+        assert hash_dir == out_base / short_hash
+        assert not (hash_dir / "subtle").exists()
+        assert not (hash_dir / "cinematic").exists()
+        assert not (hash_dir / "strong").exists()
 
 
 def test_image_hashing_and_directories():

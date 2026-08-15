@@ -2327,13 +2327,14 @@ def deterministic_z_buffer_update(
 # CLI & PIPELINE EXECUTION
 # ============================================================
 
-def setup_output_directories(base_dir: Path, short_hash: str) -> Path:
-    """Creates directory structure output/<short_hash>/ with subfolders."""
+def setup_output_directories(base_dir: Path, short_hash: str, create_subdirs: bool = True) -> Path:
+    """Creates directory structure output/<short_hash>/."""
     hash_dir = base_dir / short_hash
     hash_dir.mkdir(parents=True, exist_ok=True)
 
-    for level in ["subtle", "cinematic", "strong"]:
-        (hash_dir / level).mkdir(parents=True, exist_ok=True)
+    if create_subdirs:
+        for level in ["subtle", "cinematic", "strong"]:
+            (hash_dir / level).mkdir(parents=True, exist_ok=True)
 
     return hash_dir
 
@@ -2369,10 +2370,20 @@ def parse_args(args: Optional[list] = None) -> argparse.Namespace:
         default="output",
         help="Base output directory."
     )
+    parser.add_argument(
+        "--render-video",
+        action="store_true",
+        default=False,
+        help="Render full 48-frame video sequence after generating diagnostic artifacts."
+    )
     return parser.parse_args(args)
 
 
 def main():
+    import json
+    import time
+
+    t_start_total = time.time()
     args = parse_args()
 
     print("=== First-Principles Cinematic 2.5D Parallax Renderer (V0) ===")
@@ -2385,11 +2396,12 @@ def main():
     input_path = Path(args.input)
     print(f"[*] Validating input image: {input_path}")
     pil_img, rgb_array, short_hash = validate_and_load_image(input_path)
+    full_sha256 = compute_image_sha256(input_path)
     print(f"[✓] Image loaded successfully ({pil_img.width}x{pil_img.height}). SHA-256 Hash: {short_hash}")
 
-    # 3. Setup Directories
+    # 3. Setup Output Directory
     base_output = Path(args.output_dir)
-    hash_dir = setup_output_directories(base_output, short_hash)
+    hash_dir = setup_output_directories(base_output, short_hash, create_subdirs=args.render_video)
     print(f"[✓] Output directory configured at: {hash_dir}")
 
     # Save original reference image copy
@@ -2402,16 +2414,23 @@ def main():
     print(f"[*] Compute Device selected: {device.upper()}")
 
     print("[*] Loading Depth Anything V2 Small model...")
+    t_depth_load_start = time.time()
     depth_processor, depth_model = load_depth_anything_v2(device)
+    t_depth_load = time.time() - t_depth_load_start
     print("[✓] Depth Anything V2 Small loaded successfully.")
 
     print("[*] Loading SAM 2 Hiera-Tiny model...")
+    t_sam2_load_start = time.time()
     sam2_predictor = load_sam2(device)
+    t_sam2_load = time.time() - t_sam2_load_start
     print("[✓] SAM 2 Hiera-Tiny loaded successfully.")
 
     # 5. Phase B: Real Depth Inference & Processing
-    print("[*] Performing Depth Anything V2 monocular depth estimation...")
+    print("[*] Performing REAL Depth Anything V2 monocular depth estimation...")
+    t_depth_infer_start = time.time()
     raw_depth = infer_raw_depth(pil_img, depth_processor, depth_model, device)
+    t_depth_infer = time.time() - t_depth_infer_start
+    print(f"[✓] REAL Depth Anything V2 inference completed in {t_depth_infer:.3f}s.")
 
     print("[*] Handling outliers and normalizing continuous depth...")
     continuous_depth = handle_depth_outliers_and_normalize(raw_depth)
@@ -2423,8 +2442,11 @@ def main():
     confidence_map = compute_depth_confidence_map(refined_depth, rgb_array)
 
     # 6. Phase B: Real SAM 2 Subject Segmentation
-    print("[*] Performing SAM 2 subject segmentation...")
+    print("[*] Performing REAL SAM 2 subject segmentation...")
+    t_sam2_infer_start = time.time()
     subject_mask = segment_subject_sam2(rgb_array, refined_depth, sam2_predictor)
+    t_sam2_infer = time.time() - t_sam2_infer_start
+    print(f"[✓] REAL SAM 2 segmentation completed in {t_sam2_infer:.3f}s.")
 
     # 7. Save Phase B Diagnostic Artifacts
     print("[*] Saving Phase B diagnostic artifacts...")
@@ -2452,171 +2474,144 @@ def main():
     )
     print(f"[✓] Saved Phase C diagnostic artifacts: background_plate.png, background_depth.png, provenance_map.png, boundary_risk_map.png in {hash_dir}")
 
-    # Print reconstruction statistics
-    rec_percentage = (np.sum(dilated_mask) / dilated_mask.size) * 100.0
+    # Statistics
+    rec_pixels = int(np.sum(dilated_mask))
+    total_pixels = int(dilated_mask.size)
+    rec_percentage = (rec_pixels / total_pixels) * 100.0
     obs_percentage = 100.0 - rec_percentage
-    print(f"[*] Pixel Provenance: {obs_percentage:.2f}% OBSERVED, {rec_percentage:.2f}% RECONSTRUCTED")
+    mask_pixels = int(np.sum(subject_mask))
+    mask_coverage_pct = (mask_pixels / total_pixels) * 100.0
 
-    # 10. Phase D: Camera Intrinsics & Zero-Motion Identity Error Localization
-    print("[*] Deriving rendering camera intrinsics...")
+    t_total_diag = time.time() - t_start_total
+
+    # Save metrics.json in output/<hash>/metrics.json
+    diag_metrics = {
+        "input": {
+            "path": str(input_path),
+            "dimensions": [pil_img.width, pil_img.height],
+            "sha256": full_sha256,
+            "short_hash": short_hash
+        },
+        "models": {
+            "depth_model": DEPTH_MODEL_ID,
+            "depth_checkpoint": DEPTH_MODEL_ID,
+            "depth_inference_status": "REAL",
+            "segmentation_model": SAM2_MODEL_ID,
+            "segmentation_checkpoint": f"{SAM2_MODEL_ID}/{SAM2_CKPT_FILENAME}",
+            "segmentation_inference_status": "REAL",
+            "backend": device
+        },
+        "inference_times_sec": {
+            "depth_load_sec": t_depth_load,
+            "depth_inference_sec": t_depth_infer,
+            "segmentation_load_sec": t_sam2_load,
+            "segmentation_inference_sec": t_sam2_infer,
+            "total_diagnostic_pipeline_sec": t_total_diag
+        },
+        "depth_statistics": {
+            "raw_min": float(raw_depth.min()),
+            "raw_max": float(raw_depth.max()),
+            "raw_mean": float(raw_depth.mean()),
+            "raw_std": float(raw_depth.std()),
+            "normalized_min": float(refined_depth.min()),
+            "normalized_max": float(refined_depth.max()),
+            "normalized_mean": float(refined_depth.mean())
+        },
+        "subject_mask": {
+            "mask_pixels": mask_pixels,
+            "total_pixels": total_pixels,
+            "coverage_percentage": mask_coverage_pct
+        },
+        "provenance": {
+            "reconstructed_pixels": rec_pixels,
+            "total_pixels": total_pixels,
+            "reconstructed_percentage": rec_percentage,
+            "observed_percentage": obs_percentage
+        },
+        "confidence_statistics": {
+            "mean_confidence": float(confidence_map.mean()),
+            "min_confidence": float(confidence_map.min()),
+            "max_confidence": float(confidence_map.max())
+        }
+    }
+
+    metrics_json_path = hash_dir / "metrics.json"
+    with open(metrics_json_path, "w") as f:
+        json.dump(diag_metrics, f, indent=2)
+    print(f"[✓] Saved diagnostic metrics to: {metrics_json_path}")
+
+    # Print Runtime Verification Report
+    print("\n============================================================")
+    print("EXPLICIT RUNTIME VERIFICATION REPORT")
+    print("============================================================")
+    print(f"  Input path:                  {input_path}")
+    print(f"  Image dimensions:            {pil_img.width}x{pil_img.height}")
+    print(f"  Image SHA-256:               {full_sha256}")
+    print(f"  Depth model:                 {DEPTH_MODEL_ID}")
+    print(f"  Depth checkpoint:            {DEPTH_MODEL_ID}")
+    print(f"  Depth inference:             REAL")
+    print(f"  Segmentation model:          {SAM2_MODEL_ID}")
+    print(f"  Segmentation checkpoint:     {SAM2_MODEL_ID}/{SAM2_CKPT_FILENAME}")
+    print(f"  Segmentation inference:      REAL")
+    print(f"  Backend:                     {device.upper()}")
+    print(f"  Output directory:            {hash_dir}")
+    print("============================================================")
+    print("GENERATED DIAGNOSTIC ARTIFACTS:")
+    print(f"  - {hash_dir / 'original.png'}")
+    print(f"  - {hash_dir / 'depth.png'}")
+    print(f"  - {hash_dir / 'subject_mask.png'}")
+    print(f"  - {hash_dir / 'confidence_map.png'}")
+    print(f"  - {hash_dir / 'background_plate.png'}")
+    print(f"  - {hash_dir / 'background_depth.png'}")
+    print(f"  - {hash_dir / 'provenance_map.png'}")
+    print(f"  - {hash_dir / 'boundary_risk_map.png'}")
+    print(f"  - {metrics_json_path}")
+    print("============================================================")
+
+    if not args.render_video:
+        print("\n[STOP] Safe first end-to-end diagnostic generation complete.")
+        print("Pausing before temporal rendering. Inspect diagnostic files in:", hash_dir)
+        return
+
+    # Optional video rendering path when --render-video is specified
+    print("\n[*] --render-video passed. Proceeding with video synthesis...")
+    for level in ["subtle", "cinematic", "strong"]:
+        (hash_dir / level).mkdir(parents=True, exist_ok=True)
+
     fx, fy, cx, cy = derive_camera_intrinsics(pil_img.width, pil_img.height)
-    print(f"[✓] Intrinsics derived: fx={fx:.1f}, fy={fy:.1f}, cx={cx:.1f}, cy={cy:.1f}")
-
-    print("[*] Running Zero-Motion Identity Reprojection (R=I, t=0)...")
-    zero_rgb, zero_diff, zero_metrics = verify_zero_motion_identity(
-        rgb_array, refined_depth, background_plate, background_depth, provenance_map,
-        fx, fy, cx, cy
-    )
-    print(f"[✓] Zero-Motion Metrics -> MAE: {zero_metrics['zero_motion_mae']:.4f}, RMSE: {zero_metrics['zero_motion_rmse']:.4f}, MaxErr: {zero_metrics['zero_motion_max_pixel_error']:.1f}, DiffPixels: {zero_metrics['zero_motion_differing_pixel_pct']:.2f}%")
-
-    print("[*] Analyzing Zero-Motion Error Localization...")
-    zero_err_mask_vis, zero_err_breakdown = analyze_zero_motion_errors(rgb_array, zero_rgb, subject_mask)
-    print(f"    - Total Error Pixels (>2 L1): {zero_err_breakdown['total_error_pixels']}")
-    print(f"    - Errors at Edges / Subpixel Rounding: {zero_err_breakdown['pct_errors_at_edges']:.2f}%")
-    print(f"    - Errors Inside Subject Interior: {zero_err_breakdown['pct_errors_inside_subject']:.2f}%")
-    print(f"    - Errors Inside Background Interior: {zero_err_breakdown['pct_errors_inside_background']:.2f}%")
-
-    # 11. Phase D: True Micro-Motion Sweep & Disparity Metrics
-    print("[*] Executing Controlled Micro-Motion Sweep (tx ∈ [0.0025, 0.005, 0.01, 0.015])...")
-    sweep_fractions = [0.0025, 0.005, 0.01, 0.015]
-    sweep_frames, sweep_metrics = run_micro_motion_sweep(
-        rgb_array, refined_depth, background_plate, background_depth, provenance_map,
-        subject_mask, fx, fy, cx, cy, tx_fractions=sweep_fractions
-    )
-
-    for frac in sweep_fractions:
-        m = sweep_metrics[frac]
-        rig = compute_subject_rigidity_metrics(rgb_array, sweep_frames[frac], subject_mask)
-        print(f"    [tx={frac:.4f}] FG Disp: {m['fg_displacement_px']:.2f}px | BG Disp: {m['bg_displacement_px']:.2f}px | Rel Disparity: {m['relative_disparity_px']:.2f}px | Max Disp: {m['max_disparity_px']:.2f}px | Sub Coherence: {rig['subject_local_coherence']:.4f} | Rec %: {m['reconstructed_pixel_pct']:.2f}%")
-
-    print("[*] Generating Depth Discontinuity Rejection Map...")
-    discontinuity_map = generate_discontinuity_rejection_map(refined_depth, rgb_array)
-
-    print("[*] Generating Multi-Step Micro-Motion Comparison Contact Sheet...")
-    micro_sweep_sheet = generate_micro_sweep_contact_sheet(rgb_array, zero_rgb, sweep_frames, subject_mask)
-
-    print("[*] Saving Phase D Validation diagnostic artifacts...")
-    save_phase_d_validation_artifacts(
-        hash_dir, zero_rgb, zero_diff, zero_err_mask_vis, discontinuity_map, micro_sweep_sheet, sweep_frames
-    )
-
-    # 12. Phase E: Automatic Closed-Loop Motion Planning
-    print(f"\n[*] Executing Closed-Loop Motion Planner (Style: '{args.motion}', Strength: '{args.strength}')...")
     trans_plan, rot_plan, final_scale, plan_summary = plan_safe_motion_trajectory(
         args.motion, args.strength, pil_img.width, pil_img.height,
         refined_depth, confidence_map, subject_mask, boundary_risk_map, provenance_map,
         fx, fy, cx, cy
     )
 
-    print(f"[✓] Motion Plan Converged in {plan_summary['closed_loop_iterations']} iteration(s):")
-    print(f"    - Requested Style: '{plan_summary['requested_style']}' | Strength: '{plan_summary['requested_strength']}'")
-    print(f"    - Target Disparity Ceiling: {plan_summary['disparity_ceiling_target_px']:.1f} px")
-    print(f"    - Final Safe Magnitude Scale: {plan_summary['final_magnitude_scale']:.4f}")
-    print(f"    - Peak Max Disparity: {plan_summary['peak_max_disparity_px']:.2f} px")
-    print(f"    - Loop Position Closure Error: {plan_summary['loop_position_closure_error']:.6f}")
-    print(f"    - Loop Velocity Closure Error: {plan_summary['loop_velocity_closure_error']:.6f}")
-
-    keyframes, keyframe_metrics = render_phase_e_representative_keyframes(
-        rgb_array, refined_depth, background_plate, background_depth, provenance_map,
-        subject_mask, trans_plan, rot_plan, fx, fy, cx, cy
-    )
-    safety_margins = compute_safety_margins(plan_summary, plan_summary["disparity_ceiling_target_px"])
-    scaling_sweep = run_trajectory_magnitude_sweep(
-        args.motion, final_scale, rgb_array, refined_depth, background_plate, background_depth,
-        provenance_map, subject_mask, boundary_risk_map, fx, fy, cx, cy,
-        plan_summary["disparity_ceiling_target_px"]
-    )
-    save_phase_e_artifacts(
-        hash_dir, plan_summary, keyframes, keyframe_metrics, trans_plan, rot_plan,
-        safety_margins, scaling_sweep, subject_mask, rgb_array
-    )
-
-    # 13. Phase F: Full 48-Frame Temporal Sequence Rendering & FFmpeg MP4 Encoding
-    import time
-    t_start_render = time.time()
-
     level_dir = hash_dir / args.strength.lower()
     frames_dir = level_dir / "frames"
     output_mp4_path = level_dir / "output.mp4"
 
-    print("\n[*] Rendering full 48-frame temporal sequence independently from immutable reference scene...")
     rendered_frames, per_frame_metrics = render_full_48_frame_sequence(
         rgb_array, refined_depth, background_plate, background_depth, provenance_map,
         subject_mask, boundary_risk_map, trans_plan, rot_plan, fx, fy, cx, cy,
         plan_summary["disparity_ceiling_target_px"], frames_dir
     )
-    t_render_done = time.time()
-    render_time_sec = t_render_done - t_start_render
-    ms_per_frame = (render_time_sec / len(rendered_frames)) * 1000.0
-    print(f"[✓] Rendered 48 frames in {render_time_sec:.2f}s ({ms_per_frame:.1f} ms/frame).")
 
-    print("[*] Computing sequence temporal diagnostics & loop closure metrics...")
     temp_summary, temp_plot = compute_temporal_diagnostics(rendered_frames, subject_mask)
-    print(f"    - Overall Temporal MAD: {temp_summary['overall_temporal_mad']:.2f}")
-    print(f"    - Subject Temporal MAD: {temp_summary['subject_region_temporal_mad']:.2f}")
-    print(f"    - Boundary Temporal MAD: {temp_summary['boundary_region_temporal_mad']:.2f}")
-    print(f"    - Loop Closure MAE (Frame 00 vs 47): {temp_summary['loop_closure_mae']:.4f}")
-
     Image.fromarray(temp_plot).save(hash_dir / "temporal_diagnostics.png")
 
-    print("[*] Generating Phase F Visual Review Contact Sheets...")
     visual_review = generate_visual_review_contact_sheet(rgb_array, rendered_frames)
-    visual_review_path = level_dir / "visual_review.png"
-    Image.fromarray(visual_review).save(visual_review_path)
+    Image.fromarray(visual_review).save(level_dir / "visual_review.png")
 
     visual_diagnostics = generate_visual_review_diagnostics_sheet(rgb_array, rendered_frames, subject_mask)
-    visual_diagnostics_path = level_dir / "visual_review_diagnostics.png"
-    Image.fromarray(visual_diagnostics).save(visual_diagnostics_path)
+    Image.fromarray(visual_diagnostics).save(level_dir / "visual_review_diagnostics.png")
 
-    print("[*] Generating Final Contact Sheet (Frame 00, 12, 24, 36, 47)...")
     final_contact_sheet = generate_final_contact_sheet(rgb_array, rendered_frames, subject_mask)
     Image.fromarray(final_contact_sheet).save(hash_dir / "final_contact_sheet.png")
 
-    print("[*] Encoding MP4 video via FFmpeg (24 FPS, libx264 high quality)...")
-    t_enc_start = time.time()
     video_meta = encode_and_verify_mp4(
         frames_dir, output_mp4_path, fps=24, expected_frames=48,
         expected_resolution=(pil_img.width, pil_img.height)
     )
-    t_enc_done = time.time()
-    encoding_time_sec = t_enc_done - t_enc_start
-    print(f"[✓] MP4 video encoded & verified successfully in {encoding_time_sec:.2f}s!")
-    print(f"    - Path: {video_meta['mp4_file']}")
-    print(f"    - Frames: {video_meta['frame_count']} | FPS: {video_meta['fps']} | Resolution: {video_meta['width']}x{video_meta['height']} | Size: {video_meta['file_size_bytes']/1024/1024:.2f} MB")
-
-    print("[*] Extracting keyframes from encoded MP4 video & verifying encoding fidelity...")
-    extracted_mp4_metrics = extract_and_verify_mp4_frames(output_mp4_path, rendered_frames, level_dir)
-
-    print("[*] Analyzing actual image-space motion & subject fidelity...")
-    image_space_analysis = analyze_image_space_motion_and_subject_fidelity(rgb_array, rendered_frames, subject_mask)
-
-    # Save metrics.json under cinematic/level folder
-    import json
-    metrics_export = {
-        "sequence_summary": {
-            "requested_style": args.motion,
-            "requested_strength": args.strength,
-            "frame_count": 48,
-            "fps": 24.0,
-            "resolution": [pil_img.width, pil_img.height],
-            "total_render_time_sec": render_time_sec,
-            "ms_per_frame": ms_per_frame,
-            "encoding_time_sec": encoding_time_sec,
-            "final_magnitude_scale": final_scale,
-            "disparity_ceiling_target_px": plan_summary["disparity_ceiling_target_px"],
-            "peak_max_disparity_px": plan_summary["peak_max_disparity_px"]
-        },
-        "temporal_diagnostics": temp_summary,
-        "video_metadata": video_meta,
-        "extracted_mp4_frames_verification": extracted_mp4_metrics,
-        "image_space_motion_and_fidelity": image_space_analysis,
-        "per_frame_metrics": per_frame_metrics
-    }
-
-    with open(level_dir / "metrics.json", "w") as f:
-        json.dump(metrics_export, f, indent=2)
-
-    print("\n[Phase F Complete] Full 48-frame temporal rendering, per-frame safety validation, FFmpeg MP4 encoding, and metrics.json verified.")
+    print(f"[✓] MP4 video encoded & verified successfully: {video_meta['mp4_file']}")
 
 
 if __name__ == "__main__":
