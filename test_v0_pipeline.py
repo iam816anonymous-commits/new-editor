@@ -783,3 +783,138 @@ def test_visual_review_contact_sheets():
     diag_sheet = generate_visual_review_diagnostics_sheet(rgb, rendered_frames, sub_mask, crop_size=16)
     assert diag_sheet.ndim == 3
     assert diag_sheet.shape[2] == 3
+
+
+def test_subject_selection_candidate_feature_extraction():
+    """Unit test for subject_selection.candidate_features feature calculation."""
+    import subject_selection as ss
+    h, w = 100, 100
+    rgb = np.zeros((h, w, 3), dtype=np.uint8)
+    depth = np.full((h, w), fill_value=5.0, dtype=np.float32)
+    depth[20:60, 20:60] = 1.0  # foreground closer depth
+
+    mask = np.zeros((h, w), dtype=bool)
+    mask[20:60, 20:60] = True
+
+    feat = ss.candidate_features.extract_candidate_features(
+        mask, sam_score=0.92, prompt_origin="test_prompt",
+        depth_map=depth, rgb_array=rgb, candidate_id=1
+    )
+
+    assert feat.candidate_id == 1
+    assert feat.mask_area == 1600
+    assert feat.mask_area_ratio == pytest.approx(0.16)
+    assert feat.foreground_depth_mean == pytest.approx(1.0)
+    assert feat.border_touch_ratio == 0.0
+    assert feat.background_contamination_score < 0.20
+
+
+def test_subject_selection_multi_signal_scoring_and_penalties():
+    """Unit test for subject_selection.candidate_scorer multi-signal scoring."""
+    import subject_selection as ss
+    h, w = 100, 100
+    rgb = np.zeros((h, w, 3), dtype=np.uint8)
+    depth = np.full((h, w), fill_value=5.0, dtype=np.float32)
+    depth[30:70, 30:70] = 1.0  # central foreground
+    depth[80:100, 80:100] = 0.5  # corner border background
+
+    mask_central = np.zeros((h, w), dtype=bool)
+    mask_central[30:70, 30:70] = True
+
+    mask_corner = np.zeros((h, w), dtype=bool)
+    mask_corner[80:100, 80:100] = True
+
+    feat_central = ss.candidate_features.extract_candidate_features(
+        mask_central, sam_score=0.90, prompt_origin="central", depth_map=depth, rgb_array=rgb, candidate_id=1
+    )
+    feat_corner = ss.candidate_features.extract_candidate_features(
+        mask_corner, sam_score=0.95, prompt_origin="corner", depth_map=depth, rgb_array=rgb, candidate_id=2
+    )
+
+    cfg = ss.SubjectSelectionConfig()
+    score_central = ss.candidate_scorer.score_candidate_features(feat_central, cfg)
+    score_corner = ss.candidate_scorer.score_candidate_features(feat_corner, cfg)
+
+    assert score_central.final_score > score_corner.final_score
+    assert score_corner.border_penalty > 0.10
+
+
+def test_synthetic_compound_subject_grouping():
+    """Synthetic test verifying Vishnu + Shesha compound candidate grouping."""
+    import subject_selection as ss
+    h, w = 100, 100
+    rgb = np.zeros((h, w, 3), dtype=np.uint8)
+    depth = np.full((h, w), fill_value=5.0, dtype=np.float32)
+
+    # Vishnu mask (part 1)
+    mask1 = np.zeros((h, w), dtype=bool)
+    mask1[30:60, 30:60] = True
+    depth[30:60, 30:60] = 1.0
+
+    # Shesha mask (part 2 - adjacent/overlapping foreground)
+    mask2 = np.zeros((h, w), dtype=bool)
+    mask2[20:50, 45:75] = True
+    depth[20:50, 45:75] = 1.1
+
+    feat1 = ss.candidate_features.extract_candidate_features(mask1, 0.90, "p1", depth, rgb, 1)
+    feat2 = ss.candidate_features.extract_candidate_features(mask2, 0.88, "p2", depth, rgb, 2)
+
+    score1 = ss.candidate_scorer.score_candidate_features(feat1)
+    score2 = ss.candidate_scorer.score_candidate_features(feat2)
+
+    groups = ss.candidate_grouper.generate_candidate_groups(
+        {1: mask1, 2: mask2}, [feat1, feat2], [score1, score2], depth, rgb
+    )
+
+    merged_groups = [g for g in groups if len(g.candidate_ids) > 1]
+    assert len(merged_groups) >= 1
+    assert 1 in merged_groups[0].candidate_ids and 2 in merged_groups[0].candidate_ids
+
+
+def test_synthetic_foreground_plus_distant_planet_rejection():
+    """Synthetic test verifying that combining central foreground with distant background planet is rejected."""
+    import subject_selection as ss
+    h, w = 100, 100
+    rgb = np.zeros((h, w, 3), dtype=np.uint8)
+    depth = np.full((h, w), fill_value=5.0, dtype=np.float32)
+
+    # Foreground object
+    mask_fg = np.zeros((h, w), dtype=bool)
+    mask_fg[40:60, 40:60] = True
+    depth[40:60, 40:60] = 1.0
+
+    # Distant planet in background
+    mask_planet = np.zeros((h, w), dtype=bool)
+    mask_planet[80:95, 80:95] = True
+    depth[80:95, 80:95] = 4.8  # Far background depth
+
+    feat_fg = ss.candidate_features.extract_candidate_features(mask_fg, 0.90, "fg", depth, rgb, 1)
+    feat_planet = ss.candidate_features.extract_candidate_features(mask_planet, 0.85, "planet", depth, rgb, 2)
+
+    compat = ss.candidate_grouper.compute_pairwise_compatibility(
+        feat_fg, feat_planet, mask_fg, mask_planet
+    )
+
+    assert compat < 0.50
+
+
+def test_validation_acceptance_gate():
+    """Unit test for mask acceptance gate REJECT and ACCEPT outcomes."""
+    import subject_selection as ss
+    h, w = 100, 100
+    rgb = np.zeros((h, w, 3), dtype=np.uint8)
+    depth = np.full((h, w), fill_value=5.0, dtype=np.float32)
+    depth[30:70, 30:70] = 1.0
+
+    mask = np.zeros((h, w), dtype=bool)
+    mask[30:70, 30:70] = True
+
+    feat = ss.candidate_features.extract_candidate_features(mask, 0.95, "fg", depth, rgb, 1)
+    score = ss.candidate_scorer.score_candidate_features(feat)
+
+    group = ss.schemas.CandidateGroup(group_id=1, candidate_ids=[1], merged_mask=mask, combined_score=score)
+    val_result = ss.mask_validator.validate_selected_subject_mask(group, {1: feat}, score_margin=0.20)
+
+    assert val_result.is_valid is True
+    assert val_result.validation_status == "ACCEPTED"
+    assert val_result.confidence.final_subject_confidence > 0.50
