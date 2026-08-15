@@ -28,6 +28,12 @@ from v0_pipeline import (
     handle_depth_outliers_and_normalize,
     edge_aware_depth_refinement,
     compute_depth_confidence_map,
+    compute_mask_iou,
+    compute_candidate_features,
+    score_and_rank_candidates,
+    evaluate_subject_selection_confidence_gate,
+    generate_candidate_masks_contact_sheet,
+    export_candidate_selection_json,
     segment_subject_sam2,
     validate_subject_mask,
     refine_and_dilate_subject_mask,
@@ -338,7 +344,7 @@ def test_depth_anything_v2_real_inference():
 
 
 def test_sam2_real_subject_segmentation():
-    """Integration test verifying real SAM 2 subject segmentation and mask validity."""
+    """Integration test verifying real SAM 2 subject segmentation, candidate diagnostics, and mask validity."""
     device = get_device()
     predictor = load_sam2(device)
 
@@ -347,13 +353,97 @@ def test_sam2_real_subject_segmentation():
     depth = np.full((128, 128), fill_value=10.0, dtype=np.float32)
     depth[32:96, 32:96] = 1.0  # Foreground closer depth
 
-    subject_mask = segment_subject_sam2(rgb, depth, predictor)
+    with tempfile.TemporaryDirectory() as temp_dir:
+        hash_dir = Path(temp_dir)
+        subject_mask = segment_subject_sam2(rgb, depth, predictor, hash_dir=hash_dir)
 
-    assert subject_mask.shape == (128, 128)
-    assert subject_mask.dtype == bool
-    assert np.sum(subject_mask) > 0
-    # Verify alignment: foreground region should be largely included in subject_mask
-    assert np.mean(subject_mask[32:96, 32:96]) > 0.5
+        assert subject_mask.shape == (128, 128)
+        assert subject_mask.dtype == bool
+        assert np.sum(subject_mask) > 0
+        assert np.mean(subject_mask[32:96, 32:96]) > 0.5
+
+        # Verify candidate diagnostic artifacts were generated
+        assert (hash_dir / "candidate_masks_contact_sheet.png").exists()
+        assert (hash_dir / "candidate_selection.json").exists()
+
+
+def test_compute_mask_iou():
+    """Tests Intersection over Union computation between boolean masks."""
+    m1 = np.zeros((10, 10), dtype=bool)
+    m1[0:5, 0:5] = True  # Area 25
+
+    m2 = np.zeros((10, 10), dtype=bool)
+    m2[0:5, 0:5] = True  # Area 25 (identical)
+
+    m3 = np.zeros((10, 10), dtype=bool)
+    m3[2:7, 2:7] = True  # Overlapping
+
+    assert compute_mask_iou(m1, m2) == pytest.approx(1.0)
+    assert compute_mask_iou(m1, m3) > 0.0
+    assert compute_mask_iou(m1, m3) < 1.0
+
+
+def test_candidate_scoring_and_border_penalty():
+    """Tests that corner/border background candidates receive heavy border contact penalties compared to central foreground objects."""
+    h, w = 100, 100
+    depth_map = np.full((h, w), fill_value=5.0, dtype=np.float32)
+    depth_map[30:70, 30:70] = 1.0  # Central foreground
+    depth_map[80:100, 80:100] = 0.5  # Corner object
+
+    mask_central = np.zeros((h, w), dtype=bool)
+    mask_central[30:70, 30:70] = True
+
+    mask_corner = np.zeros((h, w), dtype=bool)
+    mask_corner[80:100, 80:100] = True
+
+    feat_central = compute_candidate_features({"mask_bool": mask_central, "sam_score": 0.90, "prompt_origin": "central"}, depth_map, candidate_id=1)
+    feat_corner = compute_candidate_features({"mask_bool": mask_corner, "sam_score": 0.95, "prompt_origin": "corner"}, depth_map, candidate_id=2)
+
+    ranked = score_and_rank_candidates([feat_central, feat_corner], depth_map, h, w)
+
+    assert ranked[0]["id"] == 1  # Central object MUST rank #1
+    assert ranked[1]["scores"]["border_penalty"] > 0.3  # Corner object receives heavy border penalty
+
+
+def test_confidence_gate_ambiguity_rejection():
+    """Tests that low-scoring or ambiguous candidate masks trigger safe rejection instead of choosing a bad mask."""
+    # Test weak score candidate
+    weak_candidate = [{
+        "id": 1,
+        "total_score": 0.20,
+        "border_contact_percentage": 0.0,
+        "centrality_score": 0.50,
+        "mask_bool": np.zeros((10, 10), dtype=bool)
+    }]
+    is_valid, sel, conf, margin, reason = evaluate_subject_selection_confidence_gate(weak_candidate)
+    assert is_valid is False
+    assert sel is None
+    assert "too low" in reason
+
+
+def test_candidate_contact_sheet_and_json_export():
+    """Tests candidate contact sheet rendering and candidate selection JSON traceability file export."""
+    h, w = 64, 64
+    rgb = np.full((h, w, 3), fill_value=100, dtype=np.uint8)
+    depth_map = np.full((h, w), fill_value=5.0, dtype=np.float32)
+    mask = np.zeros((h, w), dtype=bool)
+    mask[20:44, 20:44] = True
+
+    cand_dict = {"mask_bool": mask, "sam_score": 0.90, "prompt_origin": "test"}
+    feat = compute_candidate_features(cand_dict, depth_map, candidate_id=1)
+    ranked = score_and_rank_candidates([feat], depth_map, h, w)
+
+    with tempfile.TemporaryDirectory() as temp_dir:
+        temp_path = Path(temp_dir)
+        contact_sheet = generate_candidate_masks_contact_sheet(rgb, ranked, selected_id=1)
+        assert contact_sheet.ndim == 3
+
+        json_path = export_candidate_selection_json(
+            temp_path, ranked, selected_cand=ranked[0], is_valid=True,
+            confidence=0.9, margin=0.5, rejection_reason="ACCEPTED"
+        )
+        assert json_path.exists()
+        assert (temp_path / "candidate_selection.json").exists()
 
 
 # ============================================================
