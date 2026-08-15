@@ -194,3 +194,69 @@ def extract_candidate_features(
         geometric_coherence_score=geometric_coherence_score,
         depth_coherence_score=depth_coherence_score
     )
+
+
+def compute_batch_relative_features(
+    features_list: List[CandidateFeatures],
+    candidates_masks_by_id: Dict[int, np.ndarray],
+    depth_map: np.ndarray,
+    config: SubjectSelectionConfig = SubjectSelectionConfig()
+) -> List[CandidateFeatures]:
+    """
+    Computes candidate competition and relative scene features across all candidate masks:
+    - relative_visual_prominence
+    - foreground_cluster_distance
+    - compound_subject_likelihood
+    - environmental_isolation_score
+    """
+    if not features_list:
+        return features_list
+
+    h, w = depth_map.shape
+
+    # Calculate weighted visual center-of-mass for top central/foreground salient candidates
+    salient_feats = [f for f in features_list if f.depth_saliency > 0.40 and f.image_center_distance < 0.70]
+    if not salient_feats:
+        salient_feats = features_list
+
+    cluster_weight_sum = sum(f.mask_area * f.depth_saliency for f in salient_feats)
+    if cluster_weight_sum > 0:
+        cluster_center_x = sum(f.centroid_x * f.mask_area * f.depth_saliency for f in salient_feats) / cluster_weight_sum
+        cluster_center_y = sum(f.centroid_y * f.mask_area * f.depth_saliency for f in salient_feats) / cluster_weight_sum
+    else:
+        cluster_center_x, cluster_center_y = w / 2.0, h / 2.0
+
+    diag_len = max(1.0, np.sqrt(h**2 + w**2))
+
+    for feat in features_list:
+        # 1. Relative visual prominence
+        max_single_area = max((f.mask_area for f in features_list), default=1)
+        feat.relative_visual_prominence = float(feat.mask_area / max(1, max_single_area))
+
+        # 2. Foreground cluster distance
+        c_dist = np.sqrt((feat.centroid_x - cluster_center_x)**2 + (feat.centroid_y - cluster_center_y)**2)
+        feat.foreground_cluster_distance = float(c_dist / (0.5 * diag_len))
+
+        # 3. Compound subject likelihood (sum of compatibility with other central/foreground candidates)
+        other_compat_sum = 0.0
+        maskA = candidates_masks_by_id.get(feat.candidate_id)
+        if maskA is not None:
+            for other in features_list:
+                if other.candidate_id != feat.candidate_id and other.depth_saliency > 0.40:
+                    maskB = candidates_masks_by_id.get(other.candidate_id)
+                    if maskB is not None:
+                        d_diff = abs(feat.foreground_depth_mean - other.foreground_depth_mean)
+                        cent_dist = np.sqrt((feat.centroid_x - other.centroid_x)**2 + (feat.centroid_y - other.centroid_y)**2)
+                        if cent_dist < 0.4 * diag_len and d_diff < 1.5:
+                            other_compat_sum += other.mask_area_ratio
+        feat.compound_subject_likelihood = float(np.clip(other_compat_sum, 0.0, 1.0))
+
+        # 4. Environmental isolation score
+        isolation = (
+            0.40 * min(1.0, feat.foreground_cluster_distance) +
+            0.30 * (1.0 - feat.relative_visual_prominence) +
+            0.30 * (1.0 - feat.compound_subject_likelihood)
+        )
+        feat.environmental_isolation_score = float(np.clip(isolation, 0.0, 1.0))
+
+    return features_list

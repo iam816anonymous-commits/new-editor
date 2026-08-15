@@ -11,17 +11,20 @@ import numpy as np
 class SubjectSelectionConfig:
     """Configurable weights, penalties, and thresholds for semantic subject selection."""
     # Score component weights
-    weight_sam_confidence: float = 0.15
-    weight_centrality: float = 0.25
-    weight_depth_saliency: float = 0.25
+    weight_sam_confidence: float = 0.10
+    weight_centrality: float = 0.20
+    weight_depth_saliency: float = 0.20
     weight_scale: float = 0.15
-    weight_geometric_coherence: float = 0.10
-    weight_edge_alignment: float = 0.10
+    weight_relative_prominence: float = 0.20
+    weight_compound_support: float = 0.15
+    weight_geometric_coherence: float = 0.05
+    weight_edge_alignment: float = 0.05
 
     # Penalties
-    weight_border_penalty: float = 0.40
-    weight_contamination_penalty: float = 0.45
-    weight_fragmentation_penalty: float = 0.25
+    weight_border_penalty: float = 0.35
+    weight_contamination_penalty: float = 0.35
+    weight_fragmentation_penalty: float = 0.20
+    weight_environmental_penalty: float = 0.35
 
     # Target area coverage ratios
     min_subject_area_ratio: float = 0.01   # 1% minimum coverage
@@ -90,6 +93,11 @@ class CandidateFeatures:
     geometric_coherence_score: float
     depth_coherence_score: float
 
+    relative_visual_prominence: float = 0.0
+    foreground_cluster_distance: float = 0.0
+    compound_subject_likelihood: float = 0.0
+    environmental_isolation_score: float = 0.0
+
 
 @dataclass
 class CandidateScore:
@@ -99,12 +107,15 @@ class CandidateScore:
     centrality_score: float
     depth_saliency_score: float
     scale_score: float
+    relative_prominence_score: float
+    compound_support_score: float
     geometric_coherence_score: float
     edge_alignment_score: float
 
     border_penalty: float
     contamination_penalty: float
     fragmentation_penalty: float
+    environmental_penalty: float
 
     raw_score: float
     final_score: float

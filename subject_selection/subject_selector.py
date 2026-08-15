@@ -19,7 +19,7 @@ from .schemas import (
     MaskValidationResult,
     SubjectSelectionResult
 )
-from .candidate_features import extract_candidate_features
+from .candidate_features import extract_candidate_features, compute_batch_relative_features
 from .candidate_scorer import score_candidate_features, rank_candidates
 from .candidate_grouper import generate_candidate_groups
 from .mask_merger import refine_subject_mask
@@ -223,6 +223,25 @@ def export_diagnostics(
     Image.fromarray(contam_vis).save(hash_dir / "11_background_contamination.png")
 
     # 12_validation_report.json
+    candidate_breakdown = []
+    for feat in features_list:
+        score = score_map[feat.candidate_id]
+        candidate_breakdown.append({
+            "candidate_id": feat.candidate_id,
+            "sam_confidence": score.sam_confidence,
+            "centrality_score": score.centrality_score,
+            "depth_saliency_score": score.depth_saliency_score,
+            "scale_score": score.scale_score,
+            "relative_prominence_score": score.relative_prominence_score,
+            "compound_support_score": score.compound_support_score,
+            "border_penalty": score.border_penalty,
+            "contamination_penalty": score.contamination_penalty,
+            "environmental_penalty": score.environmental_penalty,
+            "raw_score": score.raw_score,
+            "final_score": score.final_score,
+            "is_selected": feat.candidate_id in sel_ids
+        })
+
     val_report = {
         "validation_status": validation_result.validation_status,
         "is_valid": validation_result.is_valid,
@@ -239,6 +258,7 @@ def export_diagnostics(
             "candidate_ids": selected_group.candidate_ids,
             "final_score": selected_group.combined_score.final_score
         },
+        "candidate_scores_breakdown": candidate_breakdown,
         "total_candidates_evaluated": len(features_list),
         "total_groups_evaluated": len(groups)
     }
@@ -279,7 +299,6 @@ def select_semantic_subject(
 
     # 2. Candidate Feature Extraction
     features_list: List[CandidateFeatures] = []
-    scores_list: List[CandidateScore] = []
     mask_by_id: Dict[int, np.ndarray] = {}
 
     for idx, cand_dict in enumerate(raw_masks, start=1):
@@ -296,11 +315,13 @@ def select_semantic_subject(
             candidate_id=idx,
             config=config
         )
-        score = score_candidate_features(feat, config)
         features_list.append(feat)
-        scores_list.append(score)
         mask_by_id[idx] = mask_bool
 
+    # Compute relative batch features (prominence, foreground cluster distance, compound support, environmental isolation)
+    features_list = compute_batch_relative_features(features_list, mask_by_id, depth_map, config)
+
+    scores_list = [score_candidate_features(f, config) for f in features_list]
     features_list, scores_list = rank_candidates(features_list, scores_list)
 
     # 3. Candidate Grouping

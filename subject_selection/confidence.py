@@ -34,21 +34,22 @@ def compute_subject_confidence(
         0.0, 1.0
     ))
 
-    # 4. Semantic subject confidence (combination of centrality, depth saliency, and lack of contamination)
+    # 4. Semantic subject confidence (combination of centrality, depth saliency, relative prominence, and low environmental isolation)
     semantic_conf = float(np.clip(
-        0.40 * score.centrality_score +
-        0.40 * score.depth_saliency_score +
-        0.20 * (1.0 - features.background_contamination_score),
+        0.30 * score.centrality_score +
+        0.30 * score.depth_saliency_score +
+        0.20 * features.relative_visual_prominence +
+        0.20 * (1.0 - features.environmental_isolation_score),
         0.0, 1.0
     ))
 
     # 5. Final Subject Confidence
     final_conf = float(np.clip(
-        0.20 * sam_model_conf +
-        0.25 * geom_conf +
-        0.25 * depth_conf +
-        0.30 * semantic_conf -
-        0.30 * features.background_contamination_score,
+        0.15 * sam_model_conf +
+        0.20 * geom_conf +
+        0.20 * depth_conf +
+        0.45 * semantic_conf -
+        0.35 * features.environmental_isolation_score,
         0.0, 1.0
     ))
 

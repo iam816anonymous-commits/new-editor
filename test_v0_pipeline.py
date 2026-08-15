@@ -918,3 +918,93 @@ def test_validation_acceptance_gate():
     assert val_result.is_valid is True
     assert val_result.validation_status == "ACCEPTED"
     assert val_result.confidence.final_subject_confidence > 0.50
+
+
+def test_compound_subject_beats_isolated_background_planet():
+    """
+    REGRESSION TEST FOR BUG:
+    An isolated background object (e.g., a bottom-right planet with high SAM confidence and compact shape)
+    must NOT outrank a multi-part compound foreground subject (e.g. Vishnu + Shesha).
+    Verifies that candidate batch relative features and environmental isolation penalties correctly rank
+    the compound foreground group above isolated background objects.
+    """
+    import subject_selection as ss
+    h, w = 100, 100
+    rgb = np.zeros((h, w, 3), dtype=np.uint8)
+    depth = np.full((h, w), fill_value=5.0, dtype=np.float32)
+
+    # 1. Compound Foreground Part A (Vishnu body - central)
+    mask1 = np.zeros((h, w), dtype=bool)
+    mask1[35:65, 35:65] = True
+    depth[35:65, 35:65] = 1.0
+
+    # 2. Compound Foreground Part B (Shesha serpent - central/adjacent)
+    mask2 = np.zeros((h, w), dtype=bool)
+    mask2[25:55, 45:75] = True
+    depth[25:55, 45:75] = 1.1
+
+    # 3. Clean, compact, high-confidence isolated background planet (bottom-right corner)
+    mask_planet = np.zeros((h, w), dtype=bool)
+    mask_planet[80:98, 80:98] = True
+    depth[80:98, 80:98] = 1.0  # Monocular depth spurious close depth
+
+    feat1 = ss.candidate_features.extract_candidate_features(mask1, 0.85, "vishnu", depth, rgb, 1)
+    feat2 = ss.candidate_features.extract_candidate_features(mask2, 0.82, "shesha", depth, rgb, 2)
+    feat_planet = ss.candidate_features.extract_candidate_features(mask_planet, 0.99, "planet", depth, rgb, 3)
+
+    masks_by_id = {1: mask1, 2: mask2, 3: mask_planet}
+    feats_list = [feat1, feat2, feat_planet]
+
+    # Compute relative batch features
+    feats_list = ss.candidate_features.compute_batch_relative_features(feats_list, masks_by_id, depth)
+
+    cfg = ss.SubjectSelectionConfig()
+    scores_list = [ss.candidate_scorer.score_candidate_features(f, cfg) for f in feats_list]
+
+    # Generate groups
+    groups = ss.candidate_grouper.generate_candidate_groups(
+        masks_by_id, feats_list, scores_list, depth, rgb, cfg
+    )
+
+    # Top group MUST be the compound foreground subject (1 and 2), NOT the planet (3)
+    top_group = groups[0]
+    assert 3 not in top_group.candidate_ids
+    assert set(top_group.candidate_ids).intersection({1, 2})
+
+
+def test_scoring_ablation_sam_confidence_does_not_override_composition():
+    """
+    SCORING ABLATION TEST:
+    Verifies that high SAM confidence alone on an isolated secondary candidate (SAM score 0.99)
+    cannot override strong visual prominence, centrality, and compound support of foreground candidates.
+    """
+    import subject_selection as ss
+    h, w = 100, 100
+    rgb = np.zeros((h, w, 3), dtype=np.uint8)
+    depth = np.full((h, w), fill_value=5.0, dtype=np.float32)
+
+    # Central foreground subject
+    mask_fg = np.zeros((h, w), dtype=bool)
+    mask_fg[30:70, 30:70] = True
+    depth[30:70, 30:70] = 1.0
+
+    # Isolated satellite object with perfect SAM confidence 0.99
+    mask_sat = np.zeros((h, w), dtype=bool)
+    mask_sat[85:98, 85:98] = True
+    depth[85:98, 85:98] = 1.0
+
+    feat_fg = ss.candidate_features.extract_candidate_features(mask_fg, 0.70, "fg", depth, rgb, 1)
+    feat_sat = ss.candidate_features.extract_candidate_features(mask_sat, 0.99, "sat", depth, rgb, 2)
+
+    masks_by_id = {1: mask_fg, 2: mask_sat}
+    feats_list = [feat_fg, feat_sat]
+    feats_list = ss.candidate_features.compute_batch_relative_features(feats_list, masks_by_id, depth)
+
+    cfg = ss.SubjectSelectionConfig()
+    scores_list = [ss.candidate_scorer.score_candidate_features(f, cfg) for f in feats_list]
+
+    score_fg = [s for s in scores_list if s.candidate_id == 1][0]
+    score_sat = [s for s in scores_list if s.candidate_id == 2][0]
+
+    assert score_fg.final_score > score_sat.final_score
+    assert score_sat.environmental_penalty > 0.10

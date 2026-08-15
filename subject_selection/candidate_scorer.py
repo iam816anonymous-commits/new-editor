@@ -39,10 +39,16 @@ def score_candidate_features(
         scale_score = (config.max_subject_area_ratio - cov) / (config.max_subject_area_ratio - config.optimal_area_ratio_max)
     scale_score = float(np.clip(scale_score, 0.0, 1.0))
 
-    # 5. Geometric coherence score (0..1)
+    # 5. Relative Visual Prominence score (0..1)
+    relative_prominence_score = float(np.clip(features.relative_visual_prominence, 0.0, 1.0))
+
+    # 6. Compound Subject Support score (0..1)
+    compound_support_score = float(np.clip(features.compound_subject_likelihood, 0.0, 1.0))
+
+    # 7. Geometric coherence score (0..1)
     geometric_coherence_score = float(np.clip(features.geometric_coherence_score, 0.0, 1.0))
 
-    # 6. Edge alignment score (0..1)
+    # 8. Edge alignment score (0..1)
     edge_alignment_score = float(np.clip(features.edge_alignment, 0.0, 1.0))
 
     # Weighted Positive Raw Score
@@ -51,11 +57,13 @@ def score_candidate_features(
         config.weight_centrality * centrality_score +
         config.weight_depth_saliency * depth_saliency_score +
         config.weight_scale * scale_score +
+        config.weight_relative_prominence * relative_prominence_score +
+        config.weight_compound_support * compound_support_score +
         config.weight_geometric_coherence * geometric_coherence_score +
         config.weight_edge_alignment * edge_alignment_score
     )
 
-    # 7. Penalties
+    # 9. Penalties
     # Border Penalty
     b_touch = features.border_touch_ratio
     if b_touch > 0.05:
@@ -69,7 +77,10 @@ def score_candidate_features(
     # Fragmentation Penalty
     fragmentation_penalty = float(config.weight_fragmentation_penalty * features.fragmentation_score)
 
-    total_penalties = border_penalty + contamination_penalty + fragmentation_penalty
+    # Environmental Isolation Penalty
+    environmental_penalty = float(config.weight_environmental_penalty * features.environmental_isolation_score)
+
+    total_penalties = border_penalty + contamination_penalty + fragmentation_penalty + environmental_penalty
     final_score = float(max(0.0, raw_score - total_penalties))
 
     return CandidateScore(
@@ -78,11 +89,14 @@ def score_candidate_features(
         centrality_score=round(centrality_score, 4),
         depth_saliency_score=round(depth_saliency_score, 4),
         scale_score=round(scale_score, 4),
+        relative_prominence_score=round(relative_prominence_score, 4),
+        compound_support_score=round(compound_support_score, 4),
         geometric_coherence_score=round(geometric_coherence_score, 4),
         edge_alignment_score=round(edge_alignment_score, 4),
         border_penalty=round(border_penalty, 4),
         contamination_penalty=round(contamination_penalty, 4),
         fragmentation_penalty=round(fragmentation_penalty, 4),
+        environmental_penalty=round(environmental_penalty, 4),
         raw_score=round(raw_score, 4),
         final_score=round(final_score, 4)
     )
