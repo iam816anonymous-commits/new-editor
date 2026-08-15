@@ -31,7 +31,7 @@ def generate_candidate_masks_sam2(
     depth_map: np.ndarray,
     predictor: SAM2ImagePredictor,
     iou_threshold: float = 0.85
-) -> List[np.ndarray]:
+) -> List[Dict[str, Any]]:
     """Generates a deduplicated list of candidate masks using SAM 2 with grid, depth point, and box prompts."""
     predictor.set_image(rgb_array)
     h, w = depth_map.shape
@@ -89,18 +89,26 @@ def generate_candidate_masks_sam2(
             continue
 
     # Deduplicate candidate masks using IoU > iou_threshold
-    dedup_masks: List[np.ndarray] = []
+    dedup_masks: List[Dict[str, Any]] = []
     for mask_bool, score, origin in raw_masks:
         is_dup = False
         for existing in dedup_masks:
-            intersection = np.sum(mask_bool & existing)
-            union = np.sum(mask_bool | existing)
+            intersection = np.sum(mask_bool & existing["mask_bool"])
+            union = np.sum(mask_bool | existing["mask_bool"])
             iou = intersection / union if union > 0 else 0.0
             if iou >= iou_threshold:
                 is_dup = True
+                if score > existing["sam_score"]:
+                    existing["mask_bool"] = mask_bool
+                    existing["sam_score"] = score
+                    existing["prompt_origin"] = origin
                 break
         if not is_dup:
-            dedup_masks.append(mask_bool)
+            dedup_masks.append({
+                "mask_bool": mask_bool,
+                "sam_score": score,
+                "prompt_origin": origin
+            })
 
     return dedup_masks
 
@@ -114,7 +122,8 @@ def export_diagnostics(
     groups: List[CandidateGroup],
     selected_group: CandidateGroup,
     refined_mask: np.ndarray,
-    validation_result: MaskValidationResult
+    validation_result: MaskValidationResult,
+    mask_by_id: Optional[Dict[int, np.ndarray]] = None
 ) -> None:
     """Generates and exports diagnostic PNG artifacts and 12_validation_report.json."""
     hash_dir.mkdir(parents=True, exist_ok=True)
@@ -150,7 +159,10 @@ def export_diagnostics(
         panel = base_vis.copy()
         color = np.array([0, 255, 0], dtype=np.uint8) if is_sel else np.array([0, 255, 255], dtype=np.uint8)
 
-        # We need candidate mask; reconstruct from features bounding box area for contact preview
+        if mask_by_id and cid in mask_by_id:
+            cand_m = mask_by_id[cid]
+            panel[cand_m] = (panel[cand_m] * 0.4 + color * 0.6).astype(np.uint8)
+
         cv2.rectangle(panel, (feat.bbox[1], feat.bbox[0]), (feat.bbox[3], feat.bbox[2]), (0, 255, 0) if is_sel else (0, 255, 255), 2)
         panel_resized = cv2.resize(panel, (panel_w, panel_h), interpolation=cv2.INTER_AREA)
 
@@ -270,11 +282,15 @@ def select_semantic_subject(
     scores_list: List[CandidateScore] = []
     mask_by_id: Dict[int, np.ndarray] = {}
 
-    for idx, mask_bool in enumerate(raw_masks, start=1):
+    for idx, cand_dict in enumerate(raw_masks, start=1):
+        mask_bool = cand_dict["mask_bool"]
+        sam_score = cand_dict["sam_score"]
+        origin = cand_dict["prompt_origin"]
+
         feat = extract_candidate_features(
             mask_bool,
-            sam_score=0.90,  # Default SAM score if not supplied
-            prompt_origin="sam2_prompt",
+            sam_score=sam_score,
+            prompt_origin=origin,
             depth_map=depth_map,
             rgb_array=rgb_array,
             candidate_id=idx,
@@ -317,7 +333,7 @@ def select_semantic_subject(
     if hash_dir is not None:
         export_diagnostics(
             hash_dir, rgb_array, depth_map, features_list, scores_list, groups,
-            selected_group, refined_mask, val_result
+            selected_group, refined_mask, val_result, mask_by_id=mask_by_id
         )
 
     if not val_result.is_valid:
