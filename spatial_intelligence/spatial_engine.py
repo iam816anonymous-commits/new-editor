@@ -11,6 +11,8 @@ from PIL import Image
 
 from .schemas import (
     SegmentationCandidate,
+    EntityClass,
+    SemanticRole,
     Entity,
     EntityPart,
     SceneGraph,
@@ -34,36 +36,56 @@ def generate_consolidated_entities_visualization(
     rgb_array: np.ndarray,
     entities: List[Entity]
 ) -> np.ndarray:
-    """Generates visual debug overlay showing consolidated entities with bounding boxes and entity IDs."""
+    """
+    Generates improved visual debug overlay showing consolidated entities with distinct styling:
+    - PRIMARY_SUBJECT: Solid green outline + green overlay.
+    - RENDERABLE_FOREGROUND: Bright cyan box + overlay.
+    - RENDERABLE_MIDGROUND: Yellow box + overlay.
+    - BACKGROUND_LAYER: Subtle blue overlay, no heavy bounding box.
+    - ANALYSIS_ONLY: Muted gray dashed contour, NO giant bounding boxes.
+    """
     h, w, _ = rgb_array.shape
     vis = rgb_array.copy()
 
-    # Colors for entities
-    colors = [
-        (0, 255, 0),    # Green for primary subject (1)
-        (255, 255, 0),  # Yellow
-        (0, 255, 255),  # Cyan
-        (255, 0, 255),  # Magenta
-        (255, 128, 0),  # Orange
-        (0, 128, 255),  # Sky blue
-        (128, 255, 0),  # Lime
-    ]
-
-    for idx, ent in enumerate(entities):
-        color = colors[idx % len(colors)]
+    for ent in entities:
         mask = ent.mask
 
-        # Overlay mask
-        vis[mask] = (vis[mask] * 0.6 + np.array(color, dtype=np.float32) * 0.4).astype(np.uint8)
+        # Distinct visual styling based on entity class and semantic role
+        if ent.is_primary_subject or ent.semantic_role == SemanticRole.PRIMARY_SUBJECT:
+            color = (0, 255, 0)  # Bright Green
+            vis[mask] = (vis[mask] * 0.5 + np.array(color, dtype=np.float32) * 0.5).astype(np.uint8)
+            bbox = ent.bbox
+            cv2.rectangle(vis, (bbox[1], bbox[0]), (bbox[3], bbox[2]), color, 2)
+            cv2.putText(
+                vis, f"ID {ent.entity_id}: PRIMARY_SUBJECT (T={ent.trust_score:.2f})",
+                (bbox[1] + 4, max(20, bbox[0] + 18)),
+                cv2.FONT_HERSHEY_SIMPLEX, 0.45, (255, 255, 255), 1, cv2.LINE_AA
+            )
+        elif ent.entity_class == EntityClass.RENDERABLE_ENTITY:
+            if ent.semantic_role == SemanticRole.FOREGROUND_OBJECT:
+                color = (0, 255, 255)  # Cyan
+            else:
+                color = (255, 255, 0)  # Yellow
 
-        # Draw bbox and label
-        bbox = ent.bbox
-        cv2.rectangle(vis, (bbox[1], bbox[0]), (bbox[3], bbox[2]), color, 2)
-        cv2.putText(
-            vis, f"ID {ent.entity_id}: {ent.semantic_role.value} (T={ent.trust_score:.2f})",
-            (bbox[1] + 4, max(20, bbox[0] + 18)),
-            cv2.FONT_HERSHEY_SIMPLEX, 0.45, (255, 255, 255), 1, cv2.LINE_AA
-        )
+            vis[mask] = (vis[mask] * 0.6 + np.array(color, dtype=np.float32) * 0.4).astype(np.uint8)
+            bbox = ent.bbox
+            cv2.rectangle(vis, (bbox[1], bbox[0]), (bbox[3], bbox[2]), color, 2)
+            cv2.putText(
+                vis, f"ID {ent.entity_id}: {ent.semantic_role.value} (T={ent.trust_score:.2f})",
+                (bbox[1] + 4, max(20, bbox[0] + 18)),
+                cv2.FONT_HERSHEY_SIMPLEX, 0.45, (255, 255, 255), 1, cv2.LINE_AA
+            )
+        else:
+            # ANALYSIS_ONLY regions: Subtle blue tint, NO giant bounding box
+            color = (180, 180, 180)  # Muted Gray
+            vis[mask] = (vis[mask] * 0.85 + np.array([50, 50, 150], dtype=np.float32) * 0.15).astype(np.uint8)
+            # Only draw a subtle text label at centroid, no giant rectangle
+            cy, cx = int(ent.centroid[0]), int(ent.centroid[1])
+            cv2.putText(
+                vis, f"ID {ent.entity_id}: ANALYSIS_ONLY",
+                (max(10, cx - 40), max(20, cy)),
+                cv2.FONT_HERSHEY_SIMPLEX, 0.38, color, 1, cv2.LINE_AA
+            )
 
     return vis
 

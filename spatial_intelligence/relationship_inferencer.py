@@ -7,6 +7,7 @@ import numpy as np
 from typing import List, Dict, Tuple, Any, Optional
 from .schemas import (
     RelationType,
+    EntityClass,
     Entity,
     EntityPart,
     SpatialRelationship,
@@ -96,14 +97,16 @@ def infer_spatial_relationships(
     min_occlusion_threshold: float = 0.55
 ) -> SceneGraph:
     """
-    Infers a sparse, canonical, render-relevant relationship graph among trusted entities.
+    Infers a sparse, render-oriented canonical relationship graph among entities.
 
-    Guarantees:
-    1. Operates only on trusted entities ($N \approx 5\text{--}15$).
-    2. Enforces canonical pair ordering (min_id, max_id) to eliminate reciprocal duplicates
-       (e.g., FRONT_OF + BEHIND, OCCLUDES + OCCLUDED_BY are stored as single canonical edges).
-    3. OVERLAPS does not automatically imply OCCLUDES; OCCLUDES requires multi-signal validation.
-    4. Filters out irrelevant relationships (LOW / IGNORE) to maintain a sparse graph.
+    Phase 1.6 Hardening Rules:
+    1. Operates only between renderable entities or between primary subject and immediate environment.
+       Skip pairwise relationship generation between two ANALYSIS_REGION entities.
+    2. FRONT_OF GATE: Depth difference alone between distant/unrelated regions must NOT create FRONT_OF.
+       Requires spatial interaction (overlap_ratio > 0.05 or normalized centroid distance < 0.35) plus depth separation.
+    3. OCCLUSION GATE: OCCLUDES strictly requires actual mask overlap, contact boundary, and depth separation.
+    4. SUPPORTS GATE: Strict horizontal/vertical contact geometry, vertical displacement, and compatible roles.
+    5. Records explicit rejection reasons for candidate pairs that fail spatial gates.
     """
     entities = list(scene_graph.entities.values())
     num_entities = len(entities)
@@ -119,8 +122,14 @@ def infer_spatial_relationships(
             if entA.entity_id > entB.entity_id:
                 entA, entB = entB, entA
 
-            # Skip pairwise calculation between two low-relevance background regions
-            if entA.render_relevance == RenderRelevance.IGNORE and entB.render_relevance == RenderRelevance.IGNORE:
+            scene_graph.relationship_candidate_count += 1
+
+            # Rule 1: Skip pairwise relationship generation between two analysis-only regions
+            if entA.entity_class == EntityClass.ANALYSIS_REGION and entB.entity_class == EntityClass.ANALYSIS_REGION:
+                scene_graph.record_rejected_relationship(
+                    entA.entity_id, entB.entity_id, RelationType.FRONT_OF,
+                    "environmental_region", {"reason": "both_entities_analysis_region"}
+                )
                 continue
 
             # 1. Mask Overlap & Intersection
@@ -135,24 +144,32 @@ def infer_spatial_relationships(
             # 3. Depth Difference (entA.depth_mean - entB.depth_mean)
             d_diff = entA.depth_mean - entB.depth_mean  # Negative -> entA is closer
 
-            # Canonical Relationship 1: FRONT_OF
+            # Canonical Relationship 1: FRONT_OF Gate (Requires spatial proximity/interaction AND depth separation)
             if abs(d_diff) > 0.35:
-                conf = min(0.99, float(abs(d_diff) / 3.0 + 0.50))
-                rel_relevance = RenderRelevance.CRITICAL if (entA.is_primary_subject or entB.is_primary_subject) else RenderRelevance.USEFUL
+                # FRONT_OF Gate Check: Do not create FRONT_OF for unrelated distant regions
+                is_spatially_interacting = (overlap_ratio > 0.05) or (norm_dist < 0.35) or (entA.is_primary_subject or entB.is_primary_subject)
+                if is_spatially_interacting:
+                    conf = min(0.99, float(abs(d_diff) / 3.0 + 0.50))
+                    rel_relevance = RenderRelevance.CRITICAL if (entA.is_primary_subject or entB.is_primary_subject) else RenderRelevance.USEFUL
 
-                if d_diff < 0:  # entA is closer than entB -> entA FRONT_OF entB
-                    scene_graph.add_relationship(
+                    if d_diff < 0:  # entA is closer than entB -> entA FRONT_OF entB
+                        scene_graph.add_relationship(
+                            entA.entity_id, entB.entity_id, RelationType.FRONT_OF,
+                            confidence=round(conf, 3), evidence=f"depth_mean_diff({d_diff:.2f})",
+                            render_relevance=rel_relevance,
+                            supporting_metrics={"depth_diff": round(d_diff, 3), "norm_dist": round(norm_dist, 3)}
+                        )
+                    else:  # entB is closer than entA -> entB FRONT_OF entA
+                        scene_graph.add_relationship(
+                            entB.entity_id, entA.entity_id, RelationType.FRONT_OF,
+                            confidence=round(conf, 3), evidence=f"depth_mean_diff({-d_diff:.2f})",
+                            render_relevance=rel_relevance,
+                            supporting_metrics={"depth_diff": round(-d_diff, 3), "norm_dist": round(norm_dist, 3)}
+                        )
+                else:
+                    scene_graph.record_rejected_relationship(
                         entA.entity_id, entB.entity_id, RelationType.FRONT_OF,
-                        confidence=round(conf, 3), evidence=f"depth_mean_diff({d_diff:.2f})",
-                        render_relevance=rel_relevance,
-                        supporting_metrics={"depth_diff": round(d_diff, 3)}
-                    )
-                else:  # entB is closer than entA -> entB FRONT_OF entA
-                    scene_graph.add_relationship(
-                        entB.entity_id, entA.entity_id, RelationType.FRONT_OF,
-                        confidence=round(conf, 3), evidence=f"depth_mean_diff({-d_diff:.2f})",
-                        render_relevance=rel_relevance,
-                        supporting_metrics={"depth_diff": round(-d_diff, 3)}
+                        "insufficient_spatial_interaction", {"depth_diff": round(d_diff, 3), "norm_dist": round(norm_dist, 3)}
                     )
 
             # Canonical Relationship 2: SAME_COMPOUND_SUBJECT / NEAR
@@ -163,7 +180,7 @@ def infer_spatial_relationships(
                         confidence=0.95, evidence="primary_subject_cluster",
                         render_relevance=RenderRelevance.CRITICAL
                     )
-                elif norm_dist < 0.15 and (entA.is_primary_subject or entB.is_primary_subject or entA.trust_score > 0.65 or entB.trust_score > 0.65):
+                elif norm_dist < 0.15 and (entA.is_primary_subject or entB.is_primary_subject or (entA.entity_class == EntityClass.RENDERABLE_ENTITY and entB.entity_class == EntityClass.RENDERABLE_ENTITY)):
                     scene_graph.add_relationship(
                         entA.entity_id, entB.entity_id, RelationType.NEAR,
                         confidence=round(1.0 - norm_dist / 0.15, 3), evidence=f"norm_dist({norm_dist:.2f})",
@@ -172,7 +189,7 @@ def infer_spatial_relationships(
                     )
 
             # Canonical Relationship 3: OVERLAPS & Multi-Signal OCCLUDES
-            if overlap_ratio > 0.15 and (entA.is_primary_subject or entB.is_primary_subject or entA.trust_score > 0.60 or entB.trust_score > 0.60):
+            if overlap_ratio > 0.10 and (entA.entity_class == EntityClass.RENDERABLE_ENTITY or entB.entity_class == EntityClass.RENDERABLE_ENTITY):
                 # Store OVERLAPS independently
                 scene_graph.add_relationship(
                     entA.entity_id, entB.entity_id, RelationType.OVERLAPS,
@@ -200,17 +217,23 @@ def infer_spatial_relationships(
                             render_relevance=RenderRelevance.CRITICAL,
                             supporting_metrics=metrics_B
                         )
-
-            # Canonical Relationship 4: SUPPORTS
-            if abs(entA.centroid[1] - entB.centroid[1]) < 0.25 * w and abs(d_diff) < 0.6:
-                if entB.centroid[0] > entA.centroid[0]:  # entB is below entA in Y
-                    dist_y = entB.centroid[0] - entA.centroid[0]
-                    if 0.05 * h < dist_y < 0.35 * h:
-                        scene_graph.add_relationship(
-                            entB.entity_id, entA.entity_id, RelationType.SUPPORTS,
-                            confidence=0.75, evidence=f"vertical_support_dist_y({dist_y:.1f})",
-                            render_relevance=RenderRelevance.USEFUL,
-                            supporting_metrics={"dist_y": round(dist_y, 1)}
+                    else:
+                        scene_graph.record_rejected_relationship(
+                            entA.entity_id, entB.entity_id, RelationType.OCCLUDES,
+                            "overlap_without_occlusion", {"score_A": round(score_A_occ_B, 3), "score_B": round(score_B_occ_A, 3)}
                         )
+
+            # Canonical Relationship 4: SUPPORTS Gate (Requires strict vertical contact and compatible roles)
+            if abs(entA.centroid[1] - entB.centroid[1]) < 0.20 * w and abs(d_diff) < 0.5:
+                if entA.entity_class == EntityClass.RENDERABLE_ENTITY and entB.entity_class == EntityClass.RENDERABLE_ENTITY:
+                    if entB.centroid[0] > entA.centroid[0]:  # entB is below entA in Y
+                        dist_y = entB.centroid[0] - entA.centroid[0]
+                        if 0.05 * h < dist_y < 0.30 * h:
+                            scene_graph.add_relationship(
+                                entB.entity_id, entA.entity_id, RelationType.SUPPORTS,
+                                confidence=0.75, evidence=f"vertical_support_dist_y({dist_y:.1f})",
+                                render_relevance=RenderRelevance.USEFUL,
+                                supporting_metrics={"dist_y": round(dist_y, 1)}
+                            )
 
     return scene_graph

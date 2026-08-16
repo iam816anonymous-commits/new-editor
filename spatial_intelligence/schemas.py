@@ -37,6 +37,12 @@ class RelationType(str, Enum):
     SAME_COMPOUND_SUBJECT = "SAME_COMPOUND_SUBJECT"
 
 
+class EntityClass(str, Enum):
+    """Explicit classification distinguishing renderable entities from analysis-only regions."""
+    RENDERABLE_ENTITY = "RENDERABLE_ENTITY"
+    ANALYSIS_REGION = "ANALYSIS_REGION"
+
+
 class SemanticRole(str, Enum):
     """Coarse semantic / render role for trusted scene entities."""
     PRIMARY_SUBJECT = "PRIMARY_SUBJECT"
@@ -111,6 +117,7 @@ class Entity:
     depth_mean: float
     depth_median: float
     depth_std: float
+    entity_class: EntityClass = EntityClass.RENDERABLE_ENTITY
     semantic_role: SemanticRole = SemanticRole.SECONDARY_OBJECT
     trust_score: float = 1.0
     trust_details: Optional[EntityTrustScore] = None
@@ -134,16 +141,35 @@ class SpatialRelationship:
 
 
 @dataclass
+class RejectedRelationship:
+    """Record tracking a rejected relationship candidate and explicit rejection reason."""
+    subject_id: int
+    target_id: int
+    relation_type: RelationType
+    rejection_reason: str
+    supporting_metrics: Dict[str, float] = field(default_factory=dict)
+
+
+@dataclass
 class SceneGraph:
     """Sparse graph representation holding trusted entities, parts, and canonical spatial relationship edges."""
     entities: Dict[int, Entity] = field(default_factory=dict)
     relationships: List[SpatialRelationship] = field(default_factory=list)
+    rejected_relationships: List[RejectedRelationship] = field(default_factory=list)
     raw_candidate_count: int = 0
     rejected_candidate_count: int = 0
     merged_candidate_count: int = 0
+    analysis_only_entity_count: int = 0
+    renderable_entity_count: int = 0
+    relationship_candidate_count: int = 0
+    relationship_rejected_count: int = 0
 
     def add_entity(self, entity: Entity) -> None:
         self.entities[entity.entity_id] = entity
+        if entity.entity_class == EntityClass.RENDERABLE_ENTITY:
+            self.renderable_entity_count += 1
+        else:
+            self.analysis_only_entity_count += 1
 
     def add_relationship(
         self,
@@ -164,6 +190,23 @@ class SceneGraph:
             render_relevance=render_relevance,
             supporting_metrics=supporting_metrics or {}
         ))
+
+    def record_rejected_relationship(
+        self,
+        subject_id: int,
+        target_id: int,
+        relation_type: RelationType,
+        rejection_reason: str,
+        supporting_metrics: Optional[Dict[str, float]] = None
+    ) -> None:
+        self.rejected_relationships.append(RejectedRelationship(
+            subject_id=subject_id,
+            target_id=target_id,
+            relation_type=relation_type,
+            rejection_reason=rejection_reason,
+            supporting_metrics=supporting_metrics or {}
+        ))
+        self.relationship_rejected_count += 1
 
     def get_relationships_for_entity(self, entity_id: int) -> List[SpatialRelationship]:
         return [r for r in self.relationships if r.subject_id == entity_id or r.target_id == entity_id]

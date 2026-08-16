@@ -1031,7 +1031,7 @@ def test_spatial_intelligence_schemas_and_scene_graph():
 
     sg_dict = si.scene_graph.export_scene_graph_dict(sg)
     assert sg_dict["trusted_entities_count"] == 1
-    assert sg_dict["relationships_count"] == 1
+    assert sg_dict["final_relationship_count"] == 1
     assert sg_dict["relationships"][0]["relation_type"] == "FRONT_OF"
 
 
@@ -1257,19 +1257,19 @@ def test_p15_7_canonical_front_of_prevents_duplicate_behind_record():
     """TEST 7: A FRONT_OF B creates a single canonical relationship without reciprocal graph duplication."""
     import spatial_intelligence as si
     h, w = 64, 64
-    m1 = np.zeros((h, w), dtype=bool); m1[5:20, 5:20] = True
-    m2 = np.zeros((h, w), dtype=bool); m2[40:55, 40:55] = True
+    m1 = np.zeros((h, w), dtype=bool); m1[20:40, 20:40] = True
+    m2 = np.zeros((h, w), dtype=bool); m2[25:45, 25:45] = True  # Nearby interacting masks
 
-    ent1 = si.Entity(1, "e1", m1, (5,5,20,20), (12,12), (0.2,0.2), 225, 0.05, 1.0, 1.0, 0.1)
-    ent2 = si.Entity(2, "e2", m2, (40,40,55,55), (47,47), (0.7,0.7), 225, 0.05, 5.0, 5.0, 0.1)
+    ent1 = si.Entity(1, "e1", m1, (20,20,40,40), (30,30), (0.5,0.5), 400, 0.1, 1.0, 1.0, 0.1)
+    ent2 = si.Entity(2, "e2", m2, (25,25,45,45), (35,35), (0.5,0.5), 400, 0.1, 5.0, 5.0, 0.1)
 
     sg = si.create_scene_graph([ent1, ent2])
     sg = si.relationship_inferencer.infer_spatial_relationships(sg, (h, w))
 
-    assert len(sg.relationships) == 1
-    assert sg.relationships[0].relation_type == si.RelationType.FRONT_OF
-    assert sg.relationships[0].subject_id == 1
-    assert sg.relationships[0].target_id == 2
+    front_rels = [r for r in sg.relationships if r.relation_type == si.RelationType.FRONT_OF]
+    assert len(front_rels) == 1
+    assert front_rels[0].subject_id == 1
+    assert front_rels[0].target_id == 2
 
 
 def test_p15_8_canonical_occludes_prevents_duplicate_occluded_by_record():
@@ -1363,11 +1363,11 @@ def test_p15_13_relationship_generation_is_deterministic():
     """TEST 13: Executing relationship inference twice on same graph yields identical outputs."""
     import spatial_intelligence as si
     h, w = 64, 64
-    m1 = np.zeros((h, w), dtype=bool); m1[5:20, 5:20] = True
-    m2 = np.zeros((h, w), dtype=bool); m2[40:55, 40:55] = True
+    m1 = np.zeros((h, w), dtype=bool); m1[20:40, 20:40] = True
+    m2 = np.zeros((h, w), dtype=bool); m2[25:45, 25:45] = True
 
-    ent1 = si.Entity(1, "e1", m1, (5,5,20,20), (12,12), (0.2,0.2), 225, 0.05, 1.0, 1.0, 0.1)
-    ent2 = si.Entity(2, "e2", m2, (40,40,55,55), (47,47), (0.7,0.7), 225, 0.05, 5.0, 5.0, 0.1)
+    ent1 = si.Entity(1, "e1", m1, (20,20,40,40), (30,30), (0.5,0.5), 400, 0.1, 1.0, 1.0, 0.1)
+    ent2 = si.Entity(2, "e2", m2, (25,25,45,45), (35,35), (0.5,0.5), 400, 0.1, 5.0, 5.0, 0.1)
 
     sg1 = si.create_scene_graph([ent1, ent2])
     sg1 = si.relationship_inferencer.infer_spatial_relationships(sg1, (h, w))
@@ -1588,3 +1588,150 @@ def test_adv_case_j_foreground_object_partially_occluding_primary_subject():
     assert len(occ_rels) == 1
     assert occ_rels[0].subject_id == 2  # FG object (Z=1.0) OCCLUDES Primary subject (Z=3.0)
     assert occ_rels[0].target_id == 1
+
+
+# ============================================================
+# PHASE 1.6 REGRESSION TESTS (A - H)
+# ============================================================
+
+def test_p16_a_unrelated_distant_regions_different_depth_do_not_create_front_of():
+    """TEST A: Two unrelated distant regions with different depth do NOT create FRONT_OF."""
+    import spatial_intelligence as si
+    h, w = 64, 64
+    m1 = np.zeros((h, w), dtype=bool); m1[0:10, 0:10] = True     # Top-left corner
+    m2 = np.zeros((h, w), dtype=bool); m2[50:60, 50:60] = True   # Bottom-right corner (norm_dist > 0.70, no overlap)
+
+    ent1 = si.Entity(2, "bg1", m1, (0,0,10,10), (5,5), (0.08,0.08), 100, 0.02, 2.0, 2.0, 0.1, entity_class=si.EntityClass.ANALYSIS_REGION)
+    ent2 = si.Entity(3, "bg2", m2, (50,50,60,60), (55,55), (0.86,0.86), 100, 0.02, 8.0, 8.0, 0.1, entity_class=si.EntityClass.ANALYSIS_REGION)
+
+    sg = si.create_scene_graph([ent1, ent2])
+    sg = si.relationship_inferencer.infer_spatial_relationships(sg, (h, w))
+
+    front_rels = [r for r in sg.relationships if r.relation_type == si.RelationType.FRONT_OF]
+    assert len(front_rels) == 0
+    assert len(sg.rejected_relationships) >= 1
+
+
+def test_p16_b_overlapping_masks_insufficient_depth_separation_no_occludes():
+    """TEST B: Two overlapping masks with insufficient depth separation do NOT create OCCLUDES."""
+    import spatial_intelligence as si
+    h, w = 64, 64
+    m1 = np.zeros((h, w), dtype=bool); m1[20:40, 20:40] = True
+    m2 = np.zeros((h, w), dtype=bool); m2[25:45, 25:45] = True
+
+    ent1 = si.Entity(1, "o1", m1, (20,20,40,40), (30,30), (0.5,0.5), 400, 0.1, 2.0, 2.0, 0.1, trust_score=0.9)
+    ent2 = si.Entity(2, "o2", m2, (25,25,45,45), (35,35), (0.5,0.5), 400, 0.1, 2.05, 2.05, 0.1, trust_score=0.9)  # delta Z = 0.05 < 0.15
+
+    sg = si.create_scene_graph([ent1, ent2])
+    sg = si.relationship_inferencer.infer_spatial_relationships(sg, (h, w))
+
+    occ_rels = [r for r in sg.relationships if r.relation_type == si.RelationType.OCCLUDES]
+    assert len(occ_rels) == 0
+
+
+def test_p16_c_large_environmental_masks_classified_analysis_region():
+    """TEST C: Large environmental background masks (>25% area) are classified as ANALYSIS_REGION."""
+    import spatial_intelligence as si
+    h, w = 64, 64
+    m_large = np.ones((h, w), dtype=bool); m_large[20:40, 20:40] = False  # 90% area
+
+    ent = si.Entity(2, "env_bg", m_large, (0,0,64,64), (32,32), (0.5,0.5), 3696, 0.90, 8.0, 8.0, 0.1)
+    rgb = np.full((h, w, 3), 100, dtype=np.uint8)
+    depth = np.full((h, w), 8.0, dtype=np.float32)
+    conf = np.ones((h, w), dtype=np.float32)
+
+    entities = si.entity_trust.process_entity_trust_and_roles([ent], rgb, depth, conf)
+    assert entities[0].entity_class == si.EntityClass.ANALYSIS_REGION
+    assert entities[0].render_relevance == si.RenderRelevance.IGNORE
+
+
+def test_p16_d_primary_subject_remains_canonical_renderable_entity():
+    """TEST D: Primary subject remains 1 canonical RENDERABLE_ENTITY and CRITICAL."""
+    import spatial_intelligence as si
+    h, w = 64, 64
+    m_sub = np.zeros((h, w), dtype=bool); m_sub[20:50, 20:50] = True
+    ent = si.Entity(1, "primary", m_sub, (20,20,50,50), (35,35), (0.55,0.55), 900, 0.22, 2.0, 2.0, 0.1, is_primary_subject=True)
+
+    rgb = np.full((h, w, 3), 100, dtype=np.uint8)
+    depth = np.full((h, w), 2.0, dtype=np.float32)
+    conf = np.ones((h, w), dtype=np.float32)
+
+    entities = si.entity_trust.process_entity_trust_and_roles([ent], rgb, depth, conf)
+    assert entities[0].entity_class == si.EntityClass.RENDERABLE_ENTITY
+    assert entities[0].render_relevance == si.RenderRelevance.CRITICAL
+
+
+def test_p16_e_overlap_does_not_imply_occlusion():
+    """TEST E: OVERLAP does not automatically imply OCCLUSION."""
+    import spatial_intelligence as si
+    h, w = 64, 64
+    m1 = np.zeros((h, w), dtype=bool); m1[20:40, 20:40] = True
+    m2 = np.zeros((h, w), dtype=bool); m2[25:45, 25:45] = True
+
+    ent1 = si.Entity(1, "o1", m1, (20,20,40,40), (30,30), (0.5,0.5), 400, 0.1, 2.0, 2.0, 0.1)
+    ent2 = si.Entity(2, "o2", m2, (25,25,45,45), (35,35), (0.5,0.5), 400, 0.1, 2.0, 2.0, 0.1)
+
+    sg = si.create_scene_graph([ent1, ent2])
+    sg = si.relationship_inferencer.infer_spatial_relationships(sg, (h, w))
+
+    rel_types = [r.relation_type for r in sg.relationships]
+    assert si.RelationType.OVERLAPS in rel_types
+    assert si.RelationType.OCCLUDES not in rel_types
+
+
+def test_p16_f_unrelated_background_entities_do_not_create_pairwise_edges():
+    """TEST F: Unrelated ANALYSIS_REGION background entities do NOT create pairwise graph edges."""
+    import spatial_intelligence as si
+    h, w = 64, 64
+    m1 = np.zeros((h, w), dtype=bool); m1[0:20, 0:20] = True
+    m2 = np.zeros((h, w), dtype=bool); m2[40:60, 40:60] = True
+
+    ent1 = si.Entity(2, "bg1", m1, (0,0,20,20), (10,10), (0.15,0.15), 400, 0.1, 8.0, 8.0, 0.1, entity_class=si.EntityClass.ANALYSIS_REGION)
+    ent2 = si.Entity(3, "bg2", m2, (40,40,60,60), (50,50), (0.78,0.78), 400, 0.1, 9.0, 9.0, 0.1, entity_class=si.EntityClass.ANALYSIS_REGION)
+
+    sg = si.create_scene_graph([ent1, ent2])
+    sg = si.relationship_inferencer.infer_spatial_relationships(sg, (h, w))
+
+    assert len(sg.relationships) == 0
+    assert len(sg.rejected_relationships) == 1
+
+
+def test_p16_g_valid_foreground_object_overlapping_background_produces_occludes():
+    """TEST G: Valid RENDERABLE_ENTITY foreground object overlapping background produces OCCLUDES."""
+    import spatial_intelligence as si
+    h, w = 64, 64
+    m_fg = np.zeros((h, w), dtype=bool); m_fg[20:40, 20:40] = True
+    m_bg = np.ones((h, w), dtype=bool)
+
+    ent_fg = si.Entity(1, "fg", m_fg, (20,20,40,40), (30,30), (0.5,0.5), 400, 0.1, 1.0, 1.0, 0.1, entity_class=si.EntityClass.RENDERABLE_ENTITY, trust_score=0.9)
+    ent_bg = si.Entity(2, "bg", m_bg, (0,0,64,64), (32,32), (0.5,0.5), 4096, 1.0, 8.0, 8.0, 0.1, entity_class=si.EntityClass.ANALYSIS_REGION, trust_score=0.8)
+
+    sg = si.create_scene_graph([ent_fg, ent_bg])
+    sg = si.relationship_inferencer.infer_spatial_relationships(sg, (h, w))
+
+    occ_rels = [r for r in sg.relationships if r.relation_type == si.RelationType.OCCLUDES]
+    assert len(occ_rels) == 1
+    assert occ_rels[0].subject_id == 1
+    assert occ_rels[0].target_id == 2
+
+
+def test_p16_h_graph_statistics_and_rejection_reasons_recorded():
+    """TEST H: Graph statistics and rejected relationship reasons are recorded in exported dictionary."""
+    import spatial_intelligence as si
+    h, w = 64, 64
+    m1 = np.zeros((h, w), dtype=bool); m1[0:10, 0:10] = True
+    m2 = np.zeros((h, w), dtype=bool); m2[50:60, 50:60] = True
+
+    ent1 = si.Entity(2, "bg1", m1, (0,0,10,10), (5,5), (0.08,0.08), 100, 0.02, 2.0, 2.0, 0.1, entity_class=si.EntityClass.ANALYSIS_REGION)
+    ent2 = si.Entity(3, "bg2", m2, (50,50,60,60), (55,55), (0.86,0.86), 100, 0.02, 8.0, 8.0, 0.1, entity_class=si.EntityClass.ANALYSIS_REGION)
+
+    sg = si.create_scene_graph([ent1, ent2])
+    sg = si.relationship_inferencer.infer_spatial_relationships(sg, (h, w))
+
+    sg_dict = si.export_scene_graph_dict(sg)
+
+    assert "analysis_only_entity_count" in sg_dict
+    assert "relationship_candidate_count" in sg_dict
+    assert "rejected_relationships" in sg_dict
+    assert len(sg_dict["rejected_relationships"]) >= 1
+    assert "rejection_reason" in sg_dict["rejected_relationships"][0]

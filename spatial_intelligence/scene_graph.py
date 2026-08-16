@@ -63,12 +63,37 @@ def export_scene_graph_dict(scene_graph: SceneGraph) -> Dict[str, Any]:
         for r in scene_graph.relationships
     ]
 
+    rejected_export = [
+        {
+            "subject_id": rr.subject_id,
+            "target_id": rr.target_id,
+            "relation_type": rr.relation_type.value,
+            "rejection_reason": rr.rejection_reason,
+            "supporting_metrics": rr.supporting_metrics
+        }
+        for rr in scene_graph.rejected_relationships
+    ]
+
+    front_of_cnt = len([r for r in scene_graph.relationships if r.relation_type == RelationType.FRONT_OF])
+    overlap_cnt = len([r for r in scene_graph.relationships if r.relation_type == RelationType.OVERLAPS])
+    occlusion_cnt = len([r for r in scene_graph.relationships if r.relation_type == RelationType.OCCLUDES])
+    support_cnt = len([r for r in scene_graph.relationships if r.relation_type == RelationType.SUPPORTS])
+
     return {
         "raw_candidate_count": scene_graph.raw_candidate_count,
         "rejected_candidate_count": scene_graph.rejected_candidate_count,
         "merged_candidate_count": scene_graph.merged_candidate_count,
         "trusted_entities_count": len(scene_graph.entities),
-        "relationships_count": len(scene_graph.relationships),
+        "analysis_only_entity_count": scene_graph.analysis_only_entity_count,
+        "renderable_entity_count": scene_graph.renderable_entity_count,
+        "relationship_candidate_count": scene_graph.relationship_candidate_count,
+        "relationship_rejected_count": scene_graph.relationship_rejected_count,
+        "final_relationship_count": len(scene_graph.relationships),
+        "front_of_count": front_of_cnt,
+        "overlap_count": overlap_cnt,
+        "occlusion_count": occlusion_cnt,
+        "support_count": support_cnt,
         "entities": entities_export,
-        "relationships": relationships_export
+        "relationships": relationships_export,
+        "rejected_relationships": rejected_export
     }

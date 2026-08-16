@@ -8,6 +8,7 @@ import numpy as np
 from typing import List, Dict, Tuple, Optional
 from .schemas import (
     Entity,
+    EntityClass,
     EntityTrustScore,
     SemanticRole,
     RenderRelevance
@@ -143,42 +144,50 @@ def compute_entity_trust_score(
     )
 
 
-def classify_semantic_role_and_relevance(
+def classify_entity_class_role_and_relevance(
     entity: Entity,
     depth_span_min: float,
     depth_span_max: float
-) -> Tuple[SemanticRole, RenderRelevance]:
+) -> Tuple[EntityClass, SemanticRole, RenderRelevance]:
     """
-    Classifies entity into coarse semantic role and render relevance.
+    Classifies entity into EntityClass (RENDERABLE_ENTITY vs ANALYSIS_REGION), coarse SemanticRole, and RenderRelevance.
 
-    Roles:
-    - PRIMARY_SUBJECT: Protected primary subject.
-    - FOREGROUND_OBJECT: High saliency, close depth Z.
-    - MIDGROUND_OBJECT: Intermediate depth Z.
-    - BACKGROUND_REGION: Farthest depth Z, large area.
-    - EMPTY_BACKGROUND: Deep background regions.
+    Environmental Suppression Rules:
+    - PRIMARY_SUBJECT is ALWAYS RENDERABLE_ENTITY and CRITICAL.
+    - Large background regions (>25% area) with low boundary alignment or high depth variance are classified as
+      ANALYSIS_REGION and IGNORE/LOW render relevance so they do NOT create competing renderable objects or pairwise graph clutter.
+    - Compact foreground/midground objects with strong trust scores remain RENDERABLE_ENTITY.
     """
     if entity.is_primary_subject:
-        return SemanticRole.PRIMARY_SUBJECT, RenderRelevance.CRITICAL
+        return EntityClass.RENDERABLE_ENTITY, SemanticRole.PRIMARY_SUBJECT, RenderRelevance.CRITICAL
 
     d_span = max(1e-5, depth_span_max - depth_span_min)
     norm_depth = (entity.depth_mean - depth_span_min) / d_span
 
-    # Role classification
-    if norm_depth < 0.25:
+    # Multi-signal check for analysis-only background regions
+    is_large_background = entity.area_ratio > 0.25
+    is_deep_background = norm_depth > 0.60
+    has_low_trust = entity.trust_score < 0.65
+
+    if is_large_background or (is_deep_background and has_low_trust):
+        ent_class = EntityClass.ANALYSIS_REGION
+        role = SemanticRole.BACKGROUND_REGION if entity.area_ratio > 0.15 else SemanticRole.EMPTY_BACKGROUND
+        relevance = RenderRelevance.IGNORE
+    elif norm_depth < 0.25 and entity.trust_score > 0.50:
+        ent_class = EntityClass.RENDERABLE_ENTITY
         role = SemanticRole.FOREGROUND_OBJECT
-        relevance = RenderRelevance.CRITICAL if entity.trust_score > 0.60 else RenderRelevance.USEFUL
-    elif norm_depth < 0.65:
+        relevance = RenderRelevance.CRITICAL if entity.trust_score > 0.70 else RenderRelevance.USEFUL
+    elif norm_depth < 0.60 and entity.trust_score > 0.55 and entity.area_ratio < 0.25:
+        ent_class = EntityClass.RENDERABLE_ENTITY
         role = SemanticRole.MIDGROUND_OBJECT
-        relevance = RenderRelevance.USEFUL if entity.trust_score > 0.50 else RenderRelevance.LOW
-    elif entity.area_ratio > 0.25:
-        role = SemanticRole.BACKGROUND_REGION
         relevance = RenderRelevance.USEFUL
     else:
-        role = SemanticRole.EMPTY_BACKGROUND
-        relevance = RenderRelevance.LOW if entity.trust_score > 0.50 else RenderRelevance.IGNORE
+        # Default fallback for uninformative/weak environmental blobs
+        ent_class = EntityClass.ANALYSIS_REGION
+        role = SemanticRole.SECONDARY_OBJECT if norm_depth < 0.50 else SemanticRole.BACKGROUND_REGION
+        relevance = RenderRelevance.LOW
 
-    return role, relevance
+    return ent_class, role, relevance
 
 
 def process_entity_trust_and_roles(
@@ -187,7 +196,7 @@ def process_entity_trust_and_roles(
     refined_depth: np.ndarray,
     confidence_map: np.ndarray
 ) -> List[Entity]:
-    """Computes trust score and semantic role for all entities in list."""
+    """Computes trust score, entity class, and semantic role for all entities in list."""
     d_min, d_max = float(refined_depth.min()), float(refined_depth.max())
 
     for ent in entities:
@@ -195,7 +204,8 @@ def process_entity_trust_and_roles(
         ent.trust_details = trust_details
         ent.trust_score = trust_details.overall_trust_score
 
-        role, relevance = classify_semantic_role_and_relevance(ent, d_min, d_max)
+        ent_class, role, relevance = classify_entity_class_role_and_relevance(ent, d_min, d_max)
+        ent.entity_class = ent_class
         ent.semantic_role = role
         ent.render_relevance = relevance
 
