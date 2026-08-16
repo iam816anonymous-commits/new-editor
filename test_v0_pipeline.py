@@ -1906,3 +1906,123 @@ def test_p17_10_temporal_diagnostics_continue_to_run():
     assert "overall_temporal_mad" in temp_summary
     assert "loop_closure_mae" in temp_summary
     assert plot_img.shape == (320, 640, 3)
+
+
+# ============================================================
+# PHASE 1.8 RECONSTRUCTION, BENCHMARK & QUALITY TESTS (8 TESTS)
+# ============================================================
+
+def test_p18_1_rendering_config_schema_and_defaults():
+    """TEST 1: RenderingConfig contract initializes with valid parameters and defaults."""
+    import spatial_intelligence as si
+    cfg = si.RenderingConfig(parallax_strength=1.5, frame_count=100)
+    assert cfg.parallax_strength == 1.5
+    assert cfg.frame_count == 100
+    assert cfg.minimum_motion == 2.0
+
+
+def test_p18_2_edge_analysis_pipeline():
+    """TEST 2: compute_edge_maps generates Sobel, Canny, Laplacian, depth, and fused edge maps."""
+    from spatial_intelligence.edge_detector import compute_edge_maps
+    h, w = 64, 64
+    rgb = np.full((h, w, 3), 100, dtype=np.uint8)
+    rgb[20:40, 20:40] = [200, 50, 50]
+    depth = np.full((h, w), 5.0, dtype=np.float32)
+    depth[20:40, 20:40] = 1.0
+
+    maps = compute_edge_maps(rgb, depth)
+    assert "sobel_mag" in maps
+    assert "canny" in maps
+    assert "fused" in maps
+    assert "edge_confidence" in maps
+    assert maps["fused"].shape == (h, w)
+
+
+def test_p18_3_edge_snapped_mask_refinement():
+    """TEST 3: snap_mask_to_edges refines boundary contours toward RGB and depth edges."""
+    from spatial_intelligence.mask_refiner import snap_mask_to_edges, compute_role_aware_alpha_feather
+    h, w = 64, 64
+    mask = np.zeros((h, w), dtype=bool); mask[20:40, 20:40] = True
+    rgb = np.full((h, w, 3), 100, dtype=np.uint8)
+    depth = np.full((h, w), 5.0, dtype=np.float32)
+
+    snapped_m, avg_d, max_d = snap_mask_to_edges(mask, rgb, depth, max_snap_distance=4)
+    alpha = compute_role_aware_alpha_feather(snapped_m, "PRIMARY_SUBJECT", feather_px=3)
+
+    assert snapped_m.shape == (h, w)
+    assert alpha.shape == (h, w)
+    assert alpha[25, 25] == 1.0
+
+
+def test_p18_4_edge_aware_reconstruction_engine():
+    """TEST 4: reconstruct_exposed_pixels fills disoccluded holes while enforcing primary subject protection."""
+    from spatial_intelligence.reconstruction import reconstruct_exposed_pixels, TemporalSourceCache
+    h, w = 64, 64
+    rgb = np.full((h, w, 3), 100, dtype=np.uint8)
+    hole = np.zeros((h, w), dtype=bool); hole[10:20, 10:20] = True
+    prot = np.zeros((h, w), dtype=bool); prot[15:25, 15:25] = True  # Protect [15:20, 15:20]
+    depth = np.full((h, w), 5.0, dtype=np.float32)
+    edge_map = np.zeros((h, w), dtype=np.float32)
+
+    cache = TemporalSourceCache((h, w))
+    rec_rgb, rec_d, metrics = reconstruct_exposed_pixels(
+        rgb, hole, depth, edge_map, primary_protection_mask=prot,
+        reconstruction_mode="FAST", reconstruction_quality="HIGH", temporal_cache=cache
+    )
+
+    assert rec_rgb.shape == (h, w, 3)
+    assert metrics["reconstructed_pixels"] > 0
+
+
+def test_p18_5_artifact_detection_and_parallax_quality_score():
+    """TEST 5: compute_parallax_quality_score calculates motion floor, temporal MAD, and overall score."""
+    from spatial_intelligence.quality_score import compute_parallax_quality_score
+    h, w = 32, 32
+    rgb = np.full((h, w, 3), 100, dtype=np.uint8)
+    mask = np.zeros((h, w), dtype=bool); mask[10:20, 10:20] = True
+    depth = np.full((h, w), 2.0, dtype=np.float32)
+
+    f1 = rgb.copy()
+    f2 = rgb.copy(); f2[10:20, 12:22] = [200, 50, 50]
+
+    p_score, metrics = compute_parallax_quality_score([f1, f2, f1], rgb, mask, depth)
+
+    assert 0.0 <= p_score.overall_parallax_quality <= 1.0
+    assert "motion_floor_status" in metrics
+
+
+def test_p18_6_generate_100_render_configs():
+    """TEST 6: generate_100_render_configs creates exactly 100 deterministic RenderingConfig instances."""
+    from spatial_intelligence.benchmark_100 import generate_100_render_configs
+    cfgs = generate_100_render_configs()
+    assert len(cfgs) == 100
+    assert cfgs[0].seed == 1
+    assert cfgs[99].seed == 100
+
+
+def test_p18_7_execute_100_render_benchmark():
+    """TEST 7: execute_100_render_benchmark generates 10x10 contact sheet and selects best render."""
+    from spatial_intelligence.benchmark_100 import execute_100_render_benchmark
+    import tempfile
+    h, w = 32, 32
+    rgb = np.full((h, w, 3), 100, dtype=np.uint8)
+    mask = np.zeros((h, w), dtype=bool); mask[10:20, 10:20] = True
+    depth = np.full((h, w), 2.0, dtype=np.float32)
+
+    with tempfile.TemporaryDirectory() as temp_dir:
+        out_dir = Path(temp_dir)
+        cs_path, summary = execute_100_render_benchmark(rgb, depth, mask, None, out_dir)
+
+        assert cs_path.exists()
+        assert summary["total_renders_evaluated"] == 100
+        assert summary["best_overall_quality_score"] > 0.0
+
+
+def test_p18_8_cache_directory_setup():
+    """TEST 8: setup_cache_directory creates content-addressed cache directory."""
+    import v0_pipeline as v0
+    import tempfile
+    with tempfile.TemporaryDirectory() as temp_dir:
+        c_dir = v0.setup_cache_directory(Path(temp_dir), "a81c93d4")
+        assert c_dir.exists()
+        assert c_dir.name == "a81c93d4"

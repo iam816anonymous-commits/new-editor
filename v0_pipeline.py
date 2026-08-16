@@ -1773,7 +1773,7 @@ def render_phase_e_representative_keyframes(
         r_vec = rotations[idx]
         R_mat = compute_rotation_matrix(r_vec[0], r_vec[1], r_vec[2])
 
-        motion_map = construct_layer_motion_map(rgb_array.shape[:2], subject_mask, spatial_diagnostics=None)
+        motion_map = construct_layer_motion_map(rgb_array.shape[:2], subject_mask, spatial_diagnostics=spatial_diagnostics)
         syn_rgb, syn_z, syn_prov = render_single_frame_forward_splatting(
             rgb_array, depth_map, bg_plate, bg_depth, provenance_map,
             R_mat, t_vec, fx, fy, cx, cy, layer_motion_map=motion_map
@@ -2857,6 +2857,13 @@ def deterministic_z_buffer_update(
 # CLI & PIPELINE EXECUTION
 # ============================================================
 
+def setup_cache_directory(base_cache_dir: Path, short_hash: str) -> Path:
+    """Creates SHA-256 content-addressed cache directory cache/<short_hash>/."""
+    cache_dir = base_cache_dir / short_hash
+    cache_dir.mkdir(parents=True, exist_ok=True)
+    return cache_dir
+
+
 def setup_output_directories(base_dir: Path, short_hash: str, create_subdirs: bool = True) -> Path:
     """Creates directory structure output/<short_hash>/."""
     hash_dir = base_dir / short_hash
@@ -2905,6 +2912,26 @@ def parse_args(args: Optional[list] = None) -> argparse.Namespace:
         action="store_true",
         default=False,
         help="Render full 48-frame video sequence after generating diagnostic artifacts."
+    )
+    parser.add_argument(
+        "--frames",
+        type=int,
+        default=48,
+        choices=[48, 100],
+        help="Number of video frames to render (48 or 100)."
+    )
+    parser.add_argument(
+        "--benchmark-100",
+        action="store_true",
+        default=False,
+        help="Run 100-render deterministic parameter grid benchmark and export 10x10 contact sheet."
+    )
+    parser.add_argument(
+        "--reconstruction-quality",
+        type=str,
+        default="HIGH",
+        choices=["LOW", "MEDIUM", "HIGH"],
+        help="Hole reconstruction quality level."
     )
     return parser.parse_args(args)
 
@@ -3191,6 +3218,15 @@ def main():
     )
     Image.fromarray(p17_contact_sheet).save(hash_dir / "phase_1_7_visual_validation_contact_sheet.png")
     print(f"[✓] Saved Phase 1.7 Multi-Row Contact Sheet to: {hash_dir / 'phase_1_7_visual_validation_contact_sheet.png'}")
+
+    # Optional 100-render benchmark mode
+    if args.benchmark_100:
+        print("\n[*] Running 100-render parameter grid benchmark...")
+        from spatial_intelligence.benchmark_100 import execute_100_render_benchmark
+        cs_path, bm_summary = execute_100_render_benchmark(
+            rgb_array, refined_depth, subject_mask, render_single_frame_forward_splatting, hash_dir
+        )
+        print(f"[✓] 100-render benchmark complete. Contact sheet: {cs_path}")
 
 
 if __name__ == "__main__":

@@ -29,16 +29,19 @@ def create_perspective_camera(
 def compute_normalized_depth(
     rendering_depth: np.ndarray,
     min_depth: float = 0.1,
-    max_depth: float = 10.0
+    max_depth: float = 10.0,
+    gamma: float = 1.2
 ) -> np.ndarray:
     """
-    Normalizes rendering depth Z in [min_depth, max_depth] into normalized depth coordinate space z_norm in [0, 1].
+    Normalizes rendering depth Z in [min_depth, max_depth] into normalized depth coordinate space z_norm in [0, 1],
+    applying depth gamma for nonlinear depth response.
     where 0.0 = far background and 1.0 = closest foreground.
     """
     span = max(1e-5, max_depth - min_depth)
     clipped = np.clip(rendering_depth, min_depth, max_depth)
-    z_norm = 1.0 - (clipped - min_depth) / span
-    return np.clip(z_norm, 0.0, 1.0)
+    z_linear = 1.0 - (clipped - min_depth) / span
+    z_gamma = np.power(np.clip(z_linear, 0.0, 1.0), gamma)
+    return np.clip(z_gamma, 0.0, 1.0).astype(np.float32)
 
 
 def compute_layer_motion_multiplier(layer_role_str: str) -> float:

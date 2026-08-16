@@ -18,6 +18,8 @@ from .schemas import (
     OcclusionRelationship,
     CameraModel,
     SpatialConfidence,
+    ParallaxQualityScore,
+    RenderingConfig,
     SpatialDiagnostics
 )
 from .scene_graph import create_scene_graph, export_scene_graph_dict
@@ -41,6 +43,8 @@ __all__ = [
     "OcclusionRelationship",
     "CameraModel",
     "SpatialConfidence",
+    "ParallaxQualityScore",
+    "RenderingConfig",
     "SpatialDiagnostics",
     "create_scene_graph",
     "export_scene_graph_dict",

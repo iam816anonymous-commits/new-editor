@@ -295,6 +295,32 @@ class ParallaxQualityScore:
 
 
 @dataclass
+class RenderingConfig:
+    """Typed configuration contract for depth-driven rendering and parallax view synthesis."""
+    width: int = 1536
+    height: int = 1024
+    fps: int = 24
+    frame_count: int = 48
+    parallax_strength: float = 1.0
+    depth_gamma: float = 1.2
+    foreground_boost: float = 1.5
+    background_stability: float = 0.10
+    camera_motion_x: float = 0.05
+    camera_motion_y: float = 0.02
+    camera_zoom: float = 0.03
+    camera_rotation: float = 0.0
+    edge_snap_distance: int = 4
+    mask_feather_px: int = 3
+    reconstruction_mode: str = "FAST"  # "FAST" or "HIGH"
+    reconstruction_quality: str = "HIGH"  # "LOW", "MEDIUM", "HIGH"
+    temporal_blend: float = 0.85
+    artifact_threshold: float = 0.05
+    minimum_motion: float = 2.0  # Motion floor in pixels
+    maximum_motion: float = 45.0 # Motion ceiling in pixels
+    seed: int = 42
+
+
+@dataclass
 class SpatialDiagnostics:
     """Complete exportable diagnostic payload for spatial intelligence subsystem."""
     scene_graph: SceneGraph
@@ -303,4 +329,5 @@ class SpatialDiagnostics:
     camera_model: CameraModel
     spatial_confidence: SpatialConfidence
     parallax_quality: Optional[ParallaxQualityScore] = None
+    rendering_config: Optional[RenderingConfig] = None
     metrics_summary: Dict[str, Any] = field(default_factory=dict)

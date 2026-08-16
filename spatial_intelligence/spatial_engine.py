@@ -14,6 +14,7 @@ from .schemas import (
     EntityClass,
     LayerRole,
     SemanticRole,
+    RenderRelevance,
     Entity,
     EntityPart,
     SceneGraph,
