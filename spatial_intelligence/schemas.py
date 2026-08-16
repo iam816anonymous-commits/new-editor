@@ -10,7 +10,20 @@ import numpy as np
 
 
 class RelationType(str, Enum):
-    """Enumeration of directed spatial relationships between entities/parts."""
+    """
+    Enumeration of directed spatial relationships between entities/parts.
+
+    DEPTH SIGN CONVENTION INVARIANT:
+    - Depth coordinate Z is in rendering coordinates [0.1, 10.0].
+    - SMALLER Z = CLOSER to camera (Foreground).
+    - LARGER Z = FARTHER from camera (Background).
+    - depth_diff = Z_A - Z_B.
+    - If Z_A < Z_B (depth_diff < 0): Entity A is closer than Entity B.
+      -> Entity A is FRONT_OF Entity B.
+      -> Entity A OCCLUDES Entity B (when overlapping).
+      -> Entity B is BEHIND Entity A.
+      -> Entity B is OCCLUDED_BY Entity A.
+    """
     FRONT_OF = "FRONT_OF"
     BEHIND = "BEHIND"
     SUPPORTS = "SUPPORTS"

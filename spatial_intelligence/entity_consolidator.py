@@ -109,8 +109,8 @@ def consolidate_candidates(
             rejected_count += 1
             continue
 
-        # Reject huge background/border masks (>85% image area)
-        if cov > 0.85:
+        # Reject huge uninformative masks (>98% total image area)
+        if cov > 0.98:
             rejected_count += 1
             continue
 
