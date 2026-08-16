@@ -24,6 +24,7 @@ from transformers import AutoImageProcessor, AutoModelForDepthEstimation
 from sam2.build_sam import build_sam2
 from sam2.sam2_image_predictor import SAM2ImagePredictor
 from subject_selection import select_semantic_subject
+from spatial_intelligence.spatial_engine import analyze_spatial_scene
 
 DEPTH_MODEL_ID = "depth-anything/Depth-Anything-V2-Small-hf"
 SAM2_MODEL_ID = "facebook/sam2-hiera-tiny"
@@ -2828,6 +2829,15 @@ def main():
     )
     print(f"[✓] Saved Phase C diagnostic artifacts: background_plate.png, background_depth.png, provenance_map.png, boundary_risk_map.png in {hash_dir}")
 
+    # 9.5 Spatial Intelligence Scene Analysis
+    print("[*] Performing Spatial Intelligence Scene Analysis (Scene Graph, Depth Field, Occlusion & Camera Model)...")
+    sel_res = select_semantic_subject(rgb_array, refined_depth, sam2_predictor, hash_dir=None)
+    spatial_diagnostics = analyze_spatial_scene(
+        rgb_array, refined_depth, background_depth, confidence_map, provenance_map,
+        sel_res, hash_dir=hash_dir
+    )
+    print(f"[✓] Spatial Intelligence Analysis complete. Overall Spatial Confidence: {spatial_diagnostics.spatial_confidence.overall_spatial_confidence:.2f}")
+
     # Statistics
     rec_pixels = int(np.sum(dilated_mask))
     total_pixels = int(dilated_mask.size)
@@ -2921,6 +2931,13 @@ def main():
     print(f"  - {hash_dir / 'background_depth.png'}")
     print(f"  - {hash_dir / 'provenance_map.png'}")
     print(f"  - {hash_dir / 'boundary_risk_map.png'}")
+    print(f"  - {hash_dir / 'spatial_scene.json'}")
+    print(f"  - {hash_dir / 'spatial_relationships.json'}")
+    print(f"  - {hash_dir / 'depth_field.png'}")
+    print(f"  - {hash_dir / 'depth_uncertainty.png'}")
+    print(f"  - {hash_dir / 'occlusion_map.png'}")
+    print(f"  - {hash_dir / 'camera_path.json'}")
+    print(f"  - {hash_dir / 'spatial_diagnostics.json'}")
     print(f"  - {metrics_json_path}")
     print("============================================================")
 
