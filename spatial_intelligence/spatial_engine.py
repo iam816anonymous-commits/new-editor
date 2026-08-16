@@ -10,6 +10,7 @@ import numpy as np
 from PIL import Image
 
 from .schemas import (
+    SegmentationCandidate,
     Entity,
     EntityPart,
     SceneGraph,
@@ -19,6 +20,8 @@ from .schemas import (
     SpatialConfidence,
     SpatialDiagnostics
 )
+from .entity_consolidator import consolidate_candidates
+from .entity_trust import process_entity_trust_and_roles
 from .scene_graph import create_scene_graph, export_scene_graph_dict
 from .relationship_inferencer import infer_spatial_relationships
 from .depth_field import build_spatial_depth_field
@@ -27,103 +30,106 @@ from .camera_model import create_perspective_camera, export_camera_path_dict, co
 from .temporal_tracker import TemporalSpatialTracker
 
 
-def extract_scene_entities(
+def generate_consolidated_entities_visualization(
+    rgb_array: np.ndarray,
+    entities: List[Entity]
+) -> np.ndarray:
+    """Generates visual debug overlay showing consolidated entities with bounding boxes and entity IDs."""
+    h, w, _ = rgb_array.shape
+    vis = rgb_array.copy()
+
+    # Colors for entities
+    colors = [
+        (0, 255, 0),    # Green for primary subject (1)
+        (255, 255, 0),  # Yellow
+        (0, 255, 255),  # Cyan
+        (255, 0, 255),  # Magenta
+        (255, 128, 0),  # Orange
+        (0, 128, 255),  # Sky blue
+        (128, 255, 0),  # Lime
+    ]
+
+    for idx, ent in enumerate(entities):
+        color = colors[idx % len(colors)]
+        mask = ent.mask
+
+        # Overlay mask
+        vis[mask] = (vis[mask] * 0.6 + np.array(color, dtype=np.float32) * 0.4).astype(np.uint8)
+
+        # Draw bbox and label
+        bbox = ent.bbox
+        cv2.rectangle(vis, (bbox[1], bbox[0]), (bbox[3], bbox[2]), color, 2)
+        cv2.putText(
+            vis, f"ID {ent.entity_id}: {ent.semantic_role.value} (T={ent.trust_score:.2f})",
+            (bbox[1] + 4, max(20, bbox[0] + 18)),
+            cv2.FONT_HERSHEY_SIMPLEX, 0.45, (255, 255, 255), 1, cv2.LINE_AA
+        )
+
+    return vis
+
+
+def extract_and_consolidate_scene_entities(
     subject_selection_result: Any,
     refined_depth: np.ndarray,
-    rgb_array: np.ndarray
-) -> List[Entity]:
+    rgb_array: np.ndarray,
+    confidence_map: np.ndarray
+) -> Tuple[List[Entity], int, int, int]:
     """
-    Extracts structured Entity and EntityPart instances from subject selection candidates and scene depth.
-    Converts compound primary subject group into primary subject Entity with sub-parts, and non-selected candidates into background/environmental Entities.
+    Transforms raw candidate features from subject selection into SegmentationCandidate contracts,
+    consolidates duplicate/nested proposals, and evaluates entity trust scores.
     """
-    h, w = refined_depth.shape
+    h, w, _ = rgb_array.shape
     total_pixels = max(1, h * w)
-    entities: List[Entity] = []
 
     features_list = subject_selection_result.candidate_features_list
     selected_group_ids = subject_selection_result.selected_group_ids
     primary_mask = subject_selection_result.refined_mask
 
-    # 1. Primary Compound Subject Entity
-    sub_y, sub_x = np.where(primary_mask)
-    if len(sub_y) > 0:
-        ymin, ymax = int(np.min(sub_y)), int(np.max(sub_y))
-        xmin, xmax = int(np.min(sub_x)), int(np.max(sub_x))
-        sub_bbox = (ymin, xmin, ymax, xmax)
-        sub_cy, sub_cx = float(np.mean(sub_y)), float(np.mean(sub_x))
-    else:
-        sub_bbox = (0, 0, h - 1, w - 1)
-        sub_cy, sub_cx = h / 2.0, w / 2.0
+    # Retrieve mask dictionary from subject_selection_result if available
+    mask_by_id = getattr(subject_selection_result, "candidate_masks_by_id", {})
 
-    sub_depths = refined_depth[primary_mask] if np.any(primary_mask) else np.array([5.0])
-    primary_area = int(np.sum(primary_mask))
-
-    # Extract sub-parts for primary compound subject
-    parts: List[EntityPart] = []
+    # 1. Convert CandidateFeatures into SegmentationCandidate objects
+    raw_candidates: List[SegmentationCandidate] = []
     for f in features_list:
-        if f.candidate_id in selected_group_ids:
-            # Re-create boolean mask for candidate from features bbox/centroid region or candidate features
+        if f.candidate_id in mask_by_id:
+            cand_mask = mask_by_id[f.candidate_id]
+        else:
             p_y0, p_x0, p_y1, p_x1 = f.bbox
-            part_mask = np.zeros((h, w), dtype=bool)
-            part_mask[p_y0:p_y1+1, p_x0:p_x1+1] = primary_mask[p_y0:p_y1+1, p_x0:p_x1+1]
+            cand_mask = np.zeros((h, w), dtype=bool)
+            cand_mask[p_y0:p_y1+1, p_x0:p_x1+1] = True  # Fallback
 
-            parts.append(EntityPart(
-                part_id=f.candidate_id,
-                entity_id=1,
-                name=f"primary_part_{f.candidate_id}",
-                mask=part_mask,
-                bbox=f.bbox,
-                depth_mean=f.foreground_depth_mean,
-                depth_std=f.foreground_depth_std,
-                confidence=f.sam_confidence
-            ))
+        mask_area = getattr(f, "mask_area", getattr(f, "area_pixels", int(np.sum(cand_mask))))
+        prompt_origin = getattr(f, "prompt_origin", f"cand_{f.candidate_id}")
+        raw_candidates.append(SegmentationCandidate(
+            candidate_id=f.candidate_id,
+            mask=cand_mask,
+            bbox=f.bbox,
+            centroid=(f.centroid_y, f.centroid_x),
+            norm_centroid=(f.norm_centroid_y, f.norm_centroid_x),
+            area_pixels=mask_area,
+            area_ratio=f.mask_area_ratio,
+            depth_mean=f.foreground_depth_mean,
+            depth_median=f.foreground_depth_mean,  # Feature fallback
+            depth_std=f.foreground_depth_std,
+            sam_confidence=f.sam_confidence,
+            prompt_origin=prompt_origin
+        ))
 
-    primary_entity = Entity(
-        entity_id=1,
-        name="primary_compound_subject",
-        mask=primary_mask,
-        bbox=sub_bbox,
-        centroid=(sub_cy, sub_cx),
-        norm_centroid=(sub_cy / max(1, h), sub_cx / max(1, w)),
-        area_pixels=primary_area,
-        area_ratio=float(primary_area / total_pixels),
-        depth_mean=float(np.mean(sub_depths)),
-        depth_median=float(np.median(sub_depths)),
-        depth_std=float(np.std(sub_depths)),
-        is_primary_subject=True,
-        parts=parts
+    raw_count = len(raw_candidates)
+
+    # 2. Consolidate candidates into trusted SpatialEntities
+    entities, rejected_count, merged_count = consolidate_candidates(
+        raw_candidates=raw_candidates,
+        primary_subject_mask=primary_mask,
+        primary_subject_group_ids=selected_group_ids,
+        refined_depth=refined_depth,
+        rgb_shape=(h, w)
     )
-    entities.append(primary_entity)
 
-    # 2. Secondary/Environmental Entities from non-selected candidate features
-    ent_id_counter = 2
-    for f in features_list:
-        if f.candidate_id not in selected_group_ids and f.mask_area_ratio >= 0.01:
-            p_y0, p_x0, p_y1, p_x1 = f.bbox
-            sec_mask = np.zeros((h, w), dtype=bool)
-            sec_mask[p_y0:p_y1+1, p_x0:p_x1+1] = True
-            sec_mask &= (~primary_mask)  # Ensure non-overlapping with primary subject
+    # 3. Compute trust scores and semantic roles
+    entities = process_entity_trust_and_roles(entities, rgb_array, refined_depth, confidence_map)
 
-            if np.sum(sec_mask) > 100:
-                sec_depths = refined_depth[sec_mask]
-                entities.append(Entity(
-                    entity_id=ent_id_counter,
-                    name=f"environmental_entity_{f.candidate_id}",
-                    mask=sec_mask,
-                    bbox=f.bbox,
-                    centroid=(f.centroid_y, f.centroid_x),
-                    norm_centroid=(f.norm_centroid_y, f.norm_centroid_x),
-                    area_pixels=int(np.sum(sec_mask)),
-                    area_ratio=float(np.sum(sec_mask) / total_pixels),
-                    depth_mean=float(np.mean(sec_depths)),
-                    depth_median=float(np.median(sec_depths)),
-                    depth_std=float(np.std(sec_depths)),
-                    is_primary_subject=False,
-                    parts=[]
-                ))
-                ent_id_counter += 1
-
-    return entities
+    return entities, raw_count, rejected_count, merged_count
 
 
 def export_spatial_diagnostics_artifacts(
@@ -167,6 +173,10 @@ def export_spatial_diagnostics_artifacts(
     occ_map = generate_occlusion_map(diagnostics.occlusion_relationships, (h, w))
     Image.fromarray(occ_map).save(hash_dir / "occlusion_map.png")
 
+    # 5.5 consolidated_entities.png
+    entities_vis = generate_consolidated_entities_visualization(original_rgb, list(diagnostics.scene_graph.entities.values()))
+    Image.fromarray(entities_vis).save(hash_dir / "consolidated_entities.png")
+
     # 6. camera_path.json
     dummy_t = np.zeros((48, 3))
     dummy_r = np.zeros((48, 3))
@@ -199,16 +209,22 @@ def analyze_spatial_scene(
 ) -> SpatialDiagnostics:
     """
     Main entry point for Spatial Intelligence subsystem.
-    Executes scene entity extraction, scene graph construction, spatial relationship inference,
+    Executes entity consolidation, trust scoring, scene graph construction, sparse relationship inference,
     depth field building, occlusion modeling, camera model creation, and spatial diagnostics export.
     """
     h, w, _ = rgb_array.shape
 
-    # 1. Extract Entities & Parts
-    entities = extract_scene_entities(subject_selection_result, refined_depth, rgb_array)
+    # 1. Extract, Consolidate & Trust Entities
+    entities, raw_count, rejected_count, merged_count = extract_and_consolidate_scene_entities(
+        subject_selection_result, refined_depth, rgb_array, confidence_map
+    )
 
-    # 2. Build Scene Graph & Infer Relationships
+    # 2. Build Scene Graph & Infer Sparse Relationships
     scene_graph = create_scene_graph(entities)
+    scene_graph.raw_candidate_count = raw_count
+    scene_graph.rejected_candidate_count = rejected_count
+    scene_graph.merged_candidate_count = merged_count
+
     scene_graph = infer_spatial_relationships(scene_graph, (h, w))
 
     # 3. Build Structured 2.5D Depth Field

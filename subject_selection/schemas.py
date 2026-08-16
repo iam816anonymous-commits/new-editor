@@ -159,5 +159,6 @@ class SubjectSelectionResult:
     candidate_features_list: List[CandidateFeatures] = field(default_factory=list)
     candidate_scores_list: List[CandidateScore] = field(default_factory=list)
     candidate_groups: List[CandidateGroup] = field(default_factory=list)
+    candidate_masks_by_id: Dict[int, np.ndarray] = field(default_factory=dict, repr=False)
     validation_result: MaskValidationResult = field(default_factory=lambda: MaskValidationResult("REJECTED", False, [], SubjectConfidence(0,0,0,0,0)))
     metrics_summary: Dict[str, Any] = field(default_factory=dict)
