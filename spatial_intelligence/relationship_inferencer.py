@@ -236,4 +236,18 @@ def infer_spatial_relationships(
                                 supporting_metrics={"dist_y": round(dist_y, 1)}
                             )
 
+    # Populate render_relationships (Filter out intra-compound and analysis-only relationships)
+    for rel in scene_graph.relationships:
+        subj = scene_graph.entities.get(rel.subject_id)
+        targ = scene_graph.entities.get(rel.target_id)
+        if subj is None or targ is None:
+            continue
+
+        # Suppress relationships between members of same compound subject or both background analysis regions
+        both_same_compound = (subj.is_primary_subject and targ.is_primary_subject) or (subj.parent_subject_id is not None and subj.parent_subject_id == targ.entity_id)
+        both_analysis_bg = (subj.entity_class == EntityClass.ANALYSIS_REGION and targ.entity_class == EntityClass.ANALYSIS_REGION)
+
+        if not both_same_compound and not both_analysis_bg and rel.render_relevance in [RenderRelevance.CRITICAL, RenderRelevance.USEFUL]:
+            scene_graph.render_relationships.append(rel)
+
     return scene_graph

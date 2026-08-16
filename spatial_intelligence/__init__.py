@@ -5,6 +5,7 @@ Spatial Intelligence Subsystem for First-Principles Cinematic 2.5D Parallax Rend
 from .schemas import (
     RelationType,
     EntityClass,
+    LayerRole,
     SemanticRole,
     RenderRelevance,
     SegmentationCandidate,
@@ -27,6 +28,7 @@ from .relationship_inferencer import infer_spatial_relationships
 __all__ = [
     "RelationType",
     "EntityClass",
+    "LayerRole",
     "SemanticRole",
     "RenderRelevance",
     "SegmentationCandidate",

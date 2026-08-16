@@ -129,7 +129,7 @@ def consolidate_candidates(
     # Sort environmental candidates by SAM confidence * depth saliency descending
     environmental_candidates.sort(key=lambda c: c.sam_confidence, reverse=True)
 
-    # Clustering / Deduplication pass over environmental candidates
+    # Conservative Compound-Subject Collapsing Pass: Group proposals with high mask overlap (>50%), similar depth (|delta Z| < 1.0)
     clusters: List[List[SegmentationCandidate]] = []
 
     for cand in environmental_candidates:
@@ -142,8 +142,8 @@ def consolidate_candidates(
             containment_B_in_A = compute_mask_containment(rep.mask, cand.mask)
             depth_diff = abs(cand.depth_mean - rep.depth_mean)
 
-            # Check if candidates represent substantially the same spatial region
-            if (iou >= iou_merge_threshold or containment_A_in_B >= containment_merge_threshold or containment_B_in_A >= containment_merge_threshold) and depth_diff < 1.0:
+            # Check if candidates represent substantially the same spatial region or compound part
+            if (iou >= 0.50 or containment_A_in_B >= 0.70 or containment_B_in_A >= 0.70) and depth_diff < 1.2:
                 cluster.append(cand)
                 assigned_cluster = True
                 merged_count += 1

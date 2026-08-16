@@ -9,6 +9,7 @@ from typing import List, Dict, Tuple, Optional
 from .schemas import (
     Entity,
     EntityClass,
+    LayerRole,
     EntityTrustScore,
     SemanticRole,
     RenderRelevance
@@ -148,46 +149,53 @@ def classify_entity_class_role_and_relevance(
     entity: Entity,
     depth_span_min: float,
     depth_span_max: float
-) -> Tuple[EntityClass, SemanticRole, RenderRelevance]:
+) -> Tuple[EntityClass, LayerRole, SemanticRole, RenderRelevance]:
     """
-    Classifies entity into EntityClass (RENDERABLE_ENTITY vs ANALYSIS_REGION), coarse SemanticRole, and RenderRelevance.
+    Classifies entity into EntityClass, LayerRole, SemanticRole, and RenderRelevance.
 
-    Environmental Suppression Rules:
-    - PRIMARY_SUBJECT is ALWAYS RENDERABLE_ENTITY and CRITICAL.
-    - Large background regions (>25% area) with low boundary alignment or high depth variance are classified as
-      ANALYSIS_REGION and IGNORE/LOW render relevance so they do NOT create competing renderable objects or pairwise graph clutter.
-    - Compact foreground/midground objects with strong trust scores remain RENDERABLE_ENTITY.
+    Environmental Suppression & Layer Role Mapping Rules:
+    - PRIMARY_SUBJECT is ALWAYS RENDERABLE_ENTITY, LayerRole.PRIMARY_SUBJECT, and CRITICAL.
+    - PRIMARY_SUBJECT_PART: Internal components belonging to primary subject inherit parent subject motion.
+    - FOREGROUND: Compact objects with close depth (norm_depth < 0.25) and high trust.
+    - MIDGROUND: Mid-depth compact objects.
+    - BACKGROUND: Large environmental regions (norm_depth > 0.60 or area_ratio > 0.25).
+    - ANALYSIS_ONLY: Environmental/analysis regions with low trust or massive uninformative extent.
     """
     if entity.is_primary_subject:
-        return EntityClass.RENDERABLE_ENTITY, SemanticRole.PRIMARY_SUBJECT, RenderRelevance.CRITICAL
+        return EntityClass.RENDERABLE_ENTITY, LayerRole.PRIMARY_SUBJECT, SemanticRole.PRIMARY_SUBJECT, RenderRelevance.CRITICAL
+
+    if entity.parent_subject_id is not None:
+        return EntityClass.RENDERABLE_ENTITY, LayerRole.PRIMARY_SUBJECT_PART, SemanticRole.PRIMARY_SUBJECT, RenderRelevance.USEFUL
 
     d_span = max(1e-5, depth_span_max - depth_span_min)
     norm_depth = (entity.depth_mean - depth_span_min) / d_span
 
-    # Multi-signal check for analysis-only background regions
     is_large_background = entity.area_ratio > 0.25
     is_deep_background = norm_depth > 0.60
     has_low_trust = entity.trust_score < 0.65
 
     if is_large_background or (is_deep_background and has_low_trust):
         ent_class = EntityClass.ANALYSIS_REGION
+        layer_role = LayerRole.ANALYSIS_ONLY
         role = SemanticRole.BACKGROUND_REGION if entity.area_ratio > 0.15 else SemanticRole.EMPTY_BACKGROUND
         relevance = RenderRelevance.IGNORE
     elif norm_depth < 0.25 and entity.trust_score > 0.50:
         ent_class = EntityClass.RENDERABLE_ENTITY
+        layer_role = LayerRole.FOREGROUND
         role = SemanticRole.FOREGROUND_OBJECT
         relevance = RenderRelevance.CRITICAL if entity.trust_score > 0.70 else RenderRelevance.USEFUL
     elif norm_depth < 0.60 and entity.trust_score > 0.55 and entity.area_ratio < 0.25:
         ent_class = EntityClass.RENDERABLE_ENTITY
+        layer_role = LayerRole.MIDGROUND
         role = SemanticRole.MIDGROUND_OBJECT
         relevance = RenderRelevance.USEFUL
     else:
-        # Default fallback for uninformative/weak environmental blobs
         ent_class = EntityClass.ANALYSIS_REGION
+        layer_role = LayerRole.BACKGROUND
         role = SemanticRole.SECONDARY_OBJECT if norm_depth < 0.50 else SemanticRole.BACKGROUND_REGION
         relevance = RenderRelevance.LOW
 
-    return ent_class, role, relevance
+    return ent_class, layer_role, role, relevance
 
 
 def process_entity_trust_and_roles(
@@ -196,7 +204,7 @@ def process_entity_trust_and_roles(
     refined_depth: np.ndarray,
     confidence_map: np.ndarray
 ) -> List[Entity]:
-    """Computes trust score, entity class, and semantic role for all entities in list."""
+    """Computes trust score, entity class, layer role, and semantic role for all entities in list."""
     d_min, d_max = float(refined_depth.min()), float(refined_depth.max())
 
     for ent in entities:
@@ -204,8 +212,9 @@ def process_entity_trust_and_roles(
         ent.trust_details = trust_details
         ent.trust_score = trust_details.overall_trust_score
 
-        ent_class, role, relevance = classify_entity_class_role_and_relevance(ent, d_min, d_max)
+        ent_class, layer_role, role, relevance = classify_entity_class_role_and_relevance(ent, d_min, d_max)
         ent.entity_class = ent_class
+        ent.layer_role = layer_role
         ent.semantic_role = role
         ent.render_relevance = relevance
 

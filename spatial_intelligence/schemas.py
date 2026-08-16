@@ -43,6 +43,16 @@ class EntityClass(str, Enum):
     ANALYSIS_REGION = "ANALYSIS_REGION"
 
 
+class LayerRole(str, Enum):
+    """Explicit rendering layer role governing independent parallax displacement."""
+    BACKGROUND = "BACKGROUND"
+    MIDGROUND = "MIDGROUND"
+    PRIMARY_SUBJECT = "PRIMARY_SUBJECT"
+    PRIMARY_SUBJECT_PART = "PRIMARY_SUBJECT_PART"
+    FOREGROUND = "FOREGROUND"
+    ANALYSIS_ONLY = "ANALYSIS_ONLY"
+
+
 class SemanticRole(str, Enum):
     """Coarse semantic / render role for trusted scene entities."""
     PRIMARY_SUBJECT = "PRIMARY_SUBJECT"
@@ -118,10 +128,12 @@ class Entity:
     depth_median: float
     depth_std: float
     entity_class: EntityClass = EntityClass.RENDERABLE_ENTITY
+    layer_role: LayerRole = LayerRole.MIDGROUND
     semantic_role: SemanticRole = SemanticRole.SECONDARY_OBJECT
     trust_score: float = 1.0
     trust_details: Optional[EntityTrustScore] = None
     is_primary_subject: bool = False
+    parent_subject_id: Optional[int] = None
     source_candidate_ids: List[int] = field(default_factory=list)
     render_relevance: RenderRelevance = RenderRelevance.USEFUL
     parts: List[EntityPart] = field(default_factory=list)
@@ -155,6 +167,7 @@ class SceneGraph:
     """Sparse graph representation holding trusted entities, parts, and canonical spatial relationship edges."""
     entities: Dict[int, Entity] = field(default_factory=dict)
     relationships: List[SpatialRelationship] = field(default_factory=list)
+    render_relationships: List[SpatialRelationship] = field(default_factory=list)
     rejected_relationships: List[RejectedRelationship] = field(default_factory=list)
     raw_candidate_count: int = 0
     rejected_candidate_count: int = 0
@@ -267,6 +280,21 @@ class SpatialConfidence:
 
 
 @dataclass
+class ParallaxQualityScore:
+    """Deterministic diagnostic parallax quality breakdown."""
+    background_motion_px: float
+    midground_motion_px: float
+    primary_subject_motion_px: float
+    foreground_motion_px: float
+    temporal_mad: float
+    boundary_mad: float
+    loop_closure_mae: float
+    edge_artifact_ratio: float
+    overlap_artifact_ratio: float
+    overall_parallax_quality: float
+
+
+@dataclass
 class SpatialDiagnostics:
     """Complete exportable diagnostic payload for spatial intelligence subsystem."""
     scene_graph: SceneGraph
@@ -274,4 +302,5 @@ class SpatialDiagnostics:
     occlusion_relationships: List[OcclusionRelationship]
     camera_model: CameraModel
     spatial_confidence: SpatialConfidence
+    parallax_quality: Optional[ParallaxQualityScore] = None
     metrics_summary: Dict[str, Any] = field(default_factory=dict)
