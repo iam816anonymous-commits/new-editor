@@ -2799,7 +2799,9 @@ def main():
     # 6. Phase B: Real SAM 2 Subject Segmentation
     print("[*] Performing REAL SAM 2 subject segmentation...")
     t_sam2_infer_start = time.time()
-    subject_mask = segment_subject_sam2(rgb_array, refined_depth, sam2_predictor, hash_dir=hash_dir)
+    sel_res = select_semantic_subject(rgb_array, refined_depth, sam2_predictor, hash_dir=hash_dir)
+    subject_mask = sel_res.refined_mask
+    validate_subject_mask(subject_mask, refined_depth.shape)
     t_sam2_infer = time.time() - t_sam2_infer_start
     print(f"[✓] REAL SAM 2 segmentation completed in {t_sam2_infer:.3f}s.")
 
@@ -2831,7 +2833,6 @@ def main():
 
     # 9.5 Spatial Intelligence Scene Analysis
     print("[*] Performing Spatial Intelligence Scene Analysis (Scene Graph, Depth Field, Occlusion & Camera Model)...")
-    sel_res = select_semantic_subject(rgb_array, refined_depth, sam2_predictor, hash_dir=None)
     spatial_diagnostics = analyze_spatial_scene(
         rgb_array, refined_depth, background_depth, confidence_map, provenance_map,
         sel_res, hash_dir=hash_dir

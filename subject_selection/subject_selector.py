@@ -367,6 +367,7 @@ def select_semantic_subject(
         candidate_features_list=features_list,
         candidate_scores_list=scores_list,
         candidate_groups=groups,
+        candidate_masks_by_id=mask_by_id,
         validation_result=val_result,
         metrics_summary={
             "selected_group_id": selected_group.group_id,

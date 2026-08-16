@@ -11,7 +11,7 @@ import numpy as np
 
 class RelationType(str, Enum):
     """Enumeration of directed spatial relationships between entities/parts."""
-    IN_FRONT_OF = "IN_FRONT_OF"
+    FRONT_OF = "FRONT_OF"
     BEHIND = "BEHIND"
     SUPPORTS = "SUPPORTS"
     ATTACHED_TO = "ATTACHED_TO"
@@ -22,6 +22,53 @@ class RelationType(str, Enum):
     NEAR = "NEAR"
     FAR_FROM = "FAR_FROM"
     SAME_COMPOUND_SUBJECT = "SAME_COMPOUND_SUBJECT"
+
+
+class SemanticRole(str, Enum):
+    """Coarse semantic / render role for trusted scene entities."""
+    PRIMARY_SUBJECT = "PRIMARY_SUBJECT"
+    SECONDARY_OBJECT = "SECONDARY_OBJECT"
+    FOREGROUND_OBJECT = "FOREGROUND_OBJECT"
+    MIDGROUND_OBJECT = "MIDGROUND_OBJECT"
+    BACKGROUND_REGION = "BACKGROUND_REGION"
+    EMPTY_BACKGROUND = "EMPTY_BACKGROUND"
+
+
+class RenderRelevance(str, Enum):
+    """Relevance classification for rendering and disocclusion handling."""
+    CRITICAL = "CRITICAL"
+    USEFUL = "USEFUL"
+    LOW = "LOW"
+    IGNORE = "IGNORE"
+
+
+@dataclass
+class SegmentationCandidate:
+    """Unconsolidated raw proposal candidate from SAM 2 or prompt grid."""
+    candidate_id: int
+    mask: np.ndarray = field(repr=False)
+    bbox: Tuple[int, int, int, int]
+    centroid: Tuple[float, float]
+    norm_centroid: Tuple[float, float]
+    area_pixels: int
+    area_ratio: float
+    depth_mean: float
+    depth_median: float
+    depth_std: float
+    sam_confidence: float
+    prompt_origin: str
+
+
+@dataclass
+class EntityTrustScore:
+    """Multi-signal trust breakdown for a candidate entity separate from raw SAM confidence."""
+    mask_quality: float
+    depth_coherence: float
+    boundary_coherence: float
+    candidate_uniqueness: float
+    render_relevance: float
+    overall_trust_score: float
+    evidence_breakdown: Dict[str, float] = field(default_factory=dict)
 
 
 @dataclass
@@ -39,7 +86,7 @@ class EntityPart:
 
 @dataclass
 class Entity:
-    """Semantically and spatially distinct scene entity."""
+    """Trusted, consolidated spatial entity safe for downstream rendering decisions."""
     entity_id: int
     name: str
     mask: np.ndarray = field(repr=False)
@@ -51,31 +98,59 @@ class Entity:
     depth_mean: float
     depth_median: float
     depth_std: float
+    semantic_role: SemanticRole = SemanticRole.SECONDARY_OBJECT
+    trust_score: float = 1.0
+    trust_details: Optional[EntityTrustScore] = None
     is_primary_subject: bool = False
+    source_candidate_ids: List[int] = field(default_factory=list)
+    render_relevance: RenderRelevance = RenderRelevance.USEFUL
     parts: List[EntityPart] = field(default_factory=list)
 
 
 @dataclass
 class SpatialRelationship:
-    """Directed spatial relationship edge between two entities or parts."""
+    """Canonical directed spatial relationship edge between two trusted entities."""
     subject_id: int
     target_id: int
     relation_type: RelationType
     confidence: float
     evidence: str
+    render_relevance: RenderRelevance = RenderRelevance.USEFUL
+    is_canonical: bool = True
+    supporting_metrics: Dict[str, float] = field(default_factory=dict)
 
 
 @dataclass
 class SceneGraph:
-    """Graph representation holding scene entities, parts, and spatial relationship edges."""
+    """Sparse graph representation holding trusted entities, parts, and canonical spatial relationship edges."""
     entities: Dict[int, Entity] = field(default_factory=dict)
     relationships: List[SpatialRelationship] = field(default_factory=list)
+    raw_candidate_count: int = 0
+    rejected_candidate_count: int = 0
+    merged_candidate_count: int = 0
 
     def add_entity(self, entity: Entity) -> None:
         self.entities[entity.entity_id] = entity
 
-    def add_relationship(self, subject_id: int, target_id: int, relation_type: RelationType, confidence: float, evidence: str) -> None:
-        self.relationships.append(SpatialRelationship(subject_id, target_id, relation_type, confidence, evidence))
+    def add_relationship(
+        self,
+        subject_id: int,
+        target_id: int,
+        relation_type: RelationType,
+        confidence: float,
+        evidence: str,
+        render_relevance: RenderRelevance = RenderRelevance.USEFUL,
+        supporting_metrics: Optional[Dict[str, float]] = None
+    ) -> None:
+        self.relationships.append(SpatialRelationship(
+            subject_id=subject_id,
+            target_id=target_id,
+            relation_type=relation_type,
+            confidence=confidence,
+            evidence=evidence,
+            render_relevance=render_relevance,
+            supporting_metrics=supporting_metrics or {}
+        ))
 
     def get_relationships_for_entity(self, entity_id: int) -> List[SpatialRelationship]:
         return [r for r in self.relationships if r.subject_id == entity_id or r.target_id == entity_id]

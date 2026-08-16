@@ -64,7 +64,10 @@ def export_scene_graph_dict(scene_graph: SceneGraph) -> Dict[str, Any]:
     ]
 
     return {
-        "entities_count": len(scene_graph.entities),
+        "raw_candidate_count": scene_graph.raw_candidate_count,
+        "rejected_candidate_count": scene_graph.rejected_candidate_count,
+        "merged_candidate_count": scene_graph.merged_candidate_count,
+        "trusted_entities_count": len(scene_graph.entities),
         "relationships_count": len(scene_graph.relationships),
         "entities": entities_export,
         "relationships": relationships_export

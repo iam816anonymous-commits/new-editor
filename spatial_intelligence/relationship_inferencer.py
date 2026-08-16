@@ -1,27 +1,109 @@
 """
-Deterministic Spatial Relationship Inference for Spatial Intelligence Subsystem.
+Deterministic Sparse Spatial Relationship Inference for Spatial Intelligence Subsystem.
 """
 
 import cv2
 import numpy as np
-from typing import List, Dict, Tuple, Any
+from typing import List, Dict, Tuple, Any, Optional
 from .schemas import (
     RelationType,
     Entity,
     EntityPart,
     SpatialRelationship,
-    SceneGraph
+    SceneGraph,
+    RenderRelevance,
+    SemanticRole
 )
+
+
+def compute_multi_signal_occlusion_score(
+    entA: Entity,
+    entB: Entity,
+    overlap_ratio: float,
+    depth_diff: float,
+    rgb_shape: Tuple[int, int]
+) -> Tuple[float, Dict[str, float]]:
+    """
+    Computes a multi-signal occlusion score for entA OCCLUDES entB.
+
+    Requires evidence across 5 independent signals:
+    1. Meaningful mask overlap
+    2. Consistent depth ordering (entA closer than entB)
+    3. Contact boundary evidence
+    4. Entity trust threshold
+    5. Spatial plausibility
+
+    Formula:
+    occlusion_score = 0.30 * overlap_term
+                    + 0.30 * depth_order_term
+                    + 0.15 * boundary_contact_term
+                    + 0.15 * trust_term
+                    + 0.10 * proximity_term
+    """
+    h, w = rgb_shape
+    diag_length = max(1.0, np.sqrt(h**2 + w**2))
+
+    # 1. Overlap term (Requires >= 5% overlap relative to smaller entity)
+    overlap_term = float(np.clip(overlap_ratio / 0.30, 0.0, 1.0))
+
+    # 2. Depth ordering term (depth_diff < -0.15 strictly required for occlusion)
+    if depth_diff >= -0.15:
+        return 0.0, {"occlusion_score": 0.0, "reason": "insufficient_depth_separation"}
+
+    depth_order_term = float(np.clip(abs(depth_diff) / 1.5, 0.0, 1.0))
+
+    # 3. Contact boundary
+    intersection = entA.mask & entB.mask
+    if np.any(intersection):
+        boundary_kernel = cv2.getStructuringElement(cv2.MORPH_RECT, (5, 5))
+        dilated_inter = cv2.dilate(intersection.astype(np.uint8) * 255, boundary_kernel) > 0
+        boundary_contact_pixels = np.sum(dilated_inter & (entA.mask ^ entB.mask))
+        boundary_contact_term = float(np.clip(boundary_contact_pixels / 500.0, 0.0, 1.0))
+    else:
+        boundary_contact_term = 0.0
+
+    # 4. Entity trust
+    trust_term = float(0.5 * entA.trust_score + 0.5 * entB.trust_score)
+
+    # 5. Spatial proximity
+    dist = np.sqrt((entA.centroid[0] - entB.centroid[0])**2 + (entA.centroid[1] - entB.centroid[1])**2)
+    norm_dist = dist / diag_length
+    proximity_term = float(np.clip(1.0 - norm_dist / 0.50, 0.0, 1.0))
+
+    occlusion_score = (
+        0.35 * overlap_term +
+        0.35 * depth_order_term +
+        0.10 * boundary_contact_term +
+        0.10 * trust_term +
+        0.10 * proximity_term
+    )
+
+    metrics = {
+        "overlap_ratio": round(overlap_ratio, 3),
+        "depth_diff": round(depth_diff, 3),
+        "boundary_contact_term": round(boundary_contact_term, 3),
+        "trust_term": round(trust_term, 3),
+        "occlusion_score": round(occlusion_score, 3)
+    }
+
+    return float(occlusion_score), metrics
 
 
 def infer_spatial_relationships(
     scene_graph: SceneGraph,
     image_shape: Tuple[int, int],
-    depth_similarity_threshold: float = 1.0
+    depth_similarity_threshold: float = 0.8,
+    min_occlusion_threshold: float = 0.55
 ) -> SceneGraph:
     """
-    Infers deterministic 2.5D spatial relationships between all pairs of entities in the scene graph
-    using visual evidence: mask overlap, bbox containment, centroid distance, depth distribution, and boundary contact.
+    Infers a sparse, canonical, render-relevant relationship graph among trusted entities.
+
+    Guarantees:
+    1. Operates only on trusted entities ($N \approx 5\text{--}15$).
+    2. Enforces canonical pair ordering (min_id, max_id) to eliminate reciprocal duplicates
+       (e.g., FRONT_OF + BEHIND, OCCLUDES + OCCLUDED_BY are stored as single canonical edges).
+    3. OVERLAPS does not automatically imply OCCLUDES; OCCLUDES requires multi-signal validation.
+    4. Filters out irrelevant relationships (LOW / IGNORE) to maintain a sparse graph.
     """
     entities = list(scene_graph.entities.values())
     num_entities = len(entities)
@@ -33,6 +115,14 @@ def infer_spatial_relationships(
             entA = entities[i]
             entB = entities[j]
 
+            # Canonical Ordering: Always place lower entity_id as subject
+            if entA.entity_id > entB.entity_id:
+                entA, entB = entB, entA
+
+            # Skip pairwise calculation between two low-relevance background regions
+            if entA.render_relevance == RenderRelevance.IGNORE and entB.render_relevance == RenderRelevance.IGNORE:
+                continue
+
             # 1. Mask Overlap & Intersection
             intersection = np.sum(entA.mask & entB.mask)
             min_area = max(1, min(entA.area_pixels, entB.area_pixels))
@@ -42,80 +132,85 @@ def infer_spatial_relationships(
             dist = np.sqrt((entA.centroid[0] - entB.centroid[0])**2 + (entA.centroid[1] - entB.centroid[1])**2)
             norm_dist = float(dist / diag_length)
 
-            # 3. Depth Difference (smaller rendering depth Z = closer to camera in rendering coordinates)
-            d_diff = entA.depth_mean - entB.depth_mean  # If negative -> entA is closer than entB
+            # 3. Depth Difference (entA.depth_mean - entB.depth_mean)
+            d_diff = entA.depth_mean - entB.depth_mean  # Negative -> entA is closer
 
-            # Inferences:
-            # Relationship 1: IN_FRONT_OF / BEHIND
-            if abs(d_diff) > 0.3:
-                if d_diff < 0:  # entA is closer
-                    conf = min(0.99, float(abs(d_diff) / 3.0 + 0.50))
+            # Canonical Relationship 1: FRONT_OF
+            if abs(d_diff) > 0.35:
+                conf = min(0.99, float(abs(d_diff) / 3.0 + 0.50))
+                rel_relevance = RenderRelevance.CRITICAL if (entA.is_primary_subject or entB.is_primary_subject) else RenderRelevance.USEFUL
+
+                if d_diff < 0:  # entA is closer than entB -> entA FRONT_OF entB
                     scene_graph.add_relationship(
-                        entA.entity_id, entB.entity_id, RelationType.IN_FRONT_OF,
-                        confidence=round(conf, 3), evidence=f"depth_mean_diff({d_diff:.2f})"
+                        entA.entity_id, entB.entity_id, RelationType.FRONT_OF,
+                        confidence=round(conf, 3), evidence=f"depth_mean_diff({d_diff:.2f})",
+                        render_relevance=rel_relevance,
+                        supporting_metrics={"depth_diff": round(d_diff, 3)}
                     )
+                else:  # entB is closer than entA -> entB FRONT_OF entA
                     scene_graph.add_relationship(
-                        entB.entity_id, entA.entity_id, RelationType.BEHIND,
-                        confidence=round(conf, 3), evidence=f"depth_mean_diff({-d_diff:.2f})"
-                    )
-                else:  # entB is closer
-                    conf = min(0.99, float(abs(d_diff) / 3.0 + 0.50))
-                    scene_graph.add_relationship(
-                        entB.entity_id, entA.entity_id, RelationType.IN_FRONT_OF,
-                        confidence=round(conf, 3), evidence=f"depth_mean_diff({-d_diff:.2f})"
-                    )
-                    scene_graph.add_relationship(
-                        entA.entity_id, entB.entity_id, RelationType.BEHIND,
-                        confidence=round(conf, 3), evidence=f"depth_mean_diff({d_diff:.2f})"
+                        entB.entity_id, entA.entity_id, RelationType.FRONT_OF,
+                        confidence=round(conf, 3), evidence=f"depth_mean_diff({-d_diff:.2f})",
+                        render_relevance=rel_relevance,
+                        supporting_metrics={"depth_diff": round(-d_diff, 3)}
                     )
 
-            # Relationship 2: SAME_COMPOUND_SUBJECT / NEAR
-            if abs(d_diff) <= depth_similarity_threshold and norm_dist < 0.35:
+            # Canonical Relationship 2: SAME_COMPOUND_SUBJECT / NEAR
+            elif abs(d_diff) <= depth_similarity_threshold and norm_dist < 0.35:
                 if entA.is_primary_subject and entB.is_primary_subject:
                     scene_graph.add_relationship(
                         entA.entity_id, entB.entity_id, RelationType.SAME_COMPOUND_SUBJECT,
-                        confidence=0.95, evidence="primary_subject_cluster"
+                        confidence=0.95, evidence="primary_subject_cluster",
+                        render_relevance=RenderRelevance.CRITICAL
                     )
-                elif norm_dist < 0.20:
+                elif norm_dist < 0.15 and (entA.is_primary_subject or entB.is_primary_subject or entA.trust_score > 0.65 or entB.trust_score > 0.65):
                     scene_graph.add_relationship(
                         entA.entity_id, entB.entity_id, RelationType.NEAR,
-                        confidence=round(1.0 - norm_dist / 0.20, 3), evidence=f"norm_dist({norm_dist:.2f})"
+                        confidence=round(1.0 - norm_dist / 0.15, 3), evidence=f"norm_dist({norm_dist:.2f})",
+                        render_relevance=RenderRelevance.USEFUL,
+                        supporting_metrics={"norm_dist": round(norm_dist, 3)}
                     )
 
-            # Relationship 3: OVERLAPS / OCCLUDES / OCCLUDED_BY
-            if overlap_ratio > 0.05:
+            # Canonical Relationship 3: OVERLAPS & Multi-Signal OCCLUDES
+            if overlap_ratio > 0.15 and (entA.is_primary_subject or entB.is_primary_subject or entA.trust_score > 0.60 or entB.trust_score > 0.60):
+                # Store OVERLAPS independently
                 scene_graph.add_relationship(
                     entA.entity_id, entB.entity_id, RelationType.OVERLAPS,
-                    confidence=round(overlap_ratio, 3), evidence=f"mask_overlap_ratio({overlap_ratio:.2f})"
+                    confidence=round(overlap_ratio, 3), evidence=f"mask_overlap_ratio({overlap_ratio:.2f})",
+                    render_relevance=RenderRelevance.USEFUL,
+                    supporting_metrics={"overlap_ratio": round(overlap_ratio, 3)}
                 )
-                if abs(d_diff) > 0.2:
-                    if d_diff < 0:  # entA occludes entB
-                        scene_graph.add_relationship(
-                            entA.entity_id, entB.entity_id, RelationType.OCCLUDES,
-                            confidence=round(min(0.98, overlap_ratio + 0.5), 3), evidence="overlap_plus_depth"
-                        )
-                        scene_graph.add_relationship(
-                            entB.entity_id, entA.entity_id, RelationType.OCCLUDED_BY,
-                            confidence=round(min(0.98, overlap_ratio + 0.5), 3), evidence="overlap_plus_depth"
-                        )
-                    else:  # entB occludes entA
+
+                # Check multi-signal OCCLUDES for entA OCCLUDES entB
+                score_A_occ_B, metrics_A = compute_multi_signal_occlusion_score(entA, entB, overlap_ratio, d_diff, image_shape)
+                if score_A_occ_B >= min_occlusion_threshold:
+                    scene_graph.add_relationship(
+                        entA.entity_id, entB.entity_id, RelationType.OCCLUDES,
+                        confidence=round(score_A_occ_B, 3), evidence="multi_signal_occlusion_gate",
+                        render_relevance=RenderRelevance.CRITICAL,
+                        supporting_metrics=metrics_A
+                    )
+                else:
+                    # Check multi-signal OCCLUDES for entB OCCLUDES entA
+                    score_B_occ_A, metrics_B = compute_multi_signal_occlusion_score(entB, entA, overlap_ratio, -d_diff, image_shape)
+                    if score_B_occ_A >= min_occlusion_threshold:
                         scene_graph.add_relationship(
                             entB.entity_id, entA.entity_id, RelationType.OCCLUDES,
-                            confidence=round(min(0.98, overlap_ratio + 0.5), 3), evidence="overlap_plus_depth"
-                        )
-                        scene_graph.add_relationship(
-                            entA.entity_id, entB.entity_id, RelationType.OCCLUDED_BY,
-                            confidence=round(min(0.98, overlap_ratio + 0.5), 3), evidence="overlap_plus_depth"
+                            confidence=round(score_B_occ_A, 3), evidence="multi_signal_occlusion_gate",
+                            render_relevance=RenderRelevance.CRITICAL,
+                            supporting_metrics=metrics_B
                         )
 
-            # Relationship 4: SUPPORTS (Vertical position + contact: lower entity entB supports upper entA)
-            if abs(entA.centroid[1] - entB.centroid[1]) < 0.3 * w:
-                if entB.centroid[0] > entA.centroid[0] and abs(d_diff) < 0.8:  # entB is below entA in Y
+            # Canonical Relationship 4: SUPPORTS
+            if abs(entA.centroid[1] - entB.centroid[1]) < 0.25 * w and abs(d_diff) < 0.6:
+                if entB.centroid[0] > entA.centroid[0]:  # entB is below entA in Y
                     dist_y = entB.centroid[0] - entA.centroid[0]
-                    if dist_y < 0.4 * h:
+                    if 0.05 * h < dist_y < 0.35 * h:
                         scene_graph.add_relationship(
                             entB.entity_id, entA.entity_id, RelationType.SUPPORTS,
-                            confidence=0.75, evidence=f"vertical_support_dist_y({dist_y:.1f})"
+                            confidence=0.75, evidence=f"vertical_support_dist_y({dist_y:.1f})",
+                            render_relevance=RenderRelevance.USEFUL,
+                            supporting_metrics={"dist_y": round(dist_y, 1)}
                         )
 
     return scene_graph

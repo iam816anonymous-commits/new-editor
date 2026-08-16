@@ -1027,12 +1027,12 @@ def test_spatial_intelligence_schemas_and_scene_graph():
         area_ratio=0.10, depth_mean=1.5, depth_median=1.5, depth_std=0.1, is_primary_subject=True
     )
     sg = si.scene_graph.create_scene_graph([ent1])
-    sg.add_relationship(1, 2, si.RelationType.IN_FRONT_OF, confidence=0.95, evidence="depth_diff")
+    sg.add_relationship(1, 2, si.RelationType.FRONT_OF, confidence=0.95, evidence="depth_diff")
 
     sg_dict = si.scene_graph.export_scene_graph_dict(sg)
-    assert sg_dict["entities_count"] == 1
+    assert sg_dict["trusted_entities_count"] == 1
     assert sg_dict["relationships_count"] == 1
-    assert sg_dict["relationships"][0]["relation_type"] == "IN_FRONT_OF"
+    assert sg_dict["relationships"][0]["relation_type"] == "FRONT_OF"
 
 
 def test_spatial_relationship_inference_and_occlusion():
@@ -1054,7 +1054,7 @@ def test_spatial_relationship_inference_and_occlusion():
     rels = sg.get_relationships_for_entity(1)
     rel_types = [r.relation_type for r in rels]
 
-    assert si.RelationType.IN_FRONT_OF in rel_types
+    assert si.RelationType.FRONT_OF in rel_types
     assert si.RelationType.OCCLUDES in rel_types
 
     occlusions = si.occlusion_model.build_occlusion_model(sg, (h, w))
@@ -1140,5 +1140,277 @@ def test_spatial_engine_integration_and_diagnostics():
         assert (hash_dir / "depth_field.png").exists()
         assert (hash_dir / "depth_uncertainty.png").exists()
         assert (hash_dir / "occlusion_map.png").exists()
+        assert (hash_dir / "consolidated_entities.png").exists()
         assert (hash_dir / "camera_path.json").exists()
         assert (hash_dir / "spatial_diagnostics.json").exists()
+
+
+# ============================================================
+# PHASE 1.5 ENTITY CONSOLIDATION & SPARSE GRAPH TESTS (15 TESTS)
+# ============================================================
+
+def test_p15_1_duplicate_masks_are_merged():
+    """TEST 1: Duplicate masks with high IoU are consolidated into a single trusted entity."""
+    import spatial_intelligence as si
+    h, w = 64, 64
+    m1 = np.zeros((h, w), dtype=bool); m1[10:30, 10:30] = True
+    m2 = np.zeros((h, w), dtype=bool); m2[11:30, 10:30] = True  # Very high IoU
+
+    c1 = si.SegmentationCandidate(1, m1, (10,10,30,30), (20,20), (0.31,0.31), 400, 0.1, 2.0, 2.0, 0.1, 0.9, "grid")
+    c2 = si.SegmentationCandidate(2, m2, (11,10,30,30), (20,20), (0.31,0.31), 380, 0.09, 2.05, 2.05, 0.1, 0.85, "grid")
+
+    depth = np.full((h, w), 2.0, dtype=np.float32)
+    entities, rej, merged = si.entity_consolidator.consolidate_candidates([c1, c2], None, [], depth, (h, w))
+
+    assert len(entities) == 1
+    assert merged >= 1
+
+
+def test_p15_2_nested_duplicate_masks_do_not_create_fake_occlusion():
+    """TEST 2: Nested duplicate masks are consolidated and produce zero self-occlusion edges."""
+    import spatial_intelligence as si
+    h, w = 64, 64
+    m_outer = np.zeros((h, w), dtype=bool); m_outer[10:40, 10:40] = True
+    m_inner = np.zeros((h, w), dtype=bool); m_inner[15:35, 15:35] = True
+
+    c1 = si.SegmentationCandidate(1, m_outer, (10,10,40,40), (25,25), (0.39,0.39), 900, 0.22, 2.0, 2.0, 0.1, 0.9, "grid")
+    c2 = si.SegmentationCandidate(2, m_inner, (15,15,35,35), (25,25), (0.39,0.39), 400, 0.10, 2.0, 2.0, 0.1, 0.8, "grid")
+
+    depth = np.full((h, w), 2.0, dtype=np.float32)
+    entities, rej, merged = si.entity_consolidator.consolidate_candidates([c1, c2], None, [], depth, (h, w))
+
+    sg = si.create_scene_graph(entities)
+    sg = si.relationship_inferencer.infer_spatial_relationships(sg, (h, w))
+
+    # Should be 1 entity, 0 occlusion relationships
+    assert len(entities) == 1
+    assert len(sg.relationships) == 0
+
+
+def test_p15_3_high_overlap_candidates_consolidated_when_depth_agrees():
+    """TEST 3: High overlap regions with matching depth are consolidated into one entity."""
+    import spatial_intelligence as si
+    h, w = 64, 64
+    m1 = np.zeros((h, w), dtype=bool); m1[10:30, 10:30] = True
+    m2 = np.zeros((h, w), dtype=bool); m2[12:32, 10:30] = True
+
+    c1 = si.SegmentationCandidate(1, m1, (10,10,30,30), (20,20), (0.31,0.31), 400, 0.1, 3.0, 3.0, 0.1, 0.9, "box")
+    c2 = si.SegmentationCandidate(2, m2, (12,10,32,30), (21,20), (0.33,0.31), 400, 0.1, 3.1, 3.1, 0.1, 0.88, "box")
+
+    depth = np.full((h, w), 3.0, dtype=np.float32)
+    entities, rej, merged = si.entity_consolidator.consolidate_candidates([c1, c2], None, [], depth, (h, w))
+
+    assert len(entities) == 1
+    assert entities[0].source_candidate_ids == [1, 2]
+
+
+def test_p15_4_distinct_objects_with_depth_separation_remain_separate():
+    """TEST 4: Distinct objects with depth separation remain independent trusted entities."""
+    import spatial_intelligence as si
+    h, w = 64, 64
+    m1 = np.zeros((h, w), dtype=bool); m1[5:20, 5:20] = True
+    m2 = np.zeros((h, w), dtype=bool); m2[40:55, 40:55] = True
+
+    c1 = si.SegmentationCandidate(1, m1, (5,5,20,20), (12,12), (0.2,0.2), 225, 0.05, 1.5, 1.5, 0.1, 0.9, "grid")
+    c2 = si.SegmentationCandidate(2, m2, (40,40,55,55), (47,47), (0.7,0.7), 225, 0.05, 6.0, 6.0, 0.1, 0.85, "grid")
+
+    depth = np.full((h, w), 5.0, dtype=np.float32)
+    entities, rej, merged = si.entity_consolidator.consolidate_candidates([c1, c2], None, [], depth, (h, w))
+
+    assert len(entities) == 2
+
+
+def test_p15_5_primary_subject_remains_protected_entity():
+    """TEST 5: Primary subject remains a protected entity (ID 1, SemanticRole.PRIMARY_SUBJECT)."""
+    import spatial_intelligence as si
+    h, w = 64, 64
+    sub_mask = np.zeros((h, w), dtype=bool); sub_mask[15:45, 15:45] = True
+    depth = np.full((h, w), 2.0, dtype=np.float32)
+
+    c1 = si.SegmentationCandidate(10, sub_mask, (15,15,45,45), (30,30), (0.5,0.5), 900, 0.22, 2.0, 2.0, 0.1, 0.95, "sam")
+
+    entities, rej, merged = si.entity_consolidator.consolidate_candidates([c1], sub_mask, [10], depth, (h, w))
+
+    assert len(entities) == 1
+    assert entities[0].entity_id == 1
+    assert entities[0].is_primary_subject is True
+    assert entities[0].semantic_role == si.SemanticRole.PRIMARY_SUBJECT
+
+
+def test_p15_6_primary_subject_not_arbitrarily_split():
+    """TEST 6: Candidates overlapping >60% with primary subject are absorbed into primary entity."""
+    import spatial_intelligence as si
+    h, w = 64, 64
+    sub_mask = np.zeros((h, w), dtype=bool); sub_mask[10:50, 10:50] = True
+    overlapping_cand_mask = np.zeros((h, w), dtype=bool); overlapping_cand_mask[15:45, 15:45] = True  # 100% inside
+
+    c_overlap = si.SegmentationCandidate(20, overlapping_cand_mask, (15,15,45,45), (30,30), (0.5,0.5), 900, 0.22, 2.0, 2.0, 0.1, 0.8, "sam")
+
+    depth = np.full((h, w), 2.0, dtype=np.float32)
+    entities, rej, merged = si.entity_consolidator.consolidate_candidates([c_overlap], sub_mask, [10], depth, (h, w))
+
+    assert len(entities) == 1
+    assert 20 in entities[0].source_candidate_ids
+
+
+def test_p15_7_canonical_front_of_prevents_duplicate_behind_record():
+    """TEST 7: A FRONT_OF B creates a single canonical relationship without reciprocal graph duplication."""
+    import spatial_intelligence as si
+    h, w = 64, 64
+    m1 = np.zeros((h, w), dtype=bool); m1[5:20, 5:20] = True
+    m2 = np.zeros((h, w), dtype=bool); m2[40:55, 40:55] = True
+
+    ent1 = si.Entity(1, "e1", m1, (5,5,20,20), (12,12), (0.2,0.2), 225, 0.05, 1.0, 1.0, 0.1)
+    ent2 = si.Entity(2, "e2", m2, (40,40,55,55), (47,47), (0.7,0.7), 225, 0.05, 5.0, 5.0, 0.1)
+
+    sg = si.create_scene_graph([ent1, ent2])
+    sg = si.relationship_inferencer.infer_spatial_relationships(sg, (h, w))
+
+    assert len(sg.relationships) == 1
+    assert sg.relationships[0].relation_type == si.RelationType.FRONT_OF
+    assert sg.relationships[0].subject_id == 1
+    assert sg.relationships[0].target_id == 2
+
+
+def test_p15_8_canonical_occludes_prevents_duplicate_occluded_by_record():
+    """TEST 8: A OCCLUDES B creates a single canonical relationship edge without reciprocal duplicate."""
+    import spatial_intelligence as si
+    h, w = 64, 64
+    m1 = np.zeros((h, w), dtype=bool); m1[20:40, 20:40] = True
+    m2 = np.zeros((h, w), dtype=bool); m2[30:50, 30:50] = True
+
+    ent1 = si.Entity(1, "e1", m1, (20,20,40,40), (30,30), (0.5,0.5), 400, 0.1, 1.0, 1.0, 0.1, trust_score=0.9)
+    ent2 = si.Entity(2, "e2", m2, (30,30,50,50), (40,40), (0.6,0.6), 400, 0.1, 5.0, 5.0, 0.1, trust_score=0.9)
+
+    sg = si.create_scene_graph([ent1, ent2])
+    sg = si.relationship_inferencer.infer_spatial_relationships(sg, (h, w))
+
+    occ_rels = [r for r in sg.relationships if r.relation_type == si.RelationType.OCCLUDES]
+    assert len(occ_rels) == 1
+    assert occ_rels[0].subject_id == 1
+    assert occ_rels[0].target_id == 2
+
+
+def test_p15_9_low_confidence_and_noise_candidates_rejected():
+    """TEST 9: Tiny fragments (<0.5% area) are rejected during candidate consolidation."""
+    import spatial_intelligence as si
+    h, w = 64, 64
+    m_tiny = np.zeros((h, w), dtype=bool); m_tiny[10:11, 10:11] = True  # 1 pixel = 0.02% area
+
+    c_tiny = si.SegmentationCandidate(1, m_tiny, (10,10,11,11), (10,10), (0.1,0.1), 1, 0.0002, 2.0, 2.0, 0.1, 0.5, "grid")
+
+    depth = np.full((h, w), 2.0, dtype=np.float32)
+    entities, rej, merged = si.entity_consolidator.consolidate_candidates([c_tiny], None, [], depth, (h, w))
+
+    assert len(entities) == 0
+    assert rej == 1
+
+
+def test_p15_10_large_environmental_masks_not_trusted_solely_for_area():
+    """TEST 10: Enormous environmental masks (>85% area) are rejected."""
+    import spatial_intelligence as si
+    h, w = 64, 64
+    m_huge = np.ones((h, w), dtype=bool)  # 100% area
+
+    c_huge = si.SegmentationCandidate(1, m_huge, (0,0,64,64), (32,32), (0.5,0.5), 4096, 1.0, 8.0, 8.0, 0.1, 0.9, "grid")
+
+    depth = np.full((h, w), 8.0, dtype=np.float32)
+    entities, rej, merged = si.entity_consolidator.consolidate_candidates([c_huge], None, [], depth, (h, w))
+
+    assert len(entities) == 0
+    assert rej == 1
+
+
+def test_p15_11_continuous_depth_output_remains_unchanged():
+    """TEST 11: Continuous depth maps remain completely unchanged before and after entity consolidation."""
+    import spatial_intelligence as si
+    h, w = 64, 64
+    depth_orig = np.random.uniform(0.1, 10.0, (h, w)).astype(np.float32)
+    depth_copy = depth_orig.copy()
+
+    m1 = np.zeros((h, w), dtype=bool); m1[10:30, 10:30] = True
+    c1 = si.SegmentationCandidate(1, m1, (10,10,30,30), (20,20), (0.3,0.3), 400, 0.1, 2.0, 2.0, 0.1, 0.9, "grid")
+
+    si.entity_consolidator.consolidate_candidates([c1], None, [], depth_orig, (h, w))
+
+    np.testing.assert_array_equal(depth_orig, depth_copy)
+
+
+def test_p15_12_scene_graph_remains_sparse():
+    """TEST 12: Entity consolidation guarantees scene graph remains sparse (5-15 entities)."""
+    import spatial_intelligence as si
+    h, w = 64, 64
+    candidates = []
+    # Create 30 raw candidate boxes with heavy overlaps
+    for i in range(30):
+        y0 = (i * 2) % 40
+        x0 = (i * 2) % 40
+        m = np.zeros((h, w), dtype=bool); m[y0:y0+20, x0:x0+20] = True
+        candidates.append(si.SegmentationCandidate(i+1, m, (y0,x0,y0+20,x0+20), (y0+10,x0+10), (0.5,0.5), 400, 0.1, 2.0 + i*0.1, 2.0, 0.1, 0.8, "grid"))
+
+    depth = np.full((h, w), 2.0, dtype=np.float32)
+    entities, rej, merged = si.entity_consolidator.consolidate_candidates(candidates, None, [], depth, (h, w))
+
+    sg = si.create_scene_graph(entities)
+    sg = si.relationship_inferencer.infer_spatial_relationships(sg, (h, w))
+
+    assert len(entities) <= 15
+    # Verify entity reduction ratio is dramatic (from 30 candidates to <=15 entities)
+    assert rej + merged > 15
+
+
+def test_p15_13_relationship_generation_is_deterministic():
+    """TEST 13: Executing relationship inference twice on same graph yields identical outputs."""
+    import spatial_intelligence as si
+    h, w = 64, 64
+    m1 = np.zeros((h, w), dtype=bool); m1[5:20, 5:20] = True
+    m2 = np.zeros((h, w), dtype=bool); m2[40:55, 40:55] = True
+
+    ent1 = si.Entity(1, "e1", m1, (5,5,20,20), (12,12), (0.2,0.2), 225, 0.05, 1.0, 1.0, 0.1)
+    ent2 = si.Entity(2, "e2", m2, (40,40,55,55), (47,47), (0.7,0.7), 225, 0.05, 5.0, 5.0, 0.1)
+
+    sg1 = si.create_scene_graph([ent1, ent2])
+    sg1 = si.relationship_inferencer.infer_spatial_relationships(sg1, (h, w))
+
+    sg2 = si.create_scene_graph([ent1, ent2])
+    sg2 = si.relationship_inferencer.infer_spatial_relationships(sg2, (h, w))
+
+    assert len(sg1.relationships) == len(sg2.relationships)
+    assert sg1.relationships[0].relation_type == sg2.relationships[0].relation_type
+
+
+def test_p15_14_overlaps_does_not_automatically_imply_occludes():
+    """TEST 14: Overlapping masks with minimal depth difference produce OVERLAPS but NOT OCCLUDES."""
+    import spatial_intelligence as si
+    h, w = 64, 64
+    m1 = np.zeros((h, w), dtype=bool); m1[20:40, 20:40] = True
+    m2 = np.zeros((h, w), dtype=bool); m2[25:45, 25:45] = True  # Overlapping
+
+    # Identical depth -> no occlusion
+    ent1 = si.Entity(1, "e1", m1, (20,20,40,40), (30,30), (0.5,0.5), 400, 0.1, 2.0, 2.0, 0.1, trust_score=0.9)
+    ent2 = si.Entity(2, "e2", m2, (25,25,45,45), (35,35), (0.5,0.5), 400, 0.1, 2.0, 2.0, 0.1, trust_score=0.9)
+
+    sg = si.create_scene_graph([ent1, ent2])
+    sg = si.relationship_inferencer.infer_spatial_relationships(sg, (h, w))
+
+    rel_types = [r.relation_type for r in sg.relationships]
+    assert si.RelationType.OVERLAPS in rel_types
+    assert si.RelationType.OCCLUDES not in rel_types
+
+
+def test_p15_15_entity_trust_score_formula_and_evidence():
+    """TEST 15: Entity trust score produces detailed evidence breakdown separate from raw SAM confidence."""
+    import spatial_intelligence as si
+    h, w = 64, 64
+    m1 = np.zeros((h, w), dtype=bool); m1[20:40, 20:40] = True
+    ent = si.Entity(1, "e1", m1, (20,20,40,40), (30,30), (0.5,0.5), 400, 0.1, 2.0, 2.0, 0.1)
+
+    rgb = np.full((h, w, 3), 100, dtype=np.uint8)
+    depth = np.full((h, w), 2.0, dtype=np.float32)
+    conf = np.ones((h, w), dtype=np.float32)
+
+    trust = si.entity_trust.compute_entity_trust_score(ent, rgb, depth, conf)
+
+    assert 0.0 <= trust.overall_trust_score <= 1.0
+    assert "mask_quality" in trust.evidence_breakdown
+    assert "depth_coherence" in trust.evidence_breakdown
