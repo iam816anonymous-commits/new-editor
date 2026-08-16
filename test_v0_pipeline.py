@@ -1414,3 +1414,177 @@ def test_p15_15_entity_trust_score_formula_and_evidence():
     assert 0.0 <= trust.overall_trust_score <= 1.0
     assert "mask_quality" in trust.evidence_breakdown
     assert "depth_coherence" in trust.evidence_breakdown
+
+
+# ============================================================
+# ADVERSARIAL SPATIAL INTELLIGENCE TESTS (CASES A - J)
+# ============================================================
+
+def test_adv_case_a_non_overlapping_objects_no_occlusion():
+    """CASE A: Two non-overlapping objects -> zero occlusion relationships."""
+    import spatial_intelligence as si
+    h, w = 64, 64
+    m1 = np.zeros((h, w), dtype=bool); m1[5:15, 5:15] = True
+    m2 = np.zeros((h, w), dtype=bool); m2[40:50, 40:50] = True
+
+    ent1 = si.Entity(1, "o1", m1, (5,5,15,15), (10,10), (0.15,0.15), 100, 0.02, 1.0, 1.0, 0.1, trust_score=0.9)
+    ent2 = si.Entity(2, "o2", m2, (40,40,50,50), (45,45), (0.7,0.7), 100, 0.02, 5.0, 5.0, 0.1, trust_score=0.9)
+
+    sg = si.create_scene_graph([ent1, ent2])
+    sg = si.relationship_inferencer.infer_spatial_relationships(sg, (h, w))
+
+    occ_rels = [r for r in sg.relationships if r.relation_type == si.RelationType.OCCLUDES]
+    assert len(occ_rels) == 0
+
+
+def test_adv_case_b_overlapping_objects_depth_separation_one_directional_occlusion():
+    """CASE B: Two overlapping objects with clear depth separation -> exactly one directional OCCLUDES edge."""
+    import spatial_intelligence as si
+    h, w = 64, 64
+    m1 = np.zeros((h, w), dtype=bool); m1[20:40, 20:40] = True  # Foreground
+    m2 = np.zeros((h, w), dtype=bool); m2[30:50, 30:50] = True  # Background
+
+    ent1 = si.Entity(1, "fg", m1, (20,20,40,40), (30,30), (0.5,0.5), 400, 0.1, 1.0, 1.0, 0.1, trust_score=0.95)
+    ent2 = si.Entity(2, "bg", m2, (30,30,50,50), (40,40), (0.6,0.6), 400, 0.1, 6.0, 6.0, 0.1, trust_score=0.95)
+
+    sg = si.create_scene_graph([ent1, ent2])
+    sg = si.relationship_inferencer.infer_spatial_relationships(sg, (h, w))
+
+    occ_rels = [r for r in sg.relationships if r.relation_type == si.RelationType.OCCLUDES]
+    assert len(occ_rels) == 1
+    assert occ_rels[0].subject_id == 1
+    assert occ_rels[0].target_id == 2
+
+
+def test_adv_case_c_overlapping_objects_identical_depth_overlaps_without_occlusion():
+    """CASE C: Two overlapping objects with almost identical depth -> OVERLAPS exists, but OCCLUDES is NOT inferred."""
+    import spatial_intelligence as si
+    h, w = 64, 64
+    m1 = np.zeros((h, w), dtype=bool); m1[20:40, 20:40] = True
+    m2 = np.zeros((h, w), dtype=bool); m2[25:45, 25:45] = True
+
+    ent1 = si.Entity(1, "o1", m1, (20,20,40,40), (30,30), (0.5,0.5), 400, 0.1, 3.0, 3.0, 0.1, trust_score=0.9)
+    ent2 = si.Entity(2, "o2", m2, (25,25,45,45), (35,35), (0.5,0.5), 400, 0.1, 3.0, 3.0, 0.1, trust_score=0.9)
+
+    sg = si.create_scene_graph([ent1, ent2])
+    sg = si.relationship_inferencer.infer_spatial_relationships(sg, (h, w))
+
+    rel_types = [r.relation_type for r in sg.relationships]
+    assert si.RelationType.OVERLAPS in rel_types
+    assert si.RelationType.OCCLUDES not in rel_types
+
+
+def test_adv_case_d_duplicate_masks_of_same_object_merge_to_one_entity():
+    """CASE D: Duplicate proposals of same object merge into one entity."""
+    import spatial_intelligence as si
+    h, w = 64, 64
+    m1 = np.zeros((h, w), dtype=bool); m1[10:30, 10:30] = True
+    m2 = np.zeros((h, w), dtype=bool); m2[10:30, 10:30] = True  # Exact duplicate
+
+    c1 = si.SegmentationCandidate(1, m1, (10,10,30,30), (20,20), (0.31,0.31), 400, 0.1, 2.0, 2.0, 0.1, 0.9, "grid")
+    c2 = si.SegmentationCandidate(2, m2, (10,10,30,30), (20,20), (0.31,0.31), 400, 0.1, 2.0, 2.0, 0.1, 0.88, "grid")
+
+    depth = np.full((h, w), 2.0, dtype=np.float32)
+    entities, rej, merged = si.entity_consolidator.consolidate_candidates([c1, c2], None, [], depth, (h, w))
+
+    assert len(entities) == 1
+
+
+def test_adv_case_e_nested_mask_consolidates_to_single_entity():
+    """CASE E: Nested mask representing same object consolidates into single entity."""
+    import spatial_intelligence as si
+    h, w = 64, 64
+    m_outer = np.zeros((h, w), dtype=bool); m_outer[10:40, 10:40] = True
+    m_inner = np.zeros((h, w), dtype=bool); m_inner[15:35, 15:35] = True
+
+    c1 = si.SegmentationCandidate(1, m_outer, (10,10,40,40), (25,25), (0.39,0.39), 900, 0.22, 2.0, 2.0, 0.1, 0.9, "grid")
+    c2 = si.SegmentationCandidate(2, m_inner, (15,15,35,35), (25,25), (0.39,0.39), 400, 0.10, 2.0, 2.0, 0.1, 0.85, "grid")
+
+    depth = np.full((h, w), 2.0, dtype=np.float32)
+    entities, rej, merged = si.entity_consolidator.consolidate_candidates([c1, c2], None, [], depth, (h, w))
+
+    assert len(entities) == 1
+
+
+def test_adv_case_f_distinct_touching_subjects_remain_separate_entities():
+    """CASE F: Two distinct touching subjects remain separate entities."""
+    import spatial_intelligence as si
+    h, w = 64, 64
+    m1 = np.zeros((h, w), dtype=bool); m1[10:30, 10:30] = True
+    m2 = np.zeros((h, w), dtype=bool); m2[10:30, 30:50] = True  # Touches m1 along column x=30
+
+    c1 = si.SegmentationCandidate(1, m1, (10,10,30,30), (20,20), (0.31,0.31), 400, 0.1, 1.5, 1.5, 0.1, 0.9, "grid")
+    c2 = si.SegmentationCandidate(2, m2, (10,30,30,50), (20,40), (0.31,0.62), 400, 0.1, 4.0, 4.0, 0.1, 0.9, "grid")
+
+    depth = np.full((h, w), 3.0, dtype=np.float32)
+    entities, rej, merged = si.entity_consolidator.consolidate_candidates([c1, c2], None, [], depth, (h, w))
+
+    assert len(entities) == 2
+
+
+def test_adv_case_g_large_background_not_automatically_rejected():
+    """CASE G: Large background (>85% image) is NOT automatically rejected based on area alone."""
+    import spatial_intelligence as si
+    h, w = 64, 64
+    m_bg = np.ones((h, w), dtype=bool)
+    m_bg[20:40, 20:40] = False  # 90% area
+
+    c_bg = si.SegmentationCandidate(1, m_bg, (0,0,64,64), (32,32), (0.5,0.5), 3696, 0.90, 8.0, 8.0, 0.1, 0.9, "grid")
+
+    depth = np.full((h, w), 8.0, dtype=np.float32)
+    entities, rej, merged = si.entity_consolidator.consolidate_candidates([c_bg], None, [], depth, (h, w))
+
+    assert len(entities) == 1
+
+
+def test_adv_case_h_tiny_noise_fragment_rejected():
+    """CASE H: Tiny noise fragment (<0.5% image area) is rejected."""
+    import spatial_intelligence as si
+    h, w = 64, 64
+    m_tiny = np.zeros((h, w), dtype=bool); m_tiny[10:11, 10:11] = True  # 0.02% area
+
+    c_tiny = si.SegmentationCandidate(1, m_tiny, (10,10,11,11), (10,10), (0.1,0.1), 1, 0.0002, 2.0, 2.0, 0.1, 0.4, "grid")
+
+    depth = np.full((h, w), 2.0, dtype=np.float32)
+    entities, rej, merged = si.entity_consolidator.consolidate_candidates([c_tiny], None, [], depth, (h, w))
+
+    assert len(entities) == 0
+    assert rej == 1
+
+
+def test_adv_case_i_primary_subject_with_multiple_proposals():
+    """CASE I: Primary subject with multiple proposals consolidates into 1 protected primary subject."""
+    import spatial_intelligence as si
+    h, w = 64, 64
+    sub_mask = np.zeros((h, w), dtype=bool); sub_mask[10:50, 10:50] = True
+    p1 = np.zeros((h, w), dtype=bool); p1[15:45, 15:45] = True
+    p2 = np.zeros((h, w), dtype=bool); p2[12:48, 12:48] = True
+
+    c1 = si.SegmentationCandidate(1, p1, (15,15,45,45), (30,30), (0.5,0.5), 900, 0.22, 2.0, 2.0, 0.1, 0.9, "sam")
+    c2 = si.SegmentationCandidate(2, p2, (12,12,48,48), (30,30), (0.5,0.5), 1296, 0.31, 2.0, 2.0, 0.1, 0.88, "sam")
+
+    depth = np.full((h, w), 2.0, dtype=np.float32)
+    entities, rej, merged = si.entity_consolidator.consolidate_candidates([c1, c2], sub_mask, [100], depth, (h, w))
+
+    assert len(entities) == 1
+    assert entities[0].is_primary_subject is True
+    assert set(entities[0].source_candidate_ids) == {100, 1, 2}
+
+
+def test_adv_case_j_foreground_object_partially_occluding_primary_subject():
+    """CASE J: Foreground object partially occluding primary subject remains separate with correct occlusion direction."""
+    import spatial_intelligence as si
+    h, w = 64, 64
+    sub_mask = np.zeros((h, w), dtype=bool); sub_mask[20:50, 20:50] = True  # Primary subject at Z = 3.0
+    fg_mask = np.zeros((h, w), dtype=bool); fg_mask[10:30, 10:30] = True   # Foreground object at Z = 1.0 (overlaps at [20:30, 20:30])
+
+    ent_primary = si.Entity(1, "primary", sub_mask, (20,20,50,50), (35,35), (0.55,0.55), 900, 0.22, 3.0, 3.0, 0.1, is_primary_subject=True, trust_score=1.0)
+    ent_fg = si.Entity(2, "fg_obj", fg_mask, (10,10,30,30), (20,20), (0.31,0.31), 400, 0.10, 1.0, 1.0, 0.1, is_primary_subject=False, trust_score=0.9)
+
+    sg = si.create_scene_graph([ent_primary, ent_fg])
+    sg = si.relationship_inferencer.infer_spatial_relationships(sg, (h, w))
+
+    occ_rels = [r for r in sg.relationships if r.relation_type == si.RelationType.OCCLUDES]
+    assert len(occ_rels) == 1
+    assert occ_rels[0].subject_id == 2  # FG object (Z=1.0) OCCLUDES Primary subject (Z=3.0)
+    assert occ_rels[0].target_id == 1
