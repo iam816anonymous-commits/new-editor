@@ -124,7 +124,7 @@ def export_camera_path_dict(
     translations: np.ndarray,
     rotations: np.ndarray
 ) -> Dict[str, Any]:
-    """Exports camera intrinsics and 48-frame trajectory poses to JSON-serializable dictionary."""
+    """Exports camera intrinsics and generalized frame trajectory poses to JSON-serializable dictionary."""
     frames_path = []
     num_frames = len(translations)
 

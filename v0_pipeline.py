@@ -1425,21 +1425,19 @@ def generate_visual_review_contact_sheet(
 ) -> np.ndarray:
     """
     Generates an 8-panel grid contact sheet output/<hash>/cinematic/visual_review.png
-    containing ORIGINAL and FRAMES 00, 08, 16, 24, 32, 40, 47 arranged in a 2x4 grid.
+    containing ORIGINAL and 7 dynamically sampled frames up to F{last} arranged in a 2x4 grid.
     Includes prominent text labels and scales all frames consistently.
     """
     h, w, _ = original_rgb.shape
     aspect = h / float(w)
     target_height = int(target_width * aspect)
 
-    frame_indices = [("ORIGINAL", original_rgb),
-                     ("FRAME 00", rendered_frames[0]),
-                     ("FRAME 08", rendered_frames[8]),
-                     ("FRAME 16", rendered_frames[16]),
-                     ("FRAME 24", rendered_frames[24]),
-                     ("FRAME 32", rendered_frames[32]),
-                     ("FRAME 40", rendered_frames[40]),
-                     ("FRAME 47", rendered_frames[47])]
+    num_f = len(rendered_frames)
+    sample_indices = np.linspace(0, num_f - 1, 7, dtype=int)
+
+    frame_indices = [("ORIGINAL", original_rgb)] + [
+        (f"FRAME {idx:02d}", rendered_frames[idx]) for idx in sample_indices
+    ]
 
     labeled_panels = []
     for label, img in frame_indices:
@@ -1474,14 +1472,15 @@ def generate_motion_amplitude_comparison_contact_sheet(
 ) -> np.ndarray:
     """
     Generates a 3-row diagnostic contact sheet comparing LOW MOTION, MEDIUM MOTION, and HIGH MOTION:
-    ROW 1: LOW MOTION (Keyframes F00, F08, F16, F24, F32, F40, F47)
-    ROW 2: MEDIUM MOTION (Keyframes F00, F08, F16, F24, F32, F40, F47)
-    ROW 3: HIGH MOTION (Keyframes F00, F08, F16, F24, F32, F40, F47)
+    ROW 1: LOW MOTION
+    ROW 2: MEDIUM MOTION
+    ROW 3: HIGH MOTION
     """
     h, w, _ = original_rgb.shape
     aspect = h / float(w)
     target_h = int(target_w * aspect)
-    sample_indices = [0, 8, 16, 24, 32, 40, 47]
+    num_f = len(translations)
+    sample_indices = np.linspace(0, num_f - 1, 7, dtype=int)
 
     def render_preset_frames(amp_setting: str) -> list:
         motion_map = construct_layer_motion_map(original_rgb.shape[:2], subject_mask, spatial_diagnostics=None, motion_amplitude=amp_setting)
@@ -1528,8 +1527,8 @@ def generate_phase_1_7_multi_row_contact_sheet(
     target_w: int = 240
 ) -> np.ndarray:
     """
-    Generates multi-row visual validation contact sheet (Phase 1.7):
-    ROW 1: ORIGINAL, FRAME 00, FRAME 08, FRAME 16, FRAME 24, FRAME 32, FRAME 40, FRAME 47
+    Generates multi-row visual validation contact sheet supporting dynamic frame_count (48 or 100):
+    ROW 1: ORIGINAL, F00, and 6 dynamically sampled frames up to F{last} (F47 or F99)
     ROW 2: EXTRACTED LAYERS (BG, MG, Primary Subject, FG)
     ROW 3: DEPTH MAP, FINAL LAYER MAP, OCCLUSION MAP, COMPOSITE MASK
     ROW 4: EDGE ARTIFACT MAP, TEMPORAL DIFFERENCE MAP
@@ -1537,6 +1536,7 @@ def generate_phase_1_7_multi_row_contact_sheet(
     h, w, _ = original_rgb.shape
     aspect = h / float(w)
     target_h = int(target_w * aspect)
+    num_f = len(rendered_frames)
 
     def resize_panel(img: np.ndarray, title: str) -> np.ndarray:
         if img.ndim == 2:
@@ -1548,17 +1548,9 @@ def generate_phase_1_7_multi_row_contact_sheet(
         cv2.putText(p, title, (5, 17), cv2.FONT_HERSHEY_SIMPLEX, 0.45, (0, 255, 255), 1, cv2.LINE_AA)
         return p
 
-    # ROW 1: Frames (00, 08, 16, 24, 32, 40, 47)
-    row1_imgs = [
-        ("ORIGINAL", original_rgb),
-        ("F00", rendered_frames[0]),
-        ("F08", rendered_frames[8]),
-        ("F16", rendered_frames[16]),
-        ("F24", rendered_frames[24]),
-        ("F32", rendered_frames[32]),
-        ("F40", rendered_frames[40]),
-        ("F47", rendered_frames[47])
-    ]
+    # Dynamic frame index sampling for 48 or 100 frames
+    sample_indices = np.linspace(0, num_f - 1, 7, dtype=int)
+    row1_imgs = [("ORIGINAL", original_rgb)] + [(f"F{idx:02d}", rendered_frames[idx]) for idx in sample_indices]
     row1_panels = [resize_panel(img, title) for title, img in row1_imgs]
 
     # ROW 2: Extracted Layers (BG, MG, Subject, FG) + pad
@@ -1619,7 +1611,7 @@ def generate_visual_review_diagnostics_sheet(
 ) -> np.ndarray:
     """
     Generates output/<hash>/cinematic/visual_review_diagnostics.png
-    comparing ORIGINAL against FRAME 12, FRAME 24, FRAME 36 with 2x enlarged crops
+    comparing ORIGINAL against dynamically sampled keyframes with 2x enlarged crops
     across 5 critical regions:
     1. Face
     2. Hands
@@ -1649,10 +1641,15 @@ def generate_visual_review_diagnostics_sheet(
     centers = [center_face, center_hands, center_ornaments, center_silhouette, center_bg]
     labels = ["Face", "Hands", "Ornaments", "Silhouette", "Background"]
 
+    num_f = len(rendered_frames)
+    k12 = max(0, min(num_f - 1, int(num_f * 0.25)))
+    k24 = max(0, min(num_f - 1, int(num_f * 0.50)))
+    k36 = max(0, min(num_f - 1, int(num_f * 0.75)))
+
     frames_to_compare = [("ORIGINAL", original_rgb),
-                         ("FRAME 12", rendered_frames[12]),
-                         ("FRAME 24", rendered_frames[24]),
-                         ("FRAME 36", rendered_frames[36])]
+                         (f"FRAME {k12:02d}", rendered_frames[k12]),
+                         (f"FRAME {k24:02d}", rendered_frames[k24]),
+                         (f"FRAME {k36:02d}", rendered_frames[k36])]
 
     rows = []
     for (cy_c, cx_c), label in zip(centers, labels):
@@ -1683,8 +1680,7 @@ def generate_final_contact_sheet(
     crop_size: int = 140
 ) -> np.ndarray:
     """
-    Generates a visual contact sheet comparing:
-    ORIGINAL | FRAME 000 | FRAME 012 | FRAME 024 | FRAME 036 | FRAME 047
+    Generates a visual contact sheet comparing ORIGINAL against 5 dynamically sampled keyframes up to F{last}
     with 2x enlarged crops across 5 key structural regions:
     1. Face
     2. Hands
@@ -1714,7 +1710,8 @@ def generate_final_contact_sheet(
     centers = [center_face, center_hands, center_ornaments, center_silhouette, center_bg]
     labels = ["Face", "Hands", "Ornaments", "Silhouette", "Background"]
 
-    frame_indices = [0, 12, 24, 36, 47]
+    num_f = len(rendered_frames)
+    frame_indices = np.linspace(0, num_f - 1, 5, dtype=int).tolist()
 
     rows = []
     for (cy_c, cx_c), label in zip(centers, labels):
@@ -2075,12 +2072,17 @@ def encode_and_verify_mp4(
     expected_resolution: Optional[Tuple[int, int]] = None
 ) -> Dict[str, Any]:
     """
-    Encodes the 48 PNG frames in frames_dir to output_mp4_path using FFmpeg at fps=24 with libx264 high quality (crf=17).
-    Validates output MP4 via OpenCV VideoCapture (verifying frame count = 48, FPS = 24, resolution, duration).
+    Encodes generated PNG frames in frames_dir to output_mp4_path using FFmpeg at fps=24 with libx264 high quality (crf=17).
+    Validates output MP4 via OpenCV VideoCapture verifying actual_frames == expected_frames, FPS, resolution, and duration.
+    Raises RuntimeError if frame count mismatches expected_frames.
     Returns video metadata dictionary.
     """
     output_mp4_path.parent.mkdir(parents=True, exist_ok=True)
-    input_pattern = str(frames_dir / "frame_%02d.png")
+    # Support 4-digit or 2-digit zero padded frame filenames
+    if (frames_dir / "frame_0000.png").exists():
+        input_pattern = str(frames_dir / "frame_%04d.png")
+    else:
+        input_pattern = str(frames_dir / "frame_%02d.png")
 
     cmd = [
         "ffmpeg", "-y",
@@ -2218,7 +2220,7 @@ def compute_temporal_diagnostics(
     return temporal_summary, plot_img
 
 
-def render_full_48_frame_sequence(
+def render_full_frame_sequence(
     rgb_array: np.ndarray,
     depth_map: np.ndarray,
     bg_plate: np.ndarray,
@@ -2235,15 +2237,19 @@ def render_full_48_frame_sequence(
     disparity_ceiling_px: float,
     frames_dir: Path,
     spatial_diagnostics: Optional[Any] = None,
-    motion_amplitude: str = "MEDIUM"
+    motion_amplitude: str = "MEDIUM",
+    frame_count: int = 48
 ) -> Tuple[list, list]:
     """
-    Renders all 48 frames of the sequence independently from the immutable reference scene.
-    Saves individual PNGs frame_00.png .. frame_47.png.
-    Calculates and enforces per-frame safety validation for ALL 48 frames.
+    Generalized temporal sequence renderer. Renders exactly frame_count frames.
+    Saves individual PNGs frame_0000.png .. frame_{frame_count-1:04d}.png.
+    Calculates and enforces per-frame safety validation across all generated frames.
     Returns: (rendered_frames_list, per_frame_metrics_list)
     """
     num_frames = len(translations)
+    if num_frames != frame_count:
+        raise ValueError(f"Trajectory pose count ({num_frames}) does not match requested frame_count ({frame_count}).")
+
     rendered_frames = []
     per_frame_metrics = []
 
@@ -2261,8 +2267,8 @@ def render_full_48_frame_sequence(
             R_mat, t_vec, fx, fy, cx, cy, layer_motion_map=motion_map
         )
 
-        # Save individual frame PNG
-        frame_filename = f"frame_{i:02d}.png"
+        # Save individual frame PNG with 4-digit zero padding
+        frame_filename = f"frame_{i:04d}.png"
         frame_path = frames_dir / frame_filename
         Image.fromarray(syn_rgb).save(frame_path)
         rendered_frames.append(syn_rgb)
@@ -2575,10 +2581,20 @@ def generate_c1_smooth_trajectory(
     translations = np.zeros((num_frames, 3), dtype=np.float64)
     rotations = np.zeros((num_frames, 3), dtype=np.float64)
 
-    style_upper = style.upper().replace(" ", "_")
+    style_upper = style.upper().replace(" ", "_").replace("-", "_")
+
+    # Quintic Smoothstep Easing s(t) = 6t^5 - 15t^4 + 10t^3
+    s_quintic = 6.0 * (t ** 5) - 15.0 * (t ** 4) + 10.0 * (t ** 3)
 
     if style_upper == "STATIC":
         pass  # All zeros
+    elif style_upper in ["CINEMATIC_PUSH_IN", "CINEMATIC_PUSHIN", "PUSH_IN", "PUSHIN"]:
+        # Dedicated Cinematic Push-In trajectory combining Z push-in, subtle vertical drift, and camera zoom
+        # Modulate quintic smoothstep with C1 windowing w(t) so loop closure P(0)==P(1) and V(0)==V(1)==0
+        translations[:, 2] = w * s_quintic * magnitude_scale * 0.22  # Camera Z push-in
+        translations[:, 1] = -w * s_quintic * magnitude_scale * 0.025 # Subtle vertical rise
+        translations[:, 0] = w * np.sin(2.0 * np.pi * t) * magnitude_scale * 0.012 # Gentle horizontal arc
+        rotations[:, 0] = -w * s_quintic * magnitude_scale * np.radians(1.2) # Subtle pitch
     elif style_upper in ["DOLLY_IN", "DOLLYIN"]:
         translations[:, 2] = w * magnitude_scale * 0.15
     elif style_upper in ["DOLLY_OUT", "DOLLYOUT"]:
@@ -2944,8 +2960,8 @@ def parse_args(args: Optional[list] = None) -> argparse.Namespace:
     parser.add_argument(
         "--motion",
         type=str,
-        default="Orbit",
-        choices=["Dolly In", "Dolly Out", "Horizontal Pan", "Vertical Pan", "Orbit", "Micro Orbit"],
+        default="Cinematic Push-In",
+        choices=["Cinematic Push-In", "Dolly In", "Dolly Out", "Horizontal Pan", "Vertical Pan", "Orbit", "Micro Orbit"],
         help="Type of camera trajectory movement."
     )
     parser.add_argument(
@@ -3163,8 +3179,25 @@ def main():
         }
     }
 
-    # Add cinematic motion quality metrics section
+    # Add cinematic motion quality metrics section & frame count validation
     amp_setting = getattr(args, "motion_amplitude", "MEDIUM") if 'args' in locals() else "MEDIUM"
+    req_frames = getattr(args, "frames", 48) if 'args' in locals() else 48
+    gen_frames = len(rendered_frames) if 'rendered_frames' in locals() else req_frames
+    enc_frames = video_meta.get("frame_count", gen_frames) if 'video_meta' in locals() else gen_frames
+    exp_dur = float(req_frames / 24.0)
+    act_dur = video_meta.get("duration_seconds", exp_dur) if 'video_meta' in locals() else exp_dur
+
+    diag_metrics["frame_count_validation"] = {
+        "requested_frame_count": req_frames,
+        "generated_frame_count": gen_frames,
+        "encoded_frame_count": enc_frames,
+        "fps": 24,
+        "expected_duration_seconds": exp_dur,
+        "actual_duration_seconds": act_dur,
+        "frame_count_match": bool(req_frames == gen_frames),
+        "encoding_frame_count_match": bool(req_frames == enc_frames)
+    }
+
     diag_metrics["cinematic_motion_quality"] = {
         "motion_amplitude_requested": amp_setting,
         "motion_amplitude_actual": amp_setting,
@@ -3257,22 +3290,24 @@ def main():
         (hash_dir / level).mkdir(parents=True, exist_ok=True)
 
     fx, fy, cx, cy = derive_camera_intrinsics(pil_img.width, pil_img.height)
+    requested_frame_count = getattr(args, "frames", 48)
     trans_plan, rot_plan, final_scale, plan_summary = plan_safe_motion_trajectory(
         args.motion, args.strength, pil_img.width, pil_img.height,
         refined_depth, confidence_map, subject_mask, boundary_risk_map, provenance_map,
-        fx, fy, cx, cy
+        fx, fy, cx, cy, num_frames=requested_frame_count
     )
 
     level_dir = hash_dir / args.strength.lower()
     frames_dir = level_dir / "frames"
     output_mp4_path = level_dir / "output.mp4"
 
-    rendered_frames, per_frame_metrics = render_full_48_frame_sequence(
+    rendered_frames, per_frame_metrics = render_full_frame_sequence(
         rgb_array, refined_depth, background_plate, background_depth, provenance_map,
         subject_mask, boundary_risk_map, trans_plan, rot_plan, fx, fy, cx, cy,
         plan_summary["disparity_ceiling_target_px"], frames_dir,
         spatial_diagnostics=spatial_diagnostics,
-        motion_amplitude=args.motion_amplitude
+        motion_amplitude=args.motion_amplitude,
+        frame_count=requested_frame_count
     )
 
     temp_summary, temp_plot = compute_temporal_diagnostics(rendered_frames, subject_mask)
@@ -3288,10 +3323,24 @@ def main():
     Image.fromarray(final_contact_sheet).save(hash_dir / "final_contact_sheet.png")
 
     video_meta = encode_and_verify_mp4(
-        frames_dir, output_mp4_path, fps=24, expected_frames=48,
+        frames_dir, output_mp4_path, fps=24, expected_frames=requested_frame_count,
         expected_resolution=(pil_img.width, pil_img.height)
     )
     print(f"[✓] MP4 video encoded & verified successfully: {video_meta['mp4_file']}")
+
+    # Update frame_count_validation block in metrics.json with actual rendered & encoded metadata
+    diag_metrics["frame_count_validation"] = {
+        "requested_frame_count": requested_frame_count,
+        "generated_frame_count": len(rendered_frames),
+        "encoded_frame_count": video_meta["frame_count"],
+        "fps": 24,
+        "expected_duration_seconds": float(requested_frame_count / 24.0),
+        "actual_duration_seconds": video_meta["duration_seconds"],
+        "frame_count_match": bool(requested_frame_count == len(rendered_frames)),
+        "encoding_frame_count_match": bool(requested_frame_count == video_meta["frame_count"])
+    }
+    with open(metrics_json_path, "w") as f:
+        json.dump(diag_metrics, f, indent=2)
 
     # Save Phase 1.7 Multi-Row Visual Validation Contact Sheet
     p17_contact_sheet = generate_phase_1_7_multi_row_contact_sheet(

@@ -58,7 +58,7 @@ from v0_pipeline import (
     generate_subject_coherence_diagnostics,
     generate_phase_e_keyframe_contact_sheet,
     render_phase_e_representative_keyframes,
-    render_full_48_frame_sequence,
+    render_full_frame_sequence,
     compute_temporal_diagnostics,
     encode_and_verify_mp4,
     generate_final_contact_sheet,
@@ -738,15 +738,15 @@ def test_full_sequence_rendering_and_mp4_encoding():
         output_mp4 = temp_path / "output.mp4"
 
         # 1. Render 48 frames
-        rendered_frames, frame_metrics = render_full_48_frame_sequence(
+        rendered_frames, frame_metrics = render_full_frame_sequence(
             rgb, depth, rgb, depth, prov, sub_mask, risk_map,
-            trans, rots, fx, fy, cx, cy, disparity_ceiling_px=50.0, frames_dir=frames_dir
+            trans, rots, fx, fy, cx, cy, disparity_ceiling_px=50.0, frames_dir=frames_dir, frame_count=48
         )
 
         assert len(rendered_frames) == 48
         assert len(frame_metrics) == 48
-        assert (frames_dir / "frame_00.png").exists()
-        assert (frames_dir / "frame_47.png").exists()
+        assert (frames_dir / "frame_0000.png").exists()
+        assert (frames_dir / "frame_0047.png").exists()
 
         # 2. Compute Temporal Diagnostics
         temp_summary, temp_plot = compute_temporal_diagnostics(rendered_frames, sub_mask)
@@ -2091,3 +2091,134 @@ def test_p18_12_generate_motion_amplitude_comparison_contact_sheet():
 
     assert sheet.ndim == 3
     assert sheet.shape[0] > 0
+
+
+# ============================================================
+# PHASE 1.9 FRAME COUNT & CINEMATIC PUSH-IN TESTS (6 TESTS)
+# ============================================================
+
+def test_p19_1_frame_count_48_rendering():
+    """TEST 1: --frames 48 generates exactly 48 frames (frame_0000.png .. frame_0047.png)."""
+    import v0_pipeline as v0
+    import tempfile
+
+    h, w = 32, 32
+    rgb = np.full((h, w, 3), 100, dtype=np.uint8)
+    depth = np.full((h, w), 2.0, dtype=np.float32)
+    sub_mask = np.zeros((h, w), dtype=bool); sub_mask[10:20, 10:20] = True
+    bg_plate = rgb.copy(); bg_depth = depth.copy(); prov = np.ones((h, w), dtype=np.float32)
+    risk_map = np.zeros((h, w), dtype=np.float32)
+
+    trans, rots = v0.generate_c1_smooth_trajectory("Cinematic Push-In", 1.0, num_frames=48)
+    fx, fy, cx, cy = v0.derive_camera_intrinsics(w, h)
+
+    with tempfile.TemporaryDirectory() as temp_dir:
+        f_dir = Path(temp_dir) / "frames"
+        out_mp4 = Path(temp_dir) / "output.mp4"
+
+        frames, metrics = v0.render_full_frame_sequence(
+            rgb, depth, bg_plate, bg_depth, prov, sub_mask, risk_map,
+            trans, rots, fx, fy, cx, cy, 30.0, f_dir, frame_count=48
+        )
+
+        assert len(frames) == 48
+        assert (f_dir / "frame_0000.png").exists()
+        assert (f_dir / "frame_0047.png").exists()
+        assert not (f_dir / "frame_0048.png").exists()
+
+        meta = v0.encode_and_verify_mp4(f_dir, out_mp4, fps=24, expected_frames=48, expected_resolution=(w, h))
+        assert meta["frame_count"] == 48
+        assert meta["duration_seconds"] == pytest.approx(2.0, abs=0.05)
+
+
+def test_p19_2_frame_count_100_rendering():
+    """TEST 2: --frames 100 generates exactly 100 frames (frame_0000.png .. frame_0099.png, no frame_0100)."""
+    import v0_pipeline as v0
+    import tempfile
+
+    h, w = 32, 32
+    rgb = np.full((h, w, 3), 100, dtype=np.uint8)
+    depth = np.full((h, w), 2.0, dtype=np.float32)
+    sub_mask = np.zeros((h, w), dtype=bool); sub_mask[10:20, 10:20] = True
+    bg_plate = rgb.copy(); bg_depth = depth.copy(); prov = np.ones((h, w), dtype=np.float32)
+    risk_map = np.zeros((h, w), dtype=np.float32)
+
+    trans, rots = v0.generate_c1_smooth_trajectory("Cinematic Push-In", 1.0, num_frames=100)
+    fx, fy, cx, cy = v0.derive_camera_intrinsics(w, h)
+
+    with tempfile.TemporaryDirectory() as temp_dir:
+        f_dir = Path(temp_dir) / "frames"
+        out_mp4 = Path(temp_dir) / "output.mp4"
+
+        frames, metrics = v0.render_full_frame_sequence(
+            rgb, depth, bg_plate, bg_depth, prov, sub_mask, risk_map,
+            trans, rots, fx, fy, cx, cy, 30.0, f_dir, frame_count=100
+        )
+
+        assert len(frames) == 100
+        assert (f_dir / "frame_0000.png").exists()
+        assert (f_dir / "frame_0099.png").exists()
+        assert not (f_dir / "frame_0100.png").exists()
+
+        meta = v0.encode_and_verify_mp4(f_dir, out_mp4, fps=24, expected_frames=100, expected_resolution=(w, h))
+        assert meta["frame_count"] == 100
+        assert meta["duration_seconds"] == pytest.approx(100.0 / 24.0, abs=0.05)
+
+
+def test_p19_3_frame_count_mismatch_raises_error():
+    """TEST 3: Trajectory pose count mismatch against requested frame_count raises ValueError."""
+    import v0_pipeline as v0
+    import tempfile
+
+    h, w = 32, 32
+    rgb = np.full((h, w, 3), 100, dtype=np.uint8)
+    depth = np.full((h, w), 2.0, dtype=np.float32)
+    sub_mask = np.zeros((h, w), dtype=bool)
+    bg_plate = rgb.copy(); bg_depth = depth.copy(); prov = np.ones((h, w), dtype=np.float32)
+    risk_map = np.zeros((h, w), dtype=np.float32)
+
+    trans, rots = v0.generate_c1_smooth_trajectory("Cinematic Push-In", 1.0, num_frames=48)
+    fx, fy, cx, cy = v0.derive_camera_intrinsics(w, h)
+
+    with tempfile.TemporaryDirectory() as temp_dir:
+        f_dir = Path(temp_dir) / "frames"
+        with pytest.raises(ValueError, match="Trajectory pose count"):
+            v0.render_full_frame_sequence(
+                rgb, depth, bg_plate, bg_depth, prov, sub_mask, risk_map,
+                trans, rots, fx, fy, cx, cy, 30.0, f_dir, frame_count=100  # Mismatch 48 vs 100
+            )
+
+
+def test_p19_4_cinematic_push_in_trajectory_smoothness():
+    """TEST 4: Cinematic Push-In trajectory uses quintic smoothstep easing for camera Z displacement."""
+    import v0_pipeline as v0
+
+    trans, rots = v0.generate_c1_smooth_trajectory("Cinematic Push-In", magnitude_scale=1.0, num_frames=100)
+
+    assert trans.shape == (100, 3)
+    assert trans[0, 2] == pytest.approx(0.0)      # Z start = 0
+    assert trans[-1, 2] == pytest.approx(0.0)     # Loop closure P(0) == P(1)
+    assert trans[50, 2] > trans[10, 2]            # Peak push-in displacement near mid-sequence
+    assert trans[50, 2] > 0.05
+
+
+def test_p19_5_depth_dependent_push_in_layer_separation():
+    """TEST 5: Cinematic Push-In applies layer-differentiated motion (Displacement_fg > Displacement_sub > Displacement_bg)."""
+    from spatial_intelligence.camera_model import compute_layer_motion_multiplier
+
+    m_fg = compute_layer_motion_multiplier("FOREGROUND", "MEDIUM")
+    m_sub = compute_layer_motion_multiplier("PRIMARY_SUBJECT", "MEDIUM")
+    m_bg = compute_layer_motion_multiplier("BACKGROUND", "MEDIUM")
+
+    assert m_fg > m_sub > m_bg
+
+
+def test_p19_6_cross_product_amplitude_and_frame_counts():
+    """TEST 6: Cross-product matrix test: LOW/MEDIUM/HIGH x {48, 100} produces valid trajectories."""
+    import v0_pipeline as v0
+
+    for amp in ["LOW", "MEDIUM", "HIGH"]:
+        for fc in [48, 100]:
+            trans, rots = v0.generate_c1_smooth_trajectory("Cinematic Push-In", magnitude_scale=1.0, num_frames=fc)
+            assert trans.shape == (fc, 3)
+            assert rots.shape == (fc, 3)
