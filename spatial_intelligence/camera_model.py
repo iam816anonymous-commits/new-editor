@@ -44,26 +44,50 @@ def compute_normalized_depth(
     return np.clip(z_gamma, 0.0, 1.0).astype(np.float32)
 
 
-def compute_layer_motion_multiplier(layer_role_str: str) -> float:
+def compute_layer_motion_multiplier(layer_role_str: str, motion_amplitude: str = "MEDIUM") -> float:
     """
-    Returns bounded nonlinear layer parallax motion multipliers for subtle cinematic 2.5D depth:
-    - BACKGROUND: 0.10x
-    - MIDGROUND: 0.30x
-    - PRIMARY_SUBJECT / PRIMARY_SUBJECT_PART: 0.55x
-    - FOREGROUND: 0.85x
-    - ANALYSIS_ONLY: 0.05x
+    Returns bounded nonlinear layer parallax motion multipliers for subtle cinematic 2.5D depth.
+
+    Presets:
+    LOW (Baseline):
+      BACKGROUND: 0.10x, MIDGROUND: 0.30x, PRIMARY_SUBJECT: 0.55x, FOREGROUND: 0.85x
+    MEDIUM (Production Default - ~1.5x to 2.5x stronger motion):
+      BACKGROUND: 0.20x, MIDGROUND: 0.70x, PRIMARY_SUBJECT: 1.35x, FOREGROUND: 2.10x
+    HIGH (Stress Test - ~2.0x to 3.5x stronger motion):
+      BACKGROUND: 0.35x, MIDGROUND: 1.10x, PRIMARY_SUBJECT: 1.80x, FOREGROUND: 2.85x
     """
     role_upper = layer_role_str.upper()
-    if role_upper == "BACKGROUND":
-        return 0.10
-    elif role_upper == "MIDGROUND":
-        return 0.30
-    elif role_upper in ["PRIMARY_SUBJECT", "PRIMARY_SUBJECT_PART"]:
-        return 0.55
-    elif role_upper == "FOREGROUND":
-        return 0.85
-    else:
-        return 0.05
+    amp_upper = motion_amplitude.upper()
+
+    if amp_upper == "LOW":
+        multipliers = {
+            "BACKGROUND": 0.10,
+            "MIDGROUND": 0.30,
+            "PRIMARY_SUBJECT": 0.55,
+            "PRIMARY_SUBJECT_PART": 0.55,
+            "FOREGROUND": 0.85,
+            "ANALYSIS_ONLY": 0.05
+        }
+    elif amp_upper == "HIGH":
+        multipliers = {
+            "BACKGROUND": 0.35,
+            "MIDGROUND": 1.10,
+            "PRIMARY_SUBJECT": 1.80,
+            "PRIMARY_SUBJECT_PART": 1.80,
+            "FOREGROUND": 2.85,
+            "ANALYSIS_ONLY": 0.10
+        }
+    else:  # MEDIUM default
+        multipliers = {
+            "BACKGROUND": 0.20,
+            "MIDGROUND": 0.70,
+            "PRIMARY_SUBJECT": 1.35,
+            "PRIMARY_SUBJECT_PART": 1.35,
+            "FOREGROUND": 2.10,
+            "ANALYSIS_ONLY": 0.08
+        }
+
+    return multipliers.get(role_upper, 0.20)
 
 
 def compute_layer_disparity(

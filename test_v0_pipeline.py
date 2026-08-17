@@ -2026,3 +2026,68 @@ def test_p18_8_cache_directory_setup():
         c_dir = v0.setup_cache_directory(Path(temp_dir), "a81c93d4")
         assert c_dir.exists()
         assert c_dir.name == "a81c93d4"
+
+
+# ============================================================
+# MOTION AMPLITUDE & SAFETY ENVELOPE TESTS (4 TESTS)
+# ============================================================
+
+def test_p18_9_motion_amplitude_presets():
+    """TEST 9: compute_layer_motion_multiplier returns proper motion scaling across LOW, MEDIUM, HIGH presets."""
+    from spatial_intelligence.camera_model import compute_layer_motion_multiplier
+
+    mult_low = compute_layer_motion_multiplier("PRIMARY_SUBJECT", "LOW")
+    mult_med = compute_layer_motion_multiplier("PRIMARY_SUBJECT", "MEDIUM")
+    mult_high = compute_layer_motion_multiplier("PRIMARY_SUBJECT", "HIGH")
+
+    assert mult_low < mult_med < mult_high
+    assert mult_med == 1.35
+    assert mult_high == 1.80
+
+
+def test_p18_10_layer_motion_ordering():
+    """TEST 10: Layer motion ordering guarantees Displacement_fg > Displacement_sub > Displacement_mg > Displacement_bg."""
+    from spatial_intelligence.camera_model import compute_layer_motion_multiplier
+
+    m_fg = compute_layer_motion_multiplier("FOREGROUND", "MEDIUM")
+    m_sub = compute_layer_motion_multiplier("PRIMARY_SUBJECT", "MEDIUM")
+    m_mg = compute_layer_motion_multiplier("MIDGROUND", "MEDIUM")
+    m_bg = compute_layer_motion_multiplier("BACKGROUND", "MEDIUM")
+
+    assert m_fg > m_sub > m_mg > m_bg
+
+
+def test_p18_11_construct_layer_motion_map():
+    """TEST 11: construct_layer_motion_map creates 2D map with preset layer multipliers."""
+    import v0_pipeline as v0
+    h, w = 32, 32
+    sub_mask = np.zeros((h, w), dtype=bool); sub_mask[10:20, 10:20] = True
+
+    m_map_med = v0.construct_layer_motion_map((h, w), sub_mask, spatial_diagnostics=None, motion_amplitude="MEDIUM")
+    m_map_high = v0.construct_layer_motion_map((h, w), sub_mask, spatial_diagnostics=None, motion_amplitude="HIGH")
+
+    assert m_map_med[15, 15] == 1.35
+    assert m_map_high[15, 15] == 1.80
+    assert m_map_med[0, 0] == 0.20
+
+
+def test_p18_12_generate_motion_amplitude_comparison_contact_sheet():
+    """TEST 12: generate_motion_amplitude_comparison_contact_sheet generates 3-row comparison sheet."""
+    import v0_pipeline as v0
+    h, w = 32, 32
+    rgb = np.full((h, w, 3), 100, dtype=np.uint8)
+    depth = np.full((h, w), 2.0, dtype=np.float32)
+    sub_mask = np.zeros((h, w), dtype=bool); sub_mask[10:20, 10:20] = True
+    bg_plate = rgb.copy()
+    bg_depth = depth.copy()
+    prov = np.ones((h, w), dtype=np.float32)
+
+    trans, rots = v0.generate_c1_smooth_trajectory("Orbit", 1.0, num_frames=48)
+    fx, fy, cx, cy = v0.derive_camera_intrinsics(w, h)
+
+    sheet = v0.generate_motion_amplitude_comparison_contact_sheet(
+        rgb, depth, sub_mask, bg_plate, bg_depth, prov, trans, rots, fx, fy, cx, cy, target_w=100
+    )
+
+    assert sheet.ndim == 3
+    assert sheet.shape[0] > 0

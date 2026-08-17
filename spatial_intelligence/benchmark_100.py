@@ -117,15 +117,27 @@ def execute_100_render_benchmark(
     evaluations = []
     thumbnails = []
 
-    for idx, cfg in enumerate(configs, start=1):
-        # Render fast 2-frame keyframe sequence for evaluation
-        f0 = rgb_array.copy()
-        # Simulated/synthetic rendered frame displacement for configuration sweep
-        dx = int(cfg.camera_motion_x * 50.0 * cfg.parallax_strength)
-        dy = int(cfg.camera_motion_y * 50.0 * cfg.parallax_strength)
+    h, w, _ = rgb_array.shape
+    fx, fy, cx, cy = float(max(w, h)), float(max(w, h)), w / 2.0, h / 2.0
+    R_identity = np.eye(3, dtype=np.float64)
+    bg_plate = rgb_array.copy()
+    bg_depth = depth_map.copy()
+    provenance_map = np.ones((h, w), dtype=np.float32)
 
-        f_mid = np.roll(rgb_array, (dy, dx), axis=(0, 1))
-        f_mid[~subject_mask] = rgb_array[~subject_mask]  # Keep background steady
+    for idx, cfg in enumerate(configs, start=1):
+        f0 = rgb_array.copy()
+        t_vec = np.array([cfg.camera_motion_x * cfg.parallax_strength, cfg.camera_motion_y * cfg.parallax_strength, 0.0], dtype=np.float64)
+
+        if render_func is not None:
+            try:
+                f_mid, _, _ = render_func(
+                    rgb_array, depth_map, bg_plate, bg_depth, provenance_map,
+                    R_identity, t_vec, fx, fy, cx, cy
+                )
+            except Exception:
+                f_mid = f0.copy()
+        else:
+            f_mid = f0.copy()
 
         seq = [f0, f_mid, f0]
         p_score, metrics = compute_parallax_quality_score(seq, rgb_array, subject_mask, depth_map)

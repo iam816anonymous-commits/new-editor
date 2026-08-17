@@ -302,6 +302,7 @@ class RenderingConfig:
     fps: int = 24
     frame_count: int = 48
     parallax_strength: float = 1.0
+    motion_amplitude: str = "MEDIUM"  # "LOW", "MEDIUM", "HIGH"
     depth_gamma: float = 1.2
     foreground_boost: float = 1.5
     background_stability: float = 0.10
