@@ -46,48 +46,49 @@ def compute_normalized_depth(
 
 def compute_layer_motion_multiplier(layer_role_str: str, motion_amplitude: str = "MEDIUM") -> float:
     """
-    Returns bounded nonlinear layer parallax motion multipliers for subtle cinematic 2.5D depth.
+    Returns layer parallax motion multipliers for depth-aware 2.5D perspective projection.
+    Strictly enforces layer parallax motion ordering: FOREGROUND > PRIMARY_SUBJECT > MIDGROUND > BACKGROUND.
 
     Presets:
-    LOW (Baseline):
-      BACKGROUND: 0.10x, MIDGROUND: 0.30x, PRIMARY_SUBJECT: 0.55x, FOREGROUND: 0.85x
-    MEDIUM (Production Default - ~1.5x to 2.5x stronger motion):
-      BACKGROUND: 0.20x, MIDGROUND: 0.70x, PRIMARY_SUBJECT: 1.35x, FOREGROUND: 2.10x
-    HIGH (Stress Test - ~2.0x to 3.5x stronger motion):
-      BACKGROUND: 0.35x, MIDGROUND: 1.10x, PRIMARY_SUBJECT: 1.80x, FOREGROUND: 2.85x
+    LOW:
+      BACKGROUND: 0.25x, MIDGROUND: 0.50x, PRIMARY_SUBJECT: 0.85x, FOREGROUND: 1.25x
+    MEDIUM:
+      BACKGROUND: 0.45x, MIDGROUND: 0.90x, PRIMARY_SUBJECT: 1.60x, FOREGROUND: 2.50x
+    HIGH:
+      BACKGROUND: 0.75x, MIDGROUND: 1.50x, PRIMARY_SUBJECT: 2.60x, FOREGROUND: 4.20x
     """
     role_upper = layer_role_str.upper()
     amp_upper = motion_amplitude.upper()
 
     if amp_upper == "LOW":
         multipliers = {
-            "BACKGROUND": 0.10,
-            "MIDGROUND": 0.30,
-            "PRIMARY_SUBJECT": 0.55,
-            "PRIMARY_SUBJECT_PART": 0.55,
-            "FOREGROUND": 0.85,
-            "ANALYSIS_ONLY": 0.05
+            "BACKGROUND": 0.25,
+            "MIDGROUND": 0.50,
+            "PRIMARY_SUBJECT": 0.85,
+            "PRIMARY_SUBJECT_PART": 0.85,
+            "FOREGROUND": 1.25,
+            "ANALYSIS_ONLY": 0.10
         }
     elif amp_upper == "HIGH":
         multipliers = {
-            "BACKGROUND": 0.35,
-            "MIDGROUND": 1.10,
-            "PRIMARY_SUBJECT": 1.80,
-            "PRIMARY_SUBJECT_PART": 1.80,
-            "FOREGROUND": 2.85,
-            "ANALYSIS_ONLY": 0.10
+            "BACKGROUND": 0.75,
+            "MIDGROUND": 1.50,
+            "PRIMARY_SUBJECT": 2.60,
+            "PRIMARY_SUBJECT_PART": 2.60,
+            "FOREGROUND": 4.20,
+            "ANALYSIS_ONLY": 0.20
         }
     else:  # MEDIUM default
         multipliers = {
-            "BACKGROUND": 0.20,
-            "MIDGROUND": 0.70,
-            "PRIMARY_SUBJECT": 1.35,
-            "PRIMARY_SUBJECT_PART": 1.35,
-            "FOREGROUND": 2.10,
-            "ANALYSIS_ONLY": 0.08
+            "BACKGROUND": 0.45,
+            "MIDGROUND": 0.90,
+            "PRIMARY_SUBJECT": 1.60,
+            "PRIMARY_SUBJECT_PART": 1.60,
+            "FOREGROUND": 2.50,
+            "ANALYSIS_ONLY": 0.15
         }
 
-    return multipliers.get(role_upper, 0.20)
+    return multipliers.get(role_upper, 0.45)
 
 
 def compute_layer_disparity(

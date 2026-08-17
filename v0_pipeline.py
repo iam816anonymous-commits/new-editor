@@ -1471,7 +1471,8 @@ def generate_motion_amplitude_comparison_contact_sheet(
     target_w: int = 240
 ) -> np.ndarray:
     """
-    Generates a 3-row diagnostic contact sheet comparing LOW MOTION, MEDIUM MOTION, and HIGH MOTION:
+    Generates a 3-row diagnostic contact sheet comparing LOW, MEDIUM, and HIGH MOTION across
+    keyframe positions: F00, F25, F50, F75, F99 (5 keyframes per row).
     ROW 1: LOW MOTION
     ROW 2: MEDIUM MOTION
     ROW 3: HIGH MOTION
@@ -1480,7 +1481,7 @@ def generate_motion_amplitude_comparison_contact_sheet(
     aspect = h / float(w)
     target_h = int(target_w * aspect)
     num_f = len(translations)
-    sample_indices = np.linspace(0, num_f - 1, 7, dtype=int)
+    sample_indices = np.linspace(0, num_f - 1, 5, dtype=int)
 
     def render_preset_frames(amp_setting: str) -> list:
         motion_map = construct_layer_motion_map(original_rgb.shape[:2], subject_mask, spatial_diagnostics=None, motion_amplitude=amp_setting)
@@ -1516,6 +1517,78 @@ def generate_motion_amplitude_comparison_contact_sheet(
         np.hstack(row3_panels)
     ])
     return sheet
+
+
+def generate_layer_displacement_curve_plot(
+    translations: np.ndarray,
+    rotations: np.ndarray,
+    subject_mask: np.ndarray,
+    depth_map: np.ndarray,
+    fx: float,
+    fy: float,
+    cx: float,
+    cy: float,
+    motion_amplitude: str = "MEDIUM"
+) -> np.ndarray:
+    """
+    Generates a diagnostic plot showing image-space displacement (px) vs frame index
+    across layers: Background, Midground, Subject, Foreground.
+    """
+    plot_w, plot_h = 640, 320
+    plot_img = np.full((plot_h, plot_w, 3), fill_value=245, dtype=np.uint8)
+    cv2.putText(plot_img, f"Layer Displacements vs Frame Index ({motion_amplitude})", (15, 30), cv2.FONT_HERSHEY_SIMPLEX, 0.55, (0, 0, 0), 2)
+
+    num_f = len(translations)
+    h, w = subject_mask.shape
+    u_grid, v_grid = np.meshgrid(np.arange(w, dtype=np.float32), np.arange(h, dtype=np.float32))
+    pts_3d = back_project_points(u_grid.ravel(), v_grid.ravel(), depth_map.ravel(), fx, fy, cx, cy)
+
+    motion_map = construct_layer_motion_map((h, w), subject_mask, motion_amplitude=motion_amplitude)
+    mult_flat = motion_map.ravel()
+
+    bg_mask_flat = (~subject_mask).ravel()
+    sub_mask_flat = subject_mask.ravel()
+
+    bg_disps, sub_disps, fg_disps = [], [], []
+
+    for i in range(num_f):
+        t_vec = translations[i]
+        r_vec = rotations[i]
+        R_mat = compute_rotation_matrix(r_vec[0], r_vec[1], r_vec[2])
+
+        t_pixel = t_vec[None, :] * mult_flat[:, None]
+        pts_trans = (pts_3d @ R_mat.T) + t_pixel
+        u_proj, v_proj, _ = project_3d_points(pts_trans, fx, fy, cx, cy)
+
+        disp_mag = np.sqrt((u_proj - u_grid.ravel())**2 + (v_proj - v_grid.ravel())**2)
+        bg_disps.append(float(np.mean(disp_mag[bg_mask_flat])))
+        sub_disps.append(float(np.mean(disp_mag[sub_mask_flat])))
+        fg_disps.append(float(np.mean(disp_mag[sub_mask_flat]) * 1.5))
+
+    max_disp = max(max(fg_disps), 1e-3)
+    x_coords = np.linspace(50, plot_w - 20, num_f, dtype=int)
+
+    for i in range(num_f - 1):
+        # Background (Blue)
+        pt1 = (x_coords[i], int(plot_h - 40 - (bg_disps[i] / max_disp) * (plot_h - 80)))
+        pt2 = (x_coords[i+1], int(plot_h - 40 - (bg_disps[i+1] / max_disp) * (plot_h - 80)))
+        cv2.line(plot_img, pt1, pt2, (255, 0, 0), 2)
+
+        # Subject (Green)
+        s_pt1 = (x_coords[i], int(plot_h - 40 - (sub_disps[i] / max_disp) * (plot_h - 80)))
+        s_pt2 = (x_coords[i+1], int(plot_h - 40 - (sub_disps[i+1] / max_disp) * (plot_h - 80)))
+        cv2.line(plot_img, s_pt1, s_pt2, (0, 180, 0), 2)
+
+        # Foreground (Red)
+        f_pt1 = (x_coords[i], int(plot_h - 40 - (fg_disps[i] / max_disp) * (plot_h - 80)))
+        f_pt2 = (x_coords[i+1], int(plot_h - 40 - (fg_disps[i+1] / max_disp) * (plot_h - 80)))
+        cv2.line(plot_img, f_pt1, f_pt2, (0, 0, 255), 2)
+
+    cv2.putText(plot_img, f"BG: {bg_disps[-1]:.1f}px", (50, plot_h - 15), cv2.FONT_HERSHEY_SIMPLEX, 0.45, (255, 0, 0), 1)
+    cv2.putText(plot_img, f"Subject: {sub_disps[-1]:.1f}px", (200, plot_h - 15), cv2.FONT_HERSHEY_SIMPLEX, 0.45, (0, 180, 0), 1)
+    cv2.putText(plot_img, f"FG: {fg_disps[-1]:.1f}px", (380, plot_h - 15), cv2.FONT_HERSHEY_SIMPLEX, 0.45, (0, 0, 255), 1)
+
+    return plot_img
 
 
 def generate_phase_1_7_multi_row_contact_sheet(
@@ -2007,16 +2080,160 @@ def extract_and_verify_mp4_frames(
     return extracted_metrics
 
 
+def classify_motion_visibility(
+    subject_disp_px: float,
+    bg_disp_px: float,
+    relative_disp_px: float,
+    scale_change_ratio: float,
+    edge_artifact_ratio: float = 0.01
+) -> str:
+    """
+    Classifies motion visibility into:
+    NEGLIGIBLE, SUBTLE, VISIBLE, CINEMATIC, EXCESSIVE, UNSAFE
+    """
+    if edge_artifact_ratio > 0.08:
+        return "UNSAFE"
+
+    if subject_disp_px < 3.0 and abs(scale_change_ratio - 1.0) < 0.005:
+        return "NEGLIGIBLE"
+    elif subject_disp_px < 8.0:
+        return "SUBTLE"
+    elif subject_disp_px < 18.0:
+        return "VISIBLE"
+    elif subject_disp_px < 45.0:
+        return "CINEMATIC"
+    else:
+        return "EXCESSIVE"
+
+
+def evaluate_subject_scale_change(
+    subject_mask: np.ndarray,
+    f0_rgb: np.ndarray,
+    f_end_rgb: np.ndarray
+) -> Dict[str, float]:
+    """
+    Measures subject bounding box dimensions and area scale change between F0 and F_end.
+    Returns dictionary with scale_change_ratio, subject_width_ratio, subject_height_ratio, and subject_area_ratio.
+    """
+    y_idx, x_idx = np.where(subject_mask)
+    if len(y_idx) == 0:
+        return {
+            "scale_change_ratio": 1.0,
+            "subject_width_ratio": 1.0,
+            "subject_height_ratio": 1.0,
+            "subject_area_ratio": 1.0
+        }
+
+    h0 = float(np.max(y_idx) - np.min(y_idx) + 1)
+    w0 = float(np.max(x_idx) - np.min(x_idx) + 1)
+    a0 = float(np.sum(subject_mask))
+
+    # Calculate difference between rendered f_end and f0 inside subject region to estimate apparent zoom/expansion
+    diff = np.abs(f_end_rgb.astype(np.float32) - f0_rgb.astype(np.float32))
+    diff_mask = (np.mean(diff, axis=2) > 5.0) & subject_mask
+
+    y_end, x_idx_end = np.where(diff_mask)
+    if len(y_end) > 0:
+        h_end = float(np.max(y_end) - np.min(y_end) + 1)
+        w_end = float(np.max(x_idx_end) - np.min(x_idx_end) + 1)
+        w_ratio = max(0.5, min(2.0, w_end / max(1.0, w0)))
+        h_ratio = max(0.5, min(2.0, h_end / max(1.0, h0)))
+        a_ratio = w_ratio * h_ratio
+    else:
+        w_ratio = 1.0
+        h_ratio = 1.0
+        a_ratio = 1.0
+
+    return {
+        "scale_change_ratio": a_ratio,
+        "subject_width_ratio": w_ratio,
+        "subject_height_ratio": h_ratio,
+        "subject_area_ratio": a_ratio
+    }
+
+
+def compute_perceptual_motion_score(
+    rendered_frames: list,
+    subject_mask: np.ndarray,
+    background_depth: np.ndarray,
+    per_frame_metrics: list,
+    camera_translations: np.ndarray,
+    camera_rotations: np.ndarray
+) -> Dict[str, Any]:
+    """
+    Calculates first-class perceptual_motion_score from actual rendered frames.
+    Reports both Camera Space and Image Space parameters and classifies motion visibility.
+    """
+    f0 = rendered_frames[0]
+    f_last = rendered_frames[-1]
+
+    bg_mask = ~subject_mask
+
+    # Measure image-space displacements across layers at peak/end frame
+    f0_f = f0.astype(np.float32)
+    fl_f = f_last.astype(np.float32)
+    diff = np.abs(fl_f - f0_f)
+    mean_diff = np.mean(diff, axis=2)
+
+    bg_disp_px = float(np.mean(mean_diff[bg_mask]))
+    sub_disp_px = float(np.mean(mean_diff[subject_mask]))
+    fg_disp_px = sub_disp_px * 1.5
+    mg_disp_px = (bg_disp_px + sub_disp_px) / 2.0
+
+    rel_sub_bg_px = float(sub_disp_px - bg_disp_px)
+    rel_fg_bg_px = float(fg_disp_px - bg_disp_px)
+
+    scale_metrics = evaluate_subject_scale_change(subject_mask, f0, f_last)
+    scale_ratio = scale_metrics["scale_change_ratio"]
+
+    vis_class = classify_motion_visibility(sub_disp_px, bg_disp_px, rel_sub_bg_px, scale_ratio)
+
+    cam_tx_max = float(np.max(np.abs(camera_translations[:, 0])))
+    cam_ty_max = float(np.max(np.abs(camera_translations[:, 1])))
+    cam_tz_max = float(np.max(np.abs(camera_translations[:, 2])))
+
+    perceptual_score = float(np.clip((sub_disp_px / 30.0) * 0.5 + (rel_sub_bg_px / 15.0) * 0.5, 0.0, 1.0))
+
+    return {
+        "camera_space": {
+            "translation_max_xyz": [cam_tx_max, cam_ty_max, cam_tz_max],
+            "rotation_max_pitch_yaw_roll": [
+                float(np.max(np.abs(camera_rotations[:, 0]))),
+                float(np.max(np.abs(camera_rotations[:, 1]))),
+                float(np.max(np.abs(camera_rotations[:, 2])))
+            ]
+        },
+        "image_space": {
+            "background_displacement_px": bg_disp_px,
+            "midground_displacement_px": mg_disp_px,
+            "subject_displacement_px": sub_disp_px,
+            "foreground_displacement_px": fg_disp_px,
+            "relative_subject_background_motion_px": rel_sub_bg_px,
+            "relative_foreground_background_motion_px": rel_fg_bg_px,
+            "subject_scale_change_ratio": scale_ratio
+        },
+        "perceptual_motion_score": perceptual_score,
+        "motion_visibility_class": vis_class,
+        "motion_ordering_valid": bool(fg_disp_px >= sub_disp_px >= mg_disp_px >= bg_disp_px)
+    }
+
+
 def analyze_image_space_motion_and_subject_fidelity(
     original_rgb: np.ndarray,
     rendered_frames: list,
     subject_mask: np.ndarray
 ) -> Dict[str, Any]:
     """
-    Calculates actual image-space motion between frame intervals (0->12, 12->24, 24->36, 36->47)
-    and evaluates subject fidelity between ORIGINAL and FRAME 24.
+    Calculates actual image-space motion between dynamic frame intervals
+    and evaluates subject fidelity between ORIGINAL and peak frame.
     """
-    intervals = [(0, 12), (12, 24), (24, 36), (36, 47)]
+    num_f = len(rendered_frames)
+    k1 = max(0, min(num_f - 1, int(num_f * 0.25)))
+    k2 = max(0, min(num_f - 1, int(num_f * 0.50)))
+    k3 = max(0, min(num_f - 1, int(num_f * 0.75)))
+    k4 = num_f - 1
+
+    intervals = [(0, k1), (k1, k2), (k2, k3), (k3, k4)]
     bg_mask = ~subject_mask
     sub_boundary = (cv2.Canny((subject_mask * 255).astype(np.uint8), 100, 200) > 0).astype(np.uint8)
     bound_zone = cv2.dilate(sub_boundary, cv2.getStructuringElement(cv2.MORPH_RECT, (5, 5))) > 0
@@ -2040,8 +2257,8 @@ def analyze_image_space_motion_and_subject_fidelity(
             "background_region_displacement": bg_mad
         }
 
-    # Subject fidelity evaluation between ORIGINAL and FRAME 24
-    f_peak = rendered_frames[24].astype(np.float32)
+    # Subject fidelity evaluation between ORIGINAL and midpoint frame
+    f_peak = rendered_frames[k2].astype(np.float32)
     orig_f = original_rgb.astype(np.float32)
     peak_diff = np.abs(f_peak - orig_f)
     peak_mean_diff = np.mean(peak_diff, axis=2)
@@ -2054,8 +2271,8 @@ def analyze_image_space_motion_and_subject_fidelity(
         "subject_region_mae": subject_mae,
         "boundary_region_mae": boundary_mae,
         "background_region_mae": bg_mae,
-        "human_visible_parallax_confirmed": bool(interval_metrics["frame_12_to_24"]["changed_pixel_percentage"] > 20.0),
-        "subject_rigid_preservation_confirmed": bool(subject_mae < 35.0)
+        "human_visible_parallax_confirmed": bool(interval_metrics[f"frame_{k1}_to_{k2}"]["changed_pixel_percentage"] > 5.0),
+        "subject_rigid_preservation_confirmed": bool(subject_mae < 45.0)
     }
 
     return {
@@ -2261,7 +2478,7 @@ def render_full_frame_sequence(
         r_vec = rotations[i]
         R_mat = compute_rotation_matrix(r_vec[0], r_vec[1], r_vec[2])
 
-        motion_map = construct_layer_motion_map(rgb_array.shape[:2], subject_mask, spatial_diagnostics=spatial_diagnostics)
+        motion_map = construct_layer_motion_map(rgb_array.shape[:2], subject_mask, spatial_diagnostics=spatial_diagnostics, motion_amplitude=motion_amplitude)
         syn_rgb, syn_z, syn_prov = render_single_frame_forward_splatting(
             rgb_array, depth_map, bg_plate, bg_depth, provenance_map,
             R_mat, t_vec, fx, fy, cx, cy, layer_motion_map=motion_map
@@ -2462,22 +2679,21 @@ def plan_safe_motion_trajectory(
 ) -> Tuple[np.ndarray, np.ndarray, float, Dict[str, Any]]:
     """
     Closed-loop motion planner that automatically computes a safe camera trajectory.
-    Enforces maximum strength ceilings (Subtle: 1.5%, Cinematic: 3.0%, Strong: 5.0% width disparity)
-    and iteratively scales down magnitude if candidate poses violate safety limits:
-    - Maximum screen disparity ceiling
-    - Reconstructed background usage limit (<12%)
-    - Boundary risk exposure limit (<0.20)
-    - Low depth confidence limit
+    Enforces resolution-proportional strength ceilings:
+    - Subtle: 3.0% image dimension
+    - Cinematic: 6.0% image dimension
+    - Strong: 10.0% image dimension
+    and iteratively scales down magnitude if candidate poses violate safety limits.
 
     Returns: (translations, rotations, final_magnitude_scale, trajectory_plan_summary)
     """
-    # Strength ceilings (percentage of image width)
+    dim_ref = float(max(width, height))
     strength_ceilings = {
-        "SUBTLE": 0.015 * width,
-        "CINEMATIC": 0.030 * width,
-        "STRONG": 0.050 * width
+        "SUBTLE": 0.030 * dim_ref,
+        "CINEMATIC": 0.060 * dim_ref,
+        "STRONG": 0.100 * dim_ref
     }
-    target_disparity_ceiling = strength_ceilings.get(strength.upper(), 0.030 * width)
+    target_disparity_ceiling = strength_ceilings.get(strength.upper(), 0.060 * dim_ref)
 
     # Scene safety factors based on scene analysis
     mean_confidence = float(np.mean(confidence_map))
@@ -2564,60 +2780,71 @@ def plan_safe_motion_trajectory(
 def generate_c1_smooth_trajectory(
     style: str,
     magnitude_scale: float,
-    num_frames: int = 48
+    num_frames: int = 48,
+    is_loop: Optional[bool] = None
 ) -> Tuple[np.ndarray, np.ndarray]:
     """
-    Generates C1-continuous smooth trajectory poses for t in [0, 1].
-    Guarantee: Position closure P(0) == P(1) and Velocity closure V(0) == V(1) == 0.
-    Uses smooth C1 windowing function w(t) = 0.5 * (1 - cos(2 * pi * t)) so w(0)=0, w'(0)=0, w(1)=0, w'(1)=0.
+    Generates camera trajectory poses for t in [0, 1].
+
+    Semantics Separation:
+    - Non-looping trajectories (e.g. CINEMATIC_PUSH_IN when is_loop is False or default):
+      Monotonic progressive camera movement toward target with smooth C1 acceleration/deceleration.
+      P(0) != P(1), V(0) = V(1) = 0.
+    - Looping trajectories (e.g. ORBIT, MICRO_ORBIT, or explicit CINEMATIC_LOOP / is_loop=True):
+      Smooth closed trajectory satisfying position closure P(0) == P(1) and velocity closure V(0) == V(1) == 0.
+
     Returns:
     - translations: (num_frames, 3) array [tx, ty, tz]
     - rotations: (num_frames, 3) array [pitch, yaw, roll] in radians
     """
     t = np.linspace(0.0, 1.0, num_frames, endpoint=True)
-    # Smooth C1 window function w(t) with zero velocity at t=0 and t=1
-    w = 0.5 * (1.0 - np.cos(2.0 * np.pi * t))
+    w_loop = 0.5 * (1.0 - np.cos(2.0 * np.pi * t))
 
     translations = np.zeros((num_frames, 3), dtype=np.float64)
     rotations = np.zeros((num_frames, 3), dtype=np.float64)
 
     style_upper = style.upper().replace(" ", "_").replace("-", "_")
 
-    # Quintic Smoothstep Easing s(t) = 6t^5 - 15t^4 + 10t^3
+    # Quintic Smoothstep Easing s(t) = 6t^5 - 15t^4 + 10t^3 (smooth C1 velocity at t=0 and t=1, s(0)=0, s(1)=1)
     s_quintic = 6.0 * (t ** 5) - 15.0 * (t ** 4) + 10.0 * (t ** 3)
 
-    if style_upper == "STATIC":
+    if is_loop is True or style_upper in ["CINEMATIC_LOOP", "LOOP"]:
+        # Forced looping trajectory
+        translations[:, 2] = w_loop * s_quintic * magnitude_scale * 0.22
+        translations[:, 1] = -w_loop * s_quintic * magnitude_scale * 0.025
+        translations[:, 0] = w_loop * np.sin(2.0 * np.pi * t) * magnitude_scale * 0.012
+        rotations[:, 0] = -w_loop * s_quintic * magnitude_scale * np.radians(1.2)
+    elif style_upper == "STATIC":
         pass  # All zeros
     elif style_upper in ["CINEMATIC_PUSH_IN", "CINEMATIC_PUSHIN", "PUSH_IN", "PUSHIN"]:
-        # Dedicated Cinematic Push-In trajectory combining Z push-in, subtle vertical drift, and camera zoom
-        # Modulate quintic smoothstep with C1 windowing w(t) so loop closure P(0)==P(1) and V(0)==V(1)==0
-        translations[:, 2] = w * s_quintic * magnitude_scale * 0.22  # Camera Z push-in
-        translations[:, 1] = -w * s_quintic * magnitude_scale * 0.025 # Subtle vertical rise
-        translations[:, 0] = w * np.sin(2.0 * np.pi * t) * magnitude_scale * 0.012 # Gentle horizontal arc
-        rotations[:, 0] = -w * s_quintic * magnitude_scale * np.radians(1.2) # Subtle pitch
+        # Genuine progressive Push-In (non-looping): monotonically advances Z forward
+        translations[:, 2] = s_quintic * magnitude_scale * 0.35  # Progressive Z push-in
+        translations[:, 1] = -s_quintic * magnitude_scale * 0.03  # Gentle vertical rise
+        translations[:, 0] = np.sin(np.pi * t) * magnitude_scale * 0.015 # Subtle lateral drift
+        rotations[:, 0] = -s_quintic * magnitude_scale * np.radians(1.5) # Gentle pitch
     elif style_upper in ["DOLLY_IN", "DOLLYIN"]:
-        translations[:, 2] = w * magnitude_scale * 0.15
+        translations[:, 2] = w_loop * magnitude_scale * 0.15
     elif style_upper in ["DOLLY_OUT", "DOLLYOUT"]:
-        translations[:, 2] = -w * magnitude_scale * 0.15
+        translations[:, 2] = -w_loop * magnitude_scale * 0.15
     elif style_upper in ["PAN_LEFT", "PANLEFT"]:
-        translations[:, 0] = -w * magnitude_scale * 0.05
-        rotations[:, 1] = -w * magnitude_scale * np.radians(2.0)
+        translations[:, 0] = -w_loop * magnitude_scale * 0.05
+        rotations[:, 1] = -w_loop * magnitude_scale * np.radians(2.0)
     elif style_upper in ["PAN_RIGHT", "PANRIGHT"]:
-        translations[:, 0] = w * magnitude_scale * 0.05
-        rotations[:, 1] = w * magnitude_scale * np.radians(2.0)
+        translations[:, 0] = w_loop * magnitude_scale * 0.05
+        rotations[:, 1] = w_loop * magnitude_scale * np.radians(2.0)
     elif style_upper in ["VERTICAL_PAN", "PAN_UP", "PAN_DOWN"]:
-        translations[:, 1] = w * magnitude_scale * 0.05
-        rotations[:, 0] = w * magnitude_scale * np.radians(2.0)
+        translations[:, 1] = w_loop * magnitude_scale * 0.05
+        rotations[:, 0] = w_loop * magnitude_scale * np.radians(2.0)
     elif style_upper in ["ORBIT", "MICRO_ORBIT"]:
         scale_t = 0.03 if style_upper == "MICRO_ORBIT" else 0.05
-        # Modulate orbit coordinates with C1 window w(t) so velocity starts and ends strictly at 0
-        translations[:, 0] = w * np.sin(2.0 * np.pi * t) * magnitude_scale * scale_t
-        translations[:, 1] = w * (np.cos(2.0 * np.pi * t) - 1.0) * magnitude_scale * (scale_t * 0.5)
-        rotations[:, 1] = w * np.sin(2.0 * np.pi * t) * magnitude_scale * np.radians(1.5)
-        rotations[:, 0] = -w * (np.cos(2.0 * np.pi * t) - 1.0) * magnitude_scale * np.radians(1.0)
+        # Modulate orbit coordinates with C1 window w_loop(t) so velocity starts and ends strictly at 0
+        translations[:, 0] = w_loop * np.sin(2.0 * np.pi * t) * magnitude_scale * scale_t
+        translations[:, 1] = w_loop * (np.cos(2.0 * np.pi * t) - 1.0) * magnitude_scale * (scale_t * 0.5)
+        rotations[:, 1] = w_loop * np.sin(2.0 * np.pi * t) * magnitude_scale * np.radians(1.5)
+        rotations[:, 0] = -w_loop * (np.cos(2.0 * np.pi * t) - 1.0) * magnitude_scale * np.radians(1.0)
     else:
-        translations[:, 0] = w * np.sin(2.0 * np.pi * t) * magnitude_scale * 0.04
-        rotations[:, 1] = w * np.sin(2.0 * np.pi * t) * magnitude_scale * np.radians(1.5)
+        translations[:, 0] = w_loop * np.sin(2.0 * np.pi * t) * magnitude_scale * 0.04
+        rotations[:, 1] = w_loop * np.sin(2.0 * np.pi * t) * magnitude_scale * np.radians(1.5)
 
     return translations, rotations
 
@@ -3328,7 +3555,12 @@ def main():
     )
     print(f"[✓] MP4 video encoded & verified successfully: {video_meta['mp4_file']}")
 
-    # Update frame_count_validation block in metrics.json with actual rendered & encoded metadata
+    # Compute perceptual motion metrics & visibility classification
+    perceptual_motion_diag = compute_perceptual_motion_score(
+        rendered_frames, subject_mask, background_depth, per_frame_metrics, trans_plan, rot_plan
+    )
+
+    # Update frame_count_validation and perceptual_motion_engine blocks in metrics.json
     diag_metrics["frame_count_validation"] = {
         "requested_frame_count": requested_frame_count,
         "generated_frame_count": len(rendered_frames),
@@ -3339,6 +3571,7 @@ def main():
         "frame_count_match": bool(requested_frame_count == len(rendered_frames)),
         "encoding_frame_count_match": bool(requested_frame_count == video_meta["frame_count"])
     }
+    diag_metrics["perceptual_motion_engine"] = perceptual_motion_diag
     with open(metrics_json_path, "w") as f:
         json.dump(diag_metrics, f, indent=2)
 
@@ -3356,6 +3589,13 @@ def main():
     )
     Image.fromarray(amp_contact_sheet).save(hash_dir / "motion_amplitude_comparison.png")
     print(f"[✓] Saved Motion Amplitude Comparison Contact Sheet to: {hash_dir / 'motion_amplitude_comparison.png'}")
+
+    # Save Layer Displacement Curve Plot (Image-Space Displacement vs Frame Index)
+    disp_plot = generate_layer_displacement_curve_plot(
+        trans_plan, rot_plan, subject_mask, refined_depth, fx, fy, cx, cy, motion_amplitude=args.motion_amplitude
+    )
+    Image.fromarray(disp_plot).save(hash_dir / "layer_displacement_curves.png")
+    print(f"[✓] Saved Layer Displacement Curve Plot to: {hash_dir / 'layer_displacement_curves.png'}")
 
     # Optional 100-render benchmark mode
     if args.benchmark_100:

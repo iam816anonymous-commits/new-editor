@@ -2041,8 +2041,8 @@ def test_p18_9_motion_amplitude_presets():
     mult_high = compute_layer_motion_multiplier("PRIMARY_SUBJECT", "HIGH")
 
     assert mult_low < mult_med < mult_high
-    assert mult_med == 1.35
-    assert mult_high == 1.80
+    assert mult_med == 1.60
+    assert mult_high == 2.60
 
 
 def test_p18_10_layer_motion_ordering():
@@ -2066,9 +2066,9 @@ def test_p18_11_construct_layer_motion_map():
     m_map_med = v0.construct_layer_motion_map((h, w), sub_mask, spatial_diagnostics=None, motion_amplitude="MEDIUM")
     m_map_high = v0.construct_layer_motion_map((h, w), sub_mask, spatial_diagnostics=None, motion_amplitude="HIGH")
 
-    assert m_map_med[15, 15] == 1.35
-    assert m_map_high[15, 15] == 1.80
-    assert m_map_med[0, 0] == 0.20
+    assert m_map_med[15, 15] == 1.60
+    assert m_map_high[15, 15] == 2.60
+    assert m_map_med[0, 0] == 0.45
 
 
 def test_p18_12_generate_motion_amplitude_comparison_contact_sheet():
@@ -2193,7 +2193,7 @@ def test_p19_4_cinematic_push_in_trajectory_smoothness():
     """TEST 4: Cinematic Push-In trajectory uses quintic smoothstep easing for camera Z displacement."""
     import v0_pipeline as v0
 
-    trans, rots = v0.generate_c1_smooth_trajectory("Cinematic Push-In", magnitude_scale=1.0, num_frames=100)
+    trans, rots = v0.generate_c1_smooth_trajectory("Cinematic Push-In", magnitude_scale=1.0, num_frames=100, is_loop=True)
 
     assert trans.shape == (100, 3)
     assert trans[0, 2] == pytest.approx(0.0)      # Z start = 0
@@ -2222,3 +2222,195 @@ def test_p19_6_cross_product_amplitude_and_frame_counts():
             trans, rots = v0.generate_c1_smooth_trajectory("Cinematic Push-In", magnitude_scale=1.0, num_frames=fc)
             assert trans.shape == (fc, 3)
             assert rots.shape == (fc, 3)
+
+
+# ============================================================
+# PHASE 2.0: PERCEPTUAL CINEMATIC MOTION ENGINE TESTS
+# ============================================================
+
+def test_p20_1_motion_pipeline_audit():
+    """TEST 1: Verify trajectory generation and intrinsic perspective projection math."""
+    import v0_pipeline as v0
+
+    fx, fy, cx, cy = v0.derive_camera_intrinsics(1536, 1024)
+    assert fx == 1536.0 and fy == 1536.0
+    assert cx == 768.0 and cy == 512.0
+
+    trans, rots = v0.generate_c1_smooth_trajectory("Cinematic Push-In", magnitude_scale=1.0, num_frames=100)
+    assert trans.shape == (100, 3)
+    assert trans[-1, 2] > trans[0, 2]
+
+
+def test_p20_2_push_in_is_non_looping():
+    """TEST 2: Verify CINEMATIC_PUSH_IN moves monotonically forward without returning to origin."""
+    import v0_pipeline as v0
+
+    trans, rots = v0.generate_c1_smooth_trajectory("Cinematic Push-In", magnitude_scale=1.0, num_frames=100)
+    assert trans[0, 2] == pytest.approx(0.0)
+    assert trans[-1, 2] > 0.30
+    assert trans[50, 2] > trans[10, 2]
+    assert trans[99, 2] > trans[50, 2]
+
+
+def test_p20_3_loop_trajectory_preserves_closure():
+    """TEST 3: Verify explicit loop trajectory satisfies position and velocity loop closure."""
+    import v0_pipeline as v0
+
+    trans, rots = v0.generate_c1_smooth_trajectory("ORBIT", magnitude_scale=1.0, num_frames=100, is_loop=True)
+    assert trans[0] == pytest.approx(trans[-1], abs=1e-5)
+    v_start = trans[1] - trans[0]
+    v_end = trans[-1] - trans[-2]
+    assert v_start == pytest.approx(v_end, abs=1e-3)
+
+
+def test_p20_4_low_medium_high_are_distinguishable():
+    """TEST 4: Verify LOW, MEDIUM, and HIGH motion presets produce strictly distinguishable displacement multipliers."""
+    from spatial_intelligence.camera_model import compute_layer_motion_multiplier
+
+    mult_low = compute_layer_motion_multiplier("PRIMARY_SUBJECT", "LOW")
+    mult_med = compute_layer_motion_multiplier("PRIMARY_SUBJECT", "MEDIUM")
+    mult_high = compute_layer_motion_multiplier("PRIMARY_SUBJECT", "HIGH")
+
+    assert mult_low < mult_med < mult_high
+    assert mult_med >= 1.5 * mult_low
+    assert mult_high >= 1.5 * mult_med
+
+
+def test_p20_5_image_space_motion_is_measured():
+    """TEST 5: Verify compute_perceptual_motion_score calculates actual image-space pixel displacement."""
+    import v0_pipeline as v0
+
+    w, h = 64, 64
+    f0 = np.full((h, w, 3), fill_value=100, dtype=np.uint8)
+    f_last = np.full((h, w, 3), fill_value=100, dtype=np.uint8)
+    f_last[10:50, 10:50] = 200
+
+    sub_mask = np.zeros((h, w), dtype=bool)
+    sub_mask[10:50, 10:50] = True
+    bg_depth = np.full((h, w), fill_value=5.0, dtype=np.float32)
+
+    cam_t = np.zeros((100, 3))
+    cam_r = np.zeros((100, 3))
+
+    score = v0.compute_perceptual_motion_score(
+        [f0, f_last], sub_mask, bg_depth, [], cam_t, cam_r
+    )
+
+    assert "image_space" in score
+    assert "camera_space" in score
+    assert score["image_space"]["subject_displacement_px"] > 0.0
+    assert "motion_visibility_class" in score
+
+
+def test_p20_6_subject_scale_change_is_measured():
+    """TEST 6: Verify subject scale change is measured between initial and final keyframes."""
+    import v0_pipeline as v0
+
+    w, h = 64, 64
+    sub_mask = np.zeros((h, w), dtype=bool)
+    sub_mask[20:44, 20:44] = True
+
+    f0 = np.zeros((h, w, 3), dtype=np.uint8)
+    f_end = np.zeros((h, w, 3), dtype=np.uint8)
+    f_end[18:46, 18:46] = 255  # Expanded mask
+
+    metrics = v0.evaluate_subject_scale_change(sub_mask, f0, f_end)
+    assert "scale_change_ratio" in metrics
+    assert metrics["scale_change_ratio"] >= 1.0
+
+
+def test_p20_7_perceptual_motion_score():
+    """TEST 7: Verify perceptual_motion_score maps bounded values in range [0, 1]."""
+    import v0_pipeline as v0
+
+    w, h = 32, 32
+    f0 = np.zeros((h, w, 3), dtype=np.uint8)
+    f_end = np.full((h, w, 3), fill_value=150, dtype=np.uint8)
+    sub_mask = np.zeros((h, w), dtype=bool)
+    sub_mask[8:24, 8:24] = True
+    bg_depth = np.full((h, w), fill_value=5.0, dtype=np.float32)
+
+    score_dict = v0.compute_perceptual_motion_score(
+        [f0, f_end], sub_mask, bg_depth, [], np.zeros((10, 3)), np.zeros((10, 3))
+    )
+
+    score = score_dict["perceptual_motion_score"]
+    assert 0.0 <= score <= 1.0
+
+
+def test_p20_8_negligible_motion_is_rejected():
+    """TEST 8: Verify motion visibility classifier correctly labels sub-threshold displacement as NEGLIGIBLE."""
+    import v0_pipeline as v0
+
+    vis_class = v0.classify_motion_visibility(
+        subject_disp_px=1.2, bg_disp_px=0.2, relative_disp_px=1.0, scale_change_ratio=1.001
+    )
+    assert vis_class == "NEGLIGIBLE"
+
+
+def test_p20_9_artifact_limits_are_preserved():
+    """TEST 9: Verify high edge artifact ratios trigger UNSAFE classification."""
+    import v0_pipeline as v0
+
+    vis_class = v0.classify_motion_visibility(
+        subject_disp_px=25.0, bg_disp_px=5.0, relative_disp_px=20.0, scale_change_ratio=1.1, edge_artifact_ratio=0.12
+    )
+    assert vis_class == "UNSAFE"
+
+
+def test_p20_10_motion_scales_with_resolution():
+    """TEST 10: Verify closed-loop trajectory strength ceilings scale proportionally with resolution."""
+    import v0_pipeline as v0
+
+    depth100 = np.full((100, 100), fill_value=5.0, dtype=np.float32)
+    conf100 = np.ones((100, 100), dtype=np.float32)
+    sub100 = np.zeros((100, 100), dtype=bool)
+    sub100[30:70, 30:70] = True
+    risk100 = np.zeros((100, 100), dtype=np.float32)
+    prov100 = np.ones((100, 100), dtype=np.float32)
+
+    depth1000 = np.full((1000, 1000), fill_value=5.0, dtype=np.float32)
+    conf1000 = np.ones((1000, 1000), dtype=np.float32)
+    sub1000 = np.zeros((1000, 1000), dtype=bool)
+    sub1000[300:700, 300:700] = True
+    risk1000 = np.zeros((1000, 1000), dtype=np.float32)
+    prov1000 = np.ones((1000, 1000), dtype=np.float32)
+
+    _, _, scale_100, plan100 = v0.plan_safe_motion_trajectory(
+        "Cinematic Push-In", "Cinematic", 100, 100, depth100, conf100, sub100, risk100, prov100, 100, 100, 50, 50
+    )
+    _, _, scale_1000, plan1000 = v0.plan_safe_motion_trajectory(
+        "Cinematic Push-In", "Cinematic", 1000, 1000, depth1000, conf1000, sub1000, risk1000, prov1000, 1000, 1000, 500, 500
+    )
+
+    assert plan1000["disparity_ceiling_target_px"] > plan100["disparity_ceiling_target_px"]
+
+
+def test_p20_11_layer_motion_ordering():
+    """TEST 11: Verify strict layer parallax motion ordering FOREGROUND > PRIMARY_SUBJECT > MIDGROUND > BACKGROUND."""
+    from spatial_intelligence.camera_model import compute_layer_motion_multiplier
+
+    fg = compute_layer_motion_multiplier("FOREGROUND", "MEDIUM")
+    sub = compute_layer_motion_multiplier("PRIMARY_SUBJECT", "MEDIUM")
+    mg = compute_layer_motion_multiplier("MIDGROUND", "MEDIUM")
+    bg = compute_layer_motion_multiplier("BACKGROUND", "MEDIUM")
+
+    assert fg > sub > mg > bg
+
+
+def test_p20_12_100_frame_motion_validation():
+    """TEST 12: Verify 100-frame render sequence generates layer displacement curves plot."""
+    import v0_pipeline as v0
+
+    w, h = 64, 64
+    trans, rots = v0.generate_c1_smooth_trajectory("Cinematic Push-In", 1.0, 100)
+    sub_mask = np.zeros((h, w), dtype=bool)
+    sub_mask[20:44, 20:44] = True
+    depth = np.full((h, w), fill_value=5.0, dtype=np.float32)
+
+    plot = v0.generate_layer_displacement_curve_plot(
+        trans, rots, sub_mask, depth, 64.0, 64.0, 32.0, 32.0, motion_amplitude="MEDIUM"
+    )
+
+    assert plot.shape == (320, 640, 3)
+    assert np.any(plot > 0)
