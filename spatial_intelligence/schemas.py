@@ -1,0 +1,334 @@
+"""
+Typed Dataclasses and Contracts for Spatial Intelligence Subsystem.
+First-Principles Cinematic 2.5D Parallax Renderer (V0)
+"""
+
+from dataclasses import dataclass, field
+from enum import Enum
+from typing import Dict, List, Tuple, Optional, Any
+import numpy as np
+
+
+class RelationType(str, Enum):
+    """
+    Enumeration of directed spatial relationships between entities/parts.
+
+    DEPTH SIGN CONVENTION INVARIANT:
+    - Depth coordinate Z is in rendering coordinates [0.1, 10.0].
+    - SMALLER Z = CLOSER to camera (Foreground).
+    - LARGER Z = FARTHER from camera (Background).
+    - depth_diff = Z_A - Z_B.
+    - If Z_A < Z_B (depth_diff < 0): Entity A is closer than Entity B.
+      -> Entity A is FRONT_OF Entity B.
+      -> Entity A OCCLUDES Entity B (when overlapping).
+      -> Entity B is BEHIND Entity A.
+      -> Entity B is OCCLUDED_BY Entity A.
+    """
+    FRONT_OF = "FRONT_OF"
+    BEHIND = "BEHIND"
+    SUPPORTS = "SUPPORTS"
+    ATTACHED_TO = "ATTACHED_TO"
+    PART_OF = "PART_OF"
+    OVERLAPS = "OVERLAPS"
+    OCCLUDES = "OCCLUDES"
+    OCCLUDED_BY = "OCCLUDED_BY"
+    NEAR = "NEAR"
+    FAR_FROM = "FAR_FROM"
+    SAME_COMPOUND_SUBJECT = "SAME_COMPOUND_SUBJECT"
+
+
+class EntityClass(str, Enum):
+    """Explicit classification distinguishing renderable entities from analysis-only regions."""
+    RENDERABLE_ENTITY = "RENDERABLE_ENTITY"
+    ANALYSIS_REGION = "ANALYSIS_REGION"
+
+
+class LayerRole(str, Enum):
+    """Explicit rendering layer role governing independent parallax displacement."""
+    BACKGROUND = "BACKGROUND"
+    MIDGROUND = "MIDGROUND"
+    PRIMARY_SUBJECT = "PRIMARY_SUBJECT"
+    PRIMARY_SUBJECT_PART = "PRIMARY_SUBJECT_PART"
+    FOREGROUND = "FOREGROUND"
+    ANALYSIS_ONLY = "ANALYSIS_ONLY"
+
+
+class SemanticRole(str, Enum):
+    """Coarse semantic / render role for trusted scene entities."""
+    PRIMARY_SUBJECT = "PRIMARY_SUBJECT"
+    SECONDARY_OBJECT = "SECONDARY_OBJECT"
+    FOREGROUND_OBJECT = "FOREGROUND_OBJECT"
+    MIDGROUND_OBJECT = "MIDGROUND_OBJECT"
+    BACKGROUND_REGION = "BACKGROUND_REGION"
+    EMPTY_BACKGROUND = "EMPTY_BACKGROUND"
+
+
+class RenderRelevance(str, Enum):
+    """Relevance classification for rendering and disocclusion handling."""
+    CRITICAL = "CRITICAL"
+    USEFUL = "USEFUL"
+    LOW = "LOW"
+    IGNORE = "IGNORE"
+
+
+@dataclass
+class SegmentationCandidate:
+    """Unconsolidated raw proposal candidate from SAM 2 or prompt grid."""
+    candidate_id: int
+    mask: np.ndarray = field(repr=False)
+    bbox: Tuple[int, int, int, int]
+    centroid: Tuple[float, float]
+    norm_centroid: Tuple[float, float]
+    area_pixels: int
+    area_ratio: float
+    depth_mean: float
+    depth_median: float
+    depth_std: float
+    sam_confidence: float
+    prompt_origin: str
+
+
+@dataclass
+class EntityTrustScore:
+    """Multi-signal trust breakdown for a candidate entity separate from raw SAM confidence."""
+    mask_quality: float
+    depth_coherence: float
+    boundary_coherence: float
+    candidate_uniqueness: float
+    render_relevance: float
+    overall_trust_score: float
+    evidence_breakdown: Dict[str, float] = field(default_factory=dict)
+
+
+@dataclass
+class EntityPart:
+    """Sub-component part of a scene entity (e.g. face, arm, Shesha heads)."""
+    part_id: int
+    entity_id: int
+    name: str
+    mask: np.ndarray = field(repr=False)
+    bbox: Tuple[int, int, int, int]  # (ymin, xmin, ymax, xmax)
+    depth_mean: float
+    depth_std: float
+    confidence: float
+
+
+@dataclass
+class Entity:
+    """Trusted, consolidated spatial entity safe for downstream rendering decisions."""
+    entity_id: int
+    name: str
+    mask: np.ndarray = field(repr=False)
+    bbox: Tuple[int, int, int, int]
+    centroid: Tuple[float, float]
+    norm_centroid: Tuple[float, float]
+    area_pixels: int
+    area_ratio: float
+    depth_mean: float
+    depth_median: float
+    depth_std: float
+    entity_class: EntityClass = EntityClass.RENDERABLE_ENTITY
+    layer_role: LayerRole = LayerRole.MIDGROUND
+    semantic_role: SemanticRole = SemanticRole.SECONDARY_OBJECT
+    trust_score: float = 1.0
+    trust_details: Optional[EntityTrustScore] = None
+    is_primary_subject: bool = False
+    parent_subject_id: Optional[int] = None
+    source_candidate_ids: List[int] = field(default_factory=list)
+    render_relevance: RenderRelevance = RenderRelevance.USEFUL
+    parts: List[EntityPart] = field(default_factory=list)
+
+
+@dataclass
+class SpatialRelationship:
+    """Canonical directed spatial relationship edge between two trusted entities."""
+    subject_id: int
+    target_id: int
+    relation_type: RelationType
+    confidence: float
+    evidence: str
+    render_relevance: RenderRelevance = RenderRelevance.USEFUL
+    is_canonical: bool = True
+    supporting_metrics: Dict[str, float] = field(default_factory=dict)
+
+
+@dataclass
+class RejectedRelationship:
+    """Record tracking a rejected relationship candidate and explicit rejection reason."""
+    subject_id: int
+    target_id: int
+    relation_type: RelationType
+    rejection_reason: str
+    supporting_metrics: Dict[str, float] = field(default_factory=dict)
+
+
+@dataclass
+class SceneGraph:
+    """Sparse graph representation holding trusted entities, parts, and canonical spatial relationship edges."""
+    entities: Dict[int, Entity] = field(default_factory=dict)
+    relationships: List[SpatialRelationship] = field(default_factory=list)
+    render_relationships: List[SpatialRelationship] = field(default_factory=list)
+    rejected_relationships: List[RejectedRelationship] = field(default_factory=list)
+    raw_candidate_count: int = 0
+    rejected_candidate_count: int = 0
+    merged_candidate_count: int = 0
+    analysis_only_entity_count: int = 0
+    renderable_entity_count: int = 0
+    relationship_candidate_count: int = 0
+    relationship_rejected_count: int = 0
+
+    def add_entity(self, entity: Entity) -> None:
+        self.entities[entity.entity_id] = entity
+        if entity.entity_class == EntityClass.RENDERABLE_ENTITY:
+            self.renderable_entity_count += 1
+        else:
+            self.analysis_only_entity_count += 1
+
+    def add_relationship(
+        self,
+        subject_id: int,
+        target_id: int,
+        relation_type: RelationType,
+        confidence: float,
+        evidence: str,
+        render_relevance: RenderRelevance = RenderRelevance.USEFUL,
+        supporting_metrics: Optional[Dict[str, float]] = None
+    ) -> None:
+        self.relationships.append(SpatialRelationship(
+            subject_id=subject_id,
+            target_id=target_id,
+            relation_type=relation_type,
+            confidence=confidence,
+            evidence=evidence,
+            render_relevance=render_relevance,
+            supporting_metrics=supporting_metrics or {}
+        ))
+
+    def record_rejected_relationship(
+        self,
+        subject_id: int,
+        target_id: int,
+        relation_type: RelationType,
+        rejection_reason: str,
+        supporting_metrics: Optional[Dict[str, float]] = None
+    ) -> None:
+        self.rejected_relationships.append(RejectedRelationship(
+            subject_id=subject_id,
+            target_id=target_id,
+            relation_type=relation_type,
+            rejection_reason=rejection_reason,
+            supporting_metrics=supporting_metrics or {}
+        ))
+        self.relationship_rejected_count += 1
+
+    def get_relationships_for_entity(self, entity_id: int) -> List[SpatialRelationship]:
+        return [r for r in self.relationships if r.subject_id == entity_id or r.target_id == entity_id]
+
+
+@dataclass
+class DepthField:
+    """Structured 2.5D spatial depth field representation."""
+    rendering_depth: np.ndarray = field(repr=False)  # Z in [0.1, 10.0]
+    background_depth: np.ndarray = field(repr=False)
+    subject_depth: np.ndarray = field(repr=False)
+    uncertainty_map: np.ndarray = field(repr=False)  # Uncertainty in [0.0, 1.0]
+    provenance_map: np.ndarray = field(repr=False)   # 1.0 = OBSERVED, 0.0 = INFERRED/RECONSTRUCTED
+    min_depth: float = 0.1
+    max_depth: float = 10.0
+
+
+@dataclass
+class OcclusionRelationship:
+    """Explicit occlusion relationship between occluder and occluded entity."""
+    occluder_id: int
+    occluded_id: int
+    boundary_mask: np.ndarray = field(repr=False)
+    disocclusion_risk_area: int
+    confidence: float
+
+
+@dataclass
+class CameraModel:
+    """Perspective pinhole camera model for 2.5D view synthesis."""
+    width: int
+    height: int
+    fx: float
+    fy: float
+    cx: float
+    cy: float
+    position: np.ndarray = field(default_factory=lambda: np.zeros(3, dtype=np.float64))  # (tx, ty, tz)
+    rotation_pitch_yaw_roll: np.ndarray = field(default_factory=lambda: np.zeros(3, dtype=np.float64))  # (pitch, yaw, roll)
+
+    def project_points(self, points_3d: np.ndarray) -> Tuple[np.ndarray, np.ndarray, np.ndarray]:
+        """Projects 3D points [X, Y, Z] to image coordinates (u', v') and depth Z'."""
+        X = points_3d[:, 0]
+        Y = points_3d[:, 1]
+        Z = points_3d[:, 2]
+        Z_safe = np.where(np.abs(Z) < 1e-6, 1e-6, Z)
+        u_proj = self.fx * (X / Z_safe) + self.cx
+        v_proj = self.fy * (Y / Z_safe) + self.cy
+        return u_proj, v_proj, Z
+
+
+@dataclass
+class SpatialConfidence:
+    """Multi-layer spatial reasoning confidence scores."""
+    relationship_confidence: float
+    depth_field_confidence: float
+    occlusion_confidence: float
+    overall_spatial_confidence: float
+
+
+@dataclass
+class ParallaxQualityScore:
+    """Deterministic diagnostic parallax quality breakdown."""
+    background_motion_px: float
+    midground_motion_px: float
+    primary_subject_motion_px: float
+    foreground_motion_px: float
+    temporal_mad: float
+    boundary_mad: float
+    loop_closure_mae: float
+    edge_artifact_ratio: float
+    overlap_artifact_ratio: float
+    overall_parallax_quality: float
+
+
+@dataclass
+class RenderingConfig:
+    """Typed configuration contract for depth-driven rendering and parallax view synthesis."""
+    width: int = 1536
+    height: int = 1024
+    fps: int = 24
+    frame_count: int = 48
+    parallax_strength: float = 1.0
+    motion_amplitude: str = "MEDIUM"  # "LOW", "MEDIUM", "HIGH"
+    depth_gamma: float = 1.2
+    foreground_boost: float = 1.5
+    background_stability: float = 0.10
+    camera_motion_x: float = 0.05
+    camera_motion_y: float = 0.02
+    camera_zoom: float = 0.03
+    camera_rotation: float = 0.0
+    edge_snap_distance: int = 4
+    mask_feather_px: int = 3
+    reconstruction_mode: str = "FAST"  # "FAST" or "HIGH"
+    reconstruction_quality: str = "HIGH"  # "LOW", "MEDIUM", "HIGH"
+    temporal_blend: float = 0.85
+    artifact_threshold: float = 0.05
+    minimum_motion: float = 2.0  # Motion floor in pixels
+    maximum_motion: float = 45.0 # Motion ceiling in pixels
+    seed: int = 42
+
+
+@dataclass
+class SpatialDiagnostics:
+    """Complete exportable diagnostic payload for spatial intelligence subsystem."""
+    scene_graph: SceneGraph
+    depth_field: DepthField
+    occlusion_relationships: List[OcclusionRelationship]
+    camera_model: CameraModel
+    spatial_confidence: SpatialConfidence
+    parallax_quality: Optional[ParallaxQualityScore] = None
+    rendering_config: Optional[RenderingConfig] = None
+    metrics_summary: Dict[str, Any] = field(default_factory=dict)
