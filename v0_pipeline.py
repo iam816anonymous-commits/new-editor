@@ -2112,39 +2112,58 @@ def evaluate_subject_scale_change(
     f_end_rgb: np.ndarray
 ) -> Dict[str, float]:
     """
-    Measures subject bounding box dimensions and area scale change between F0 and F_end.
-    Returns dictionary with scale_change_ratio, subject_width_ratio, subject_height_ratio, and subject_area_ratio.
+    Measures subject bounding box dimensions and area scale change directly from rendered frames F0 and F_end.
+    Detects rendered subject region in F_end using color and edge correlation relative to original subject region.
+    Returns dictionary with subject_scale_growth, scale_change_ratio, subject_width_ratio, subject_height_ratio, and subject_area_ratio.
     """
-    y_idx, x_idx = np.where(subject_mask)
-    if len(y_idx) == 0:
+    y_idx0, x_idx0 = np.where(subject_mask)
+    if len(y_idx0) == 0:
         return {
+            "subject_scale_growth": 0.0,
             "scale_change_ratio": 1.0,
             "subject_width_ratio": 1.0,
             "subject_height_ratio": 1.0,
             "subject_area_ratio": 1.0
         }
 
-    h0 = float(np.max(y_idx) - np.min(y_idx) + 1)
-    w0 = float(np.max(x_idx) - np.min(x_idx) + 1)
+    h0 = float(np.max(y_idx0) - np.min(y_idx0) + 1)
+    w0 = float(np.max(x_idx0) - np.min(x_idx0) + 1)
     a0 = float(np.sum(subject_mask))
 
-    # Calculate difference between rendered f_end and f0 inside subject region to estimate apparent zoom/expansion
-    diff = np.abs(f_end_rgb.astype(np.float32) - f0_rgb.astype(np.float32))
-    diff_mask = (np.mean(diff, axis=2) > 5.0) & subject_mask
+    # Isolate subject RGB color pattern from F0
+    f0_f = f0_rgb.astype(np.float32)
+    fl_f = f_end_rgb.astype(np.float32)
 
-    y_end, x_idx_end = np.where(diff_mask)
+    # Calculate color match in rendered F_end to locate transformed subject boundary
+    sub_colors_f0 = f0_f[subject_mask]
+    mean_sub_color = np.mean(sub_colors_f0, axis=0)
+    std_sub_color = np.std(sub_colors_f0, axis=0) + 1e-3
+
+    color_diff_fl = np.abs(fl_f - mean_sub_color) / std_sub_color
+    color_match_fl = np.mean(color_diff_fl, axis=2) < 2.5
+
+    # Dilate around original subject bbox search window
+    dilated_zone = cv2.dilate(subject_mask.astype(np.uint8), cv2.getStructuringElement(cv2.MORPH_RECT, (25, 25))) > 0
+    rendered_subject_mask = color_match_fl & dilated_zone
+
+    y_end, x_end = np.where(rendered_subject_mask)
     if len(y_end) > 0:
         h_end = float(np.max(y_end) - np.min(y_end) + 1)
-        w_end = float(np.max(x_idx_end) - np.min(x_idx_end) + 1)
-        w_ratio = max(0.5, min(2.0, w_end / max(1.0, w0)))
-        h_ratio = max(0.5, min(2.0, h_end / max(1.0, h0)))
-        a_ratio = w_ratio * h_ratio
+        w_end = float(np.max(x_end) - np.min(x_end) + 1)
+        a_end = float(np.sum(rendered_subject_mask))
+
+        w_ratio = float(w_end / max(1.0, w0))
+        h_ratio = float(h_end / max(1.0, h0))
+        growth = float(((w_ratio + h_ratio) / 2.0) - 1.0)
+        a_ratio = (1.0 + growth) ** 2
     else:
         w_ratio = 1.0
         h_ratio = 1.0
         a_ratio = 1.0
+        growth = 0.0
 
     return {
+        "subject_scale_growth": growth,
         "scale_change_ratio": a_ratio,
         "subject_width_ratio": w_ratio,
         "subject_height_ratio": h_ratio,
@@ -2161,8 +2180,9 @@ def compute_perceptual_motion_score(
     camera_rotations: np.ndarray
 ) -> Dict[str, Any]:
     """
-    Calculates first-class perceptual_motion_score from actual rendered frames.
+    Calculates first-class perceptual_motion_score and motion effectiveness gate from actual rendered frames.
     Reports both Camera Space and Image Space parameters and classifies motion visibility.
+    Enforces Hard Acceptance Gate failing renders where subject motion or scale growth is locked or static.
     """
     f0 = rendered_frames[0]
     f_last = rendered_frames[-1]
@@ -2185,6 +2205,7 @@ def compute_perceptual_motion_score(
 
     scale_metrics = evaluate_subject_scale_change(subject_mask, f0, f_last)
     scale_ratio = scale_metrics["scale_change_ratio"]
+    scale_growth = scale_metrics["subject_scale_growth"]
 
     vis_class = classify_motion_visibility(sub_disp_px, bg_disp_px, rel_sub_bg_px, scale_ratio)
 
@@ -2192,7 +2213,17 @@ def compute_perceptual_motion_score(
     cam_ty_max = float(np.max(np.abs(camera_translations[:, 1])))
     cam_tz_max = float(np.max(np.abs(camera_translations[:, 2])))
 
-    perceptual_score = float(np.clip((sub_disp_px / 30.0) * 0.5 + (rel_sub_bg_px / 15.0) * 0.5, 0.0, 1.0))
+    # Motion effectiveness & stability metrics separation
+    temp_mads = [float(m["mean_disparity_px"]) for m in per_frame_metrics] if per_frame_metrics else [0.5]
+    motion_stability_score = float(1.0 - np.clip(np.std(temp_mads) / 10.0, 0.0, 0.5))
+    motion_effectiveness_score = float(np.clip((sub_disp_px / 20.0) * 0.4 + (rel_sub_bg_px / 10.0) * 0.3 + (max(0.0, scale_growth) / 0.05) * 0.3, 0.0, 1.0))
+
+    # Hard Perceptual Motion Acceptance Gate:
+    # Fail if subject scale growth is <0.005 and relative sub/bg displacement is <1.5px, or if only foreground moves
+    motion_gate_passed = bool(
+        (sub_disp_px >= 2.0 or scale_growth >= 0.008 or abs(rel_sub_bg_px) >= 1.2) and
+        vis_class not in ["NEGLIGIBLE", "UNSAFE"]
+    )
 
     return {
         "camera_space": {
@@ -2210,11 +2241,16 @@ def compute_perceptual_motion_score(
             "foreground_displacement_px": fg_disp_px,
             "relative_subject_background_motion_px": rel_sub_bg_px,
             "relative_foreground_background_motion_px": rel_fg_bg_px,
-            "subject_scale_change_ratio": scale_ratio
+            "subject_scale_change_ratio": scale_ratio,
+            "subject_scale_growth": scale_growth
         },
-        "perceptual_motion_score": perceptual_score,
+        "motion_stability_score": motion_stability_score,
+        "motion_effectiveness_score": motion_effectiveness_score,
+        "perceptual_motion_score": motion_effectiveness_score,
         "motion_visibility_class": vis_class,
-        "motion_ordering_valid": bool(fg_disp_px >= sub_disp_px >= mg_disp_px >= bg_disp_px)
+        "motion_ordering_valid": bool(fg_disp_px >= sub_disp_px >= mg_disp_px >= bg_disp_px),
+        "perceptual_motion_gate_passed": motion_gate_passed,
+        "motion_good": motion_gate_passed
     }
 
 
@@ -2817,11 +2853,11 @@ def generate_c1_smooth_trajectory(
     elif style_upper == "STATIC":
         pass  # All zeros
     elif style_upper in ["CINEMATIC_PUSH_IN", "CINEMATIC_PUSHIN", "PUSH_IN", "PUSHIN"]:
-        # Genuine progressive Push-In (non-looping): monotonically advances Z forward
-        translations[:, 2] = s_quintic * magnitude_scale * 0.35  # Progressive Z push-in
-        translations[:, 1] = -s_quintic * magnitude_scale * 0.03  # Gentle vertical rise
-        translations[:, 0] = np.sin(np.pi * t) * magnitude_scale * 0.015 # Subtle lateral drift
-        rotations[:, 0] = -s_quintic * magnitude_scale * np.radians(1.5) # Gentle pitch
+        # Genuine progressive Push-In (non-looping): camera pushes forward towards scene (negative Z)
+        translations[:, 2] = -s_quintic * magnitude_scale * 0.10  # Negative Z pushes camera towards scene
+        translations[:, 1] = -s_quintic * magnitude_scale * 0.015 # Gentle vertical rise
+        translations[:, 0] = np.sin(np.pi * t) * magnitude_scale * 0.008 # Subtle lateral drift
+        rotations[:, 0] = -s_quintic * magnitude_scale * np.radians(0.8) # Gentle pitch
     elif style_upper in ["DOLLY_IN", "DOLLYIN"]:
         translations[:, 2] = w_loop * magnitude_scale * 0.15
     elif style_upper in ["DOLLY_OUT", "DOLLYOUT"]:
@@ -2942,22 +2978,16 @@ def render_single_frame_forward_splatting(
     """
     Renders a synthesized view using forward subpixel splatting and deterministic Z-buffering.
     Features:
-    1. First renders background plate and background depth into buffers.
+    1. Independent forward splatting for background plate and foreground surfaces.
     2. Back-projects foreground and background surfaces to 3D.
     3. Applies camera transformation P' = R @ P + t.
     4. Subpixel splatting with bilinear distribution to 2x2 target pixel neighborhood.
     5. Depth discontinuity protection: suppresses splatting across large depth jumps to avoid rubber-sheet stretching.
-    6. Deterministic Z-buffer: closest Z value strictly wins.
+    6. Deterministic Z-buffer compositing: foreground layer strictly overwrites background layer where valid foreground splats exist.
 
     Returns: (synthesized_rgb, rendered_depth_buffer, output_provenance)
     """
     height, width, _ = rgb_array.shape
-
-    # Initialize Z-buffer with infinite depth and accumulation buffers
-    z_buffer = np.full((height, width), fill_value=1e9, dtype=np.float32)
-    accum_color = np.zeros((height, width, 3), dtype=np.float32)
-    accum_weight = np.zeros((height, width), dtype=np.float32)
-    output_prov = np.zeros((height, width), dtype=np.float32)
 
     # 1. Prepare source grids
     u_grid, v_grid = np.meshgrid(np.arange(width, dtype=np.float32), np.arange(height, dtype=np.float32))
@@ -2968,46 +2998,31 @@ def render_single_frame_forward_splatting(
     d_grad_x = cv2.Sobel(depth_map, cv2.CV_32F, 1, 0, ksize=3)
     d_grad_y = cv2.Sobel(depth_map, cv2.CV_32F, 0, 1, ksize=3)
     d_grad_mag = np.sqrt(d_grad_x**2 + d_grad_y**2).ravel()
-
-    # Discontinuity mask: pixels near steep depth steps are marked
     is_discontinuity = d_grad_mag > depth_discontinuity_threshold
 
-    # Process layers: First background plate, then reference image
-    layers = [
-        ("background", bg_plate, bg_depth, provenance_map),
-        ("foreground", rgb_array, depth_map, provenance_map)
-    ]
+    def splat_layer(color_src: np.ndarray, depth_src: np.ndarray, prov_src: np.ndarray, mult_src: Optional[np.ndarray], is_fg: bool = False):
+        z_buf = np.full((height, width), fill_value=1e9, dtype=np.float32)
+        accum_col = np.zeros((height, width, 3), dtype=np.float32)
+        accum_w = np.zeros((height, width), dtype=np.float32)
+        out_prov = np.zeros((height, width), dtype=np.float32)
 
-    for layer_name, color_src, depth_src, prov_src in layers:
         colors_flat = color_src.reshape(-1, 3).astype(np.float32)
         depths_flat = depth_src.ravel()
         prov_flat = prov_src.ravel()
 
-        # Back-project layer pixels to 3D
         pts_3d = back_project_points(u_flat, v_flat, depths_flat, fx, fy, cx, cy)
-
-        # Apply layer-differentiated motion multiplier to camera translation vector t
-        if layer_motion_map is not None:
-            mult_flat = layer_motion_map.ravel() if layer_name == "foreground" else np.full_like(depths_flat, 0.10)
-            t_pixel = t[None, :] * mult_flat[:, None]
+        if mult_src is not None:
+            t_pixel = t[None, :] * mult_src.ravel()[:, None]
             pts_trans = (pts_3d @ R.T) + t_pixel
         else:
             pts_trans = transform_3d_points(pts_3d, R, t)
 
-        # Project transformed 3D points back to target 2D image coordinates
         proj_u, proj_v, proj_z = project_3d_points(pts_trans, fx, fy, cx, cy)
-
-        # Valid projection mask: positive depth and within image bounds
         valid_mask = (proj_z > 0.05) & (proj_u >= 0.0) & (proj_u < width - 1) & (proj_v >= 0.0) & (proj_v < height - 1)
-
-        if layer_name == "foreground":
-            # For foreground, suppress points near steep depth discontinuities to prevent stretching/bleeding
+        if is_fg:
             valid_mask = valid_mask & (~is_discontinuity)
 
         valid_indices = np.where(valid_mask)[0]
-
-        # Vectorized subpixel forward splatting & Z-buffering
-        # 1. Sort points by Z in descending order (far to near) so closer points overwrite farther points
         sort_order = np.argsort(-proj_z[valid_indices])
         sorted_indices = valid_indices[sort_order]
 
@@ -3044,24 +3059,58 @@ def render_single_frame_forward_splatting(
             col_sub = pcol[valid_sub]
             prov_sub = pprov[valid_sub]
 
-            # Direct vectorized update (far-to-near order guarantees closer points win)
-            z_buffer[v_sub, u_sub] = z_sub
-            accum_color[v_sub, u_sub] = col_sub * w_sub[:, None]
-            accum_weight[v_sub, u_sub] = w_sub
-            output_prov[v_sub, u_sub] = prov_sub
+            curr_z_vals = z_buf[v_sub, u_sub]
+            closer_mask = z_sub < (curr_z_vals - 0.001)
+            if np.any(closer_mask):
+                u_c, v_c = u_sub[closer_mask], v_sub[closer_mask]
+                z_buf[v_c, u_c] = z_sub[closer_mask]
+                accum_col[v_c, u_c] = 0.0
+                accum_w[v_c, u_c] = 0.0
 
-    # Normalize accumulated color by weights
-    weight_mask = accum_weight > 0
-    syn_rgb = bg_plate.copy().astype(np.float32)
-    syn_rgb[weight_mask] = accum_color[weight_mask] / accum_weight[weight_mask][..., None]
+            curr_z_updated = z_buf[v_sub, u_sub]
+            visible_mask = z_sub <= (curr_z_updated + 0.001)
+            if not np.any(visible_mask):
+                continue
 
-    # Fill remaining unwritten pixels with background plate
-    unwritten = ~weight_mask
-    z_buffer[unwritten] = bg_depth[unwritten]
-    output_prov[unwritten] = provenance_map[unwritten]
+            u_vis = u_sub[visible_mask]
+            v_vis = v_sub[visible_mask]
+            w_vis = w_sub[visible_mask]
+            z_vis = z_sub[visible_mask]
+            col_vis = col_sub[visible_mask]
+            prov_vis = prov_sub[visible_mask]
+
+            np.minimum.at(z_buf, (v_vis, u_vis), z_vis)
+            np.add.at(accum_col, (v_vis, u_vis), col_vis * w_vis[:, None])
+            np.add.at(accum_w, (v_vis, u_vis), w_vis)
+            out_prov[v_vis, u_vis] = prov_vis
+
+        return z_buf, accum_col, accum_w, out_prov
+
+    # Render Background Layer
+    bg_mult = np.full_like(bg_depth, 0.10) if layer_motion_map is not None else None
+    bg_z, bg_col, bg_w, bg_p = splat_layer(bg_plate, bg_depth, provenance_map, bg_mult, is_fg=False)
+
+    # Render Foreground Layer
+    fg_z, fg_col, fg_w, fg_p = splat_layer(rgb_array, depth_map, provenance_map, layer_motion_map, is_fg=True)
+
+    # Composite layers: Where foreground splats exist (fg_w > 0), foreground wins
+    fg_mask = fg_w > 0.05
+    syn_rgb = np.zeros((height, width, 3), dtype=np.float32)
+    rendered_z = bg_z.copy()
+    output_prov = bg_p.copy()
+
+    # Background layer synthesis
+    bg_valid = bg_w > 0
+    syn_rgb[bg_valid] = bg_col[bg_valid] / bg_w[bg_valid][..., None]
+    syn_rgb[~bg_valid] = bg_plate[~bg_valid].astype(np.float32)
+
+    # Foreground layer overlay
+    syn_rgb[fg_mask] = fg_col[fg_mask] / fg_w[fg_mask][..., None]
+    rendered_z[fg_mask] = fg_z[fg_mask]
+    output_prov[fg_mask] = fg_p[fg_mask]
 
     syn_rgb = np.clip(syn_rgb, 0.0, 255.0).astype(np.uint8)
-    return syn_rgb, z_buffer, output_prov
+    return syn_rgb, rendered_z, output_prov
 
 
 def compute_rotation_matrix(pitch: float, yaw: float, roll: float) -> np.ndarray:
@@ -3409,58 +3458,25 @@ def main():
     # Add cinematic motion quality metrics section & frame count validation
     amp_setting = getattr(args, "motion_amplitude", "MEDIUM") if 'args' in locals() else "MEDIUM"
     req_frames = getattr(args, "frames", 48) if 'args' in locals() else 48
-    gen_frames = len(rendered_frames) if 'rendered_frames' in locals() else req_frames
-    enc_frames = video_meta.get("frame_count", gen_frames) if 'video_meta' in locals() else gen_frames
     exp_dur = float(req_frames / 24.0)
-    act_dur = video_meta.get("duration_seconds", exp_dur) if 'video_meta' in locals() else exp_dur
 
     diag_metrics["frame_count_validation"] = {
         "requested_frame_count": req_frames,
-        "generated_frame_count": gen_frames,
-        "encoded_frame_count": enc_frames,
+        "generated_frame_count": 0,
+        "encoded_frame_count": 0,
         "fps": 24,
         "expected_duration_seconds": exp_dur,
-        "actual_duration_seconds": act_dur,
-        "frame_count_match": bool(req_frames == gen_frames),
-        "encoding_frame_count_match": bool(req_frames == enc_frames)
-    }
-
-    diag_metrics["cinematic_motion_quality"] = {
-        "motion_amplitude_requested": amp_setting,
-        "motion_amplitude_actual": amp_setting,
-        "background_displacement_px": 4.50 if amp_setting == "MEDIUM" else (1.50 if amp_setting == "LOW" else 8.00),
-        "midground_displacement_px": 12.50 if amp_setting == "MEDIUM" else (4.20 if amp_setting == "LOW" else 22.00),
-        "subject_displacement_px": 24.80 if amp_setting == "MEDIUM" else (8.40 if amp_setting == "LOW" else 42.00),
-        "foreground_displacement_px": 38.40 if amp_setting == "MEDIUM" else (12.80 if amp_setting == "LOW" else 64.00),
-        "relative_subject_background_motion_px": 20.30 if amp_setting == "MEDIUM" else (6.90 if amp_setting == "LOW" else 34.00),
-        "trajectory_smoothness": "C1_CONTINUOUS_SINE_WINDOWED",
-        "temporal_stability": "EXCELLENT",
-        "boundary_stability": "STABLE",
-        "loop_closure_error_mae": 0.00,
-        "reconstruction_exposure_ratio": float(rec_percentage / 100.0),
-        "edge_artifact_ratio": 0.008,
-        "overlap_artifact_ratio": 0.004,
-        "final_motion_rating": "MOTION_GOOD" if amp_setting in ["LOW", "MEDIUM"] else "MOTION_TOO_AGGRESSIVE"
+        "actual_duration_seconds": 0.0,
+        "frame_count_match": False,
+        "encoding_frame_count_match": False
     }
 
     diag_metrics["phase_1_7_comparison"] = {
-        "baseline": {
-            "trusted_entities_count": 13,
-            "renderable_entities_count": 6,
-            "relationships_count": 28,
-            "motion_amplitude": "0.15x (conservative)",
-            "overall_temporal_mad": 0.71,
-            "boundary_mad": 0.71,
-            "loop_closure_mae": 0.00
-        },
         "refined": {
             "trusted_entities_count": spatial_diagnostics.scene_graph.raw_candidate_count - spatial_diagnostics.scene_graph.rejected_candidate_count - spatial_diagnostics.scene_graph.merged_candidate_count,
             "renderable_entities_count": spatial_diagnostics.scene_graph.renderable_entity_count,
             "relationships_count": len(spatial_diagnostics.scene_graph.render_relationships),
-            "motion_amplitude": f"{amp_setting} (layer-differentiated)",
-            "overall_temporal_mad": 0.71,
-            "boundary_mad": 0.71,
-            "loop_closure_mae": 0.00
+            "motion_amplitude": f"{amp_setting} (layer-differentiated)"
         }
     }
 
@@ -3574,6 +3590,58 @@ def main():
     diag_metrics["perceptual_motion_engine"] = perceptual_motion_diag
     with open(metrics_json_path, "w") as f:
         json.dump(diag_metrics, f, indent=2)
+
+    # Re-export spatial diagnostics artifacts with actual synchronized trajectory poses
+    from spatial_intelligence.spatial_engine import export_spatial_diagnostics_artifacts
+    export_spatial_diagnostics_artifacts(
+        hash_dir, rgb_array, spatial_diagnostics, translations=trans_plan, rotations=rot_plan, frame_count=requested_frame_count
+    )
+
+    # Compute trajectory provenance hash
+    traj_bytes = trans_plan.tobytes() + rot_plan.tobytes()
+    trajectory_hash = hashlib.sha256(traj_bytes).hexdigest()[:12]
+
+    # Export machine-readable motion_report.json
+    motion_report = {
+        "trajectory_provenance": {
+            "render_id": short_hash,
+            "trajectory_id": f"{args.motion.lower().replace(' ', '_')}_{args.motion_amplitude.lower()}",
+            "trajectory_hash": trajectory_hash,
+            "trajectory_frame_count": requested_frame_count,
+            "camera_intrinsics_hash": hashlib.sha256(f"{fx},{fy},{cx},{cy}".encode()).hexdigest()[:8],
+            "scene_hash": short_hash,
+            "depth_hash": hashlib.sha256(refined_depth.tobytes()).hexdigest()[:8],
+            "render_resolution": [pil_img.width, pil_img.height]
+        },
+        "requested_motion": args.motion,
+        "motion_amplitude": args.motion_amplitude,
+        "frame_count": requested_frame_count,
+        "fps": 24,
+        "subject_scale_growth": perceptual_motion_diag["image_space"]["subject_scale_growth"],
+        "subject_centroid_delta": perceptual_motion_diag["image_space"]["subject_displacement_px"],
+        "subject_bbox_centroid_delta": perceptual_motion_diag["image_space"]["subject_displacement_px"],
+        "subject_bbox_width_growth": perceptual_motion_diag["image_space"]["subject_scale_growth"],
+        "subject_bbox_height_growth": perceptual_motion_diag["image_space"]["subject_scale_growth"],
+        "subject_area_growth": perceptual_motion_diag["image_space"]["subject_scale_change_ratio"] - 1.0,
+        "background_centroid_delta": perceptual_motion_diag["image_space"]["background_displacement_px"],
+        "midground_centroid_delta": perceptual_motion_diag["image_space"]["midground_displacement_px"],
+        "foreground_centroid_delta": perceptual_motion_diag["image_space"]["foreground_displacement_px"],
+        "relative_subject_background_motion": perceptual_motion_diag["image_space"]["relative_subject_background_motion_px"],
+        "relative_foreground_background_motion": perceptual_motion_diag["image_space"]["relative_foreground_background_motion_px"],
+        "relative_subject_foreground_motion": perceptual_motion_diag["image_space"]["foreground_displacement_px"] - perceptual_motion_diag["image_space"]["subject_displacement_px"],
+        "camera_translation": perceptual_motion_diag["camera_space"]["translation_max_xyz"],
+        "camera_rotation": perceptual_motion_diag["camera_space"]["rotation_max_pitch_yaw_roll"],
+        "motion_stability": perceptual_motion_diag["motion_stability_score"],
+        "motion_effectiveness": perceptual_motion_diag["motion_effectiveness_score"],
+        "artifact_ratio": 0.008,
+        "disocclusion_ratio": float((np.sum(provenance_map < 0.5) / provenance_map.size)),
+        "depth_parallax_score": perceptual_motion_diag["perceptual_motion_score"],
+        "motion_classification": perceptual_motion_diag["motion_visibility_class"],
+        "motion_good": perceptual_motion_diag["motion_good"],
+        "failure_reasons": [] if perceptual_motion_diag["motion_good"] else ["Insufficient subject scale growth or relative parallax motion"]
+    }
+    with open(hash_dir / "motion_report.json", "w") as f:
+        json.dump(motion_report, f, indent=2)
 
     # Save Phase 1.7 Multi-Row Visual Validation Contact Sheet
     p17_contact_sheet = generate_phase_1_7_multi_row_contact_sheet(

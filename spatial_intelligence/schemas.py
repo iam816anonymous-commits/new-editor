@@ -322,6 +322,21 @@ class RenderingConfig:
 
 
 @dataclass
+class RenderSpace:
+    """Centralized geometry contract enforcing canonical coordinate system and resolution bounds."""
+    width: int = 1536
+    height: int = 1024
+
+    @property
+    def shape(self) -> Tuple[int, int]:
+        return (self.height, self.width)
+
+    def validate_bounds(self, ymin: int, xmin: int, ymax: int, xmax: int) -> None:
+        if not (0 <= xmin <= xmax < self.width and 0 <= ymin <= ymax < self.height):
+            raise ValueError(f"Geometry contract violation: bbox ({ymin}, {xmin}, {ymax}, {xmax}) exceeds RenderSpace ({self.height}, {self.width})")
+
+
+@dataclass
 class SpatialDiagnostics:
     """Complete exportable diagnostic payload for spatial intelligence subsystem."""
     scene_graph: SceneGraph

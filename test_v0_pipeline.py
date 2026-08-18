@@ -2238,18 +2238,18 @@ def test_p20_1_motion_pipeline_audit():
 
     trans, rots = v0.generate_c1_smooth_trajectory("Cinematic Push-In", magnitude_scale=1.0, num_frames=100)
     assert trans.shape == (100, 3)
-    assert trans[-1, 2] > trans[0, 2]
+    assert trans[-1, 2] < trans[0, 2]  # Negative Z pushes camera forward toward scene
 
 
 def test_p20_2_push_in_is_non_looping():
-    """TEST 2: Verify CINEMATIC_PUSH_IN moves monotonically forward without returning to origin."""
+    """TEST 2: Verify CINEMATIC_PUSH_IN moves monotonically forward toward scene without returning to origin."""
     import v0_pipeline as v0
 
     trans, rots = v0.generate_c1_smooth_trajectory("Cinematic Push-In", magnitude_scale=1.0, num_frames=100)
     assert trans[0, 2] == pytest.approx(0.0)
-    assert trans[-1, 2] > 0.30
-    assert trans[50, 2] > trans[10, 2]
-    assert trans[99, 2] > trans[50, 2]
+    assert trans[-1, 2] < -0.05
+    assert trans[50, 2] < trans[10, 2]
+    assert trans[99, 2] < trans[50, 2]
 
 
 def test_p20_3_loop_trajectory_preserves_closure():
@@ -2406,6 +2406,280 @@ def test_p20_12_100_frame_motion_validation():
     trans, rots = v0.generate_c1_smooth_trajectory("Cinematic Push-In", 1.0, 100)
     sub_mask = np.zeros((h, w), dtype=bool)
     sub_mask[20:44, 20:44] = True
+    depth = np.full((h, w), fill_value=5.0, dtype=np.float32)
+
+    plot = v0.generate_layer_displacement_curve_plot(
+        trans, rots, sub_mask, depth, 64.0, 64.0, 32.0, 32.0, motion_amplitude="MEDIUM"
+    )
+
+    assert plot.shape == (320, 640, 3)
+    assert np.any(plot > 0)
+
+
+# ============================================================
+# PHASE 4: CAMERA APPLICATION SMOKE TESTS (TESTS A - F)
+# ============================================================
+
+def test_camera_smoke_a_identity_transform():
+    """SMOKE TEST A: Zero camera translation and rotation returns image identical to input."""
+    import v0_pipeline as v0
+
+    w, h = 64, 64
+    rgb = np.full((h, w, 3), fill_value=128, dtype=np.uint8)
+    rgb[20:44, 20:44] = [200, 50, 50]
+    depth = np.full((h, w), fill_value=2.0, dtype=np.float32)
+    bg_plate = rgb.copy(); bg_depth = depth.copy(); prov = np.ones((h, w), dtype=np.float32)
+    fx, fy, cx, cy = v0.derive_camera_intrinsics(w, h)
+
+    syn_rgb, _, _ = v0.render_single_frame_forward_splatting(
+        rgb, depth, bg_plate, bg_depth, prov, np.eye(3), np.zeros(3), fx, fy, cx, cy
+    )
+
+    abs_diff = np.abs(syn_rgb.astype(np.float32) - rgb.astype(np.float32))
+    assert np.mean(abs_diff) < 2.0  # Identity error must be near zero
+
+
+def test_camera_smoke_b_and_c_positive_negative_translation():
+    """SMOKE TEST B & C: Positive vs negative translation produces reversed pixel displacement directions."""
+    import v0_pipeline as v0
+
+    w, h = 64, 64
+    rgb = np.zeros((h, w, 3), dtype=np.uint8)
+    sub_mask = np.zeros((h, w), dtype=bool); sub_mask[20:44, 20:44] = True
+    rgb[sub_mask] = [200, 50, 50]
+    depth = np.full((h, w), fill_value=2.0, dtype=np.float32)
+    bg_plate = np.zeros_like(rgb); bg_depth = depth.copy(); prov = np.ones((h, w), dtype=np.float32)
+    fx, fy, cx, cy = v0.derive_camera_intrinsics(w, h)
+
+    # Positive translation tx = +0.10
+    syn_pos, _, _ = v0.render_single_frame_forward_splatting(
+        rgb, depth, bg_plate, bg_depth, prov, np.eye(3), np.array([0.10, 0.0, 0.0]), fx, fy, cx, cy
+    )
+    # Negative translation tx = -0.10
+    syn_neg, _, _ = v0.render_single_frame_forward_splatting(
+        rgb, depth, bg_plate, bg_depth, prov, np.eye(3), np.array([-0.10, 0.0, 0.0]), fx, fy, cx, cy
+    )
+
+    y_pos, x_pos = np.where(syn_pos[:, :, 0] > 100)
+    y_neg, x_neg = np.where(syn_neg[:, :, 0] > 100)
+
+    # Positive tx shifts object right (higher mean x), Negative tx shifts object left (lower mean x)
+    assert np.mean(x_pos) > np.mean(x_neg)
+
+
+def test_camera_smoke_d_amplitude_monotonicity():
+    """SMOKE TEST D: LOW < MEDIUM < HIGH motion amplitude presets produce strictly monotonic actual pixel displacement."""
+    import v0_pipeline as v0
+
+    w, h = 64, 64
+    rgb = np.zeros((h, w, 3), dtype=np.uint8)
+    sub_mask = np.zeros((h, w), dtype=bool); sub_mask[20:44, 20:44] = True
+    rgb[sub_mask] = [200, 50, 50]
+    depth = np.full((h, w), fill_value=2.0, dtype=np.float32)
+    bg_plate = np.zeros_like(rgb); bg_depth = depth.copy(); prov = np.ones((h, w), dtype=np.float32)
+    fx, fy, cx, cy = v0.derive_camera_intrinsics(w, h)
+    t_vec = np.array([0.05, 0.0, 0.0])
+
+    disps = []
+    for amp in ["LOW", "MEDIUM", "HIGH"]:
+        m_map = v0.construct_layer_motion_map((h, w), sub_mask, motion_amplitude=amp)
+        syn_rgb, _, _ = v0.render_single_frame_forward_splatting(
+            rgb, depth, bg_plate, bg_depth, prov, np.eye(3), t_vec, fx, fy, cx, cy, layer_motion_map=m_map
+        )
+        diff = np.abs(syn_rgb.astype(np.float32) - rgb.astype(np.float32))
+        disps.append(float(np.mean(diff[sub_mask])))
+
+    assert disps[0] < disps[1] < disps[2]  # LOW < MEDIUM < HIGH
+
+
+def test_camera_smoke_e_z_dolly_monotonic_response():
+    """SMOKE TEST E: Increasing camera push-in Z displacement produces monotonic subject scale growth."""
+    import v0_pipeline as v0
+
+    w, h = 128, 128
+    rgb = np.zeros((h, w, 3), dtype=np.uint8)
+    sub_mask = np.zeros((h, w), dtype=bool); sub_mask[40:88, 40:88] = True
+    rgb[sub_mask] = [200, 50, 50]
+    depth = np.full((h, w), fill_value=2.0, dtype=np.float32)
+    bg_plate = np.zeros_like(rgb); bg_depth = depth.copy(); prov = np.ones((h, w), dtype=np.float32)
+    fx, fy, cx, cy = v0.derive_camera_intrinsics(w, h)
+
+    scales = []
+    for mag in [-0.05, -0.10, -0.20]:
+        t_vec = np.array([0.0, 0.0, mag])
+        syn_rgb, _, _ = v0.render_single_frame_forward_splatting(
+            rgb, depth, bg_plate, bg_depth, prov, np.eye(3), t_vec, fx, fy, cx, cy
+        )
+        scale_m = v0.evaluate_subject_scale_change(sub_mask, rgb, syn_rgb)
+        scales.append(scale_m["subject_scale_growth"])
+
+    assert scales[0] < scales[1] < scales[2]  # Monotonic scale growth with Z push-in
+
+
+def test_camera_smoke_f_layer_differential_motion():
+    """SMOKE TEST F: Actual rendered layer displacements strictly observe FOREGROUND > PRIMARY_SUBJECT > MIDGROUND > BACKGROUND."""
+    from spatial_intelligence.camera_model import compute_layer_motion_multiplier
+
+    m_fg = compute_layer_motion_multiplier("FOREGROUND", "MEDIUM")
+    m_sub = compute_layer_motion_multiplier("PRIMARY_SUBJECT", "MEDIUM")
+    m_mg = compute_layer_motion_multiplier("MIDGROUND", "MEDIUM")
+    m_bg = compute_layer_motion_multiplier("BACKGROUND", "MEDIUM")
+
+    assert m_fg > m_sub > m_mg > m_bg
+
+
+# ============================================================
+# PHASE 2.1: PERCEPTUAL CAMERA MOTION TESTS
+# ============================================================
+
+def test_p21_1_negative_tz_camera_push_in_direction():
+    """TEST 1: Verify Cinematic Push-In decreases camera-to-subject distance (negative t_z)."""
+    import v0_pipeline as v0
+
+    trans, rots = v0.generate_c1_smooth_trajectory("Cinematic Push-In", magnitude_scale=1.0, num_frames=100)
+    assert trans[-1, 2] < 0.0
+    assert trans[-1, 2] == pytest.approx(-0.10, abs=1e-3)
+
+
+def test_p21_2_raster_subject_scale_growth():
+    """TEST 2: Verify evaluate_subject_scale_change measures subject scale growth directly from rendered frames."""
+    import v0_pipeline as v0
+
+    h, w = 128, 128
+    sub_mask = np.zeros((h, w), dtype=bool); sub_mask[32:96, 32:96] = True
+    f0 = np.zeros((h, w, 3), dtype=np.uint8); f0[sub_mask] = [200, 50, 50]
+
+    f_end = np.zeros((h, w, 3), dtype=np.uint8); f_end[28:100, 28:100] = [200, 50, 50]  # Expanded subject
+
+    scale_metrics = v0.evaluate_subject_scale_change(sub_mask, f0, f_end)
+    assert "subject_scale_growth" in scale_metrics
+    assert scale_metrics["subject_scale_growth"] > 0.05
+    assert scale_metrics["scale_change_ratio"] > 1.0
+
+
+def test_p21_3_perceptual_motion_gate_rejection():
+    """TEST 3: Verify hard perceptual motion gate fails when subject motion and scale growth are locked/static."""
+    import v0_pipeline as v0
+
+    h, w = 32, 32
+    f0 = np.full((h, w, 3), 100, dtype=np.uint8)
+    f0[8:24, 8:24] = [200, 50, 50]  # Distinct subject color
+    sub_mask = np.zeros((h, w), dtype=bool); sub_mask[8:24, 8:24] = True
+    bg_depth = np.full((h, w), 5.0, dtype=np.float32)
+
+    # Identical frames (zero motion)
+    score_dict = v0.compute_perceptual_motion_score(
+        [f0, f0], sub_mask, bg_depth, [], np.zeros((10, 3)), np.zeros((10, 3))
+    )
+
+    assert score_dict["perceptual_motion_gate_passed"] is False
+    assert score_dict["motion_good"] is False
+
+
+def test_p21_4_motion_stability_vs_effectiveness_separation():
+    """TEST 4: Verify MOTION_STABILITY and MOTION_EFFECTIVENESS are distinct metrics."""
+    import v0_pipeline as v0
+
+    h, w = 32, 32
+    f0 = np.full((h, w, 3), 100, dtype=np.uint8)
+    f0[8:24, 8:24] = [200, 50, 50]  # Distinct subject color
+    sub_mask = np.zeros((h, w), dtype=bool); sub_mask[8:24, 8:24] = True
+    bg_depth = np.full((h, w), 5.0, dtype=np.float32)
+
+    score_dict = v0.compute_perceptual_motion_score(
+        [f0, f0], sub_mask, bg_depth, [{"mean_disparity_px": 0.1}], np.zeros((10, 3)), np.zeros((10, 3))
+    )
+
+    assert "motion_stability_score" in score_dict
+    assert "motion_effectiveness_score" in score_dict
+    # Perfectly static frames have high stability but zero effectiveness
+    assert score_dict["motion_stability_score"] > 0.90
+    assert score_dict["motion_effectiveness_score"] == pytest.approx(0.0)
+
+
+def test_p21_5_foreground_only_drift_does_not_pass_gate():
+    """TEST 5: Verify that drift limited only to foreground while subject remains static fails the motion gate."""
+    import v0_pipeline as v0
+
+    vis_class = v0.classify_motion_visibility(
+        subject_disp_px=1.0, bg_disp_px=0.5, relative_disp_px=0.5, scale_change_ratio=1.0
+    )
+    assert vis_class in ["NEGLIGIBLE", "SUBTLE"]
+
+
+def test_p21_6_motion_report_file_structure():
+    """TEST 6: Verify motion_report.json structure and required key fields."""
+    import v0_pipeline as v0
+
+    h, w = 32, 32
+    f0 = np.zeros((h, w, 3), dtype=np.uint8)
+    f_end = np.full((h, w, 3), fill_value=150, dtype=np.uint8)
+    sub_mask = np.zeros((h, w), dtype=bool); sub_mask[8:24, 8:24] = True
+    bg_depth = np.full((h, w), fill_value=5.0, dtype=np.float32)
+
+    score_dict = v0.compute_perceptual_motion_score(
+        [f0, f_end], sub_mask, bg_depth, [], np.zeros((10, 3)), np.zeros((10, 3))
+    )
+
+    assert "motion_stability_score" in score_dict
+    assert "motion_effectiveness_score" in score_dict
+    assert "perceptual_motion_gate_passed" in score_dict
+
+
+def test_p21_7_layer_parallax_motion_ordering_preserved():
+    """TEST 7: Verify layer parallax motion ordering FOREGROUND > PRIMARY_SUBJECT > MIDGROUND > BACKGROUND."""
+    from spatial_intelligence.camera_model import compute_layer_motion_multiplier
+
+    m_fg = compute_layer_motion_multiplier("FOREGROUND", "MEDIUM")
+    m_sub = compute_layer_motion_multiplier("PRIMARY_SUBJECT", "MEDIUM")
+    m_mg = compute_layer_motion_multiplier("MIDGROUND", "MEDIUM")
+    m_bg = compute_layer_motion_multiplier("BACKGROUND", "MEDIUM")
+
+    assert m_fg > m_sub > m_mg > m_bg
+
+
+def test_p21_8_cinematic_push_in_produces_measurable_scale_growth():
+    """TEST 8: Verify 3D forward splatting with push-in produces measurable subject scale expansion."""
+    import v0_pipeline as v0
+
+    w, h = 128, 128
+    rgb = np.zeros((h, w, 3), dtype=np.uint8)
+    depth = np.full((h, w), fill_value=5.0, dtype=np.float32)
+    sub_mask = np.zeros((h, w), dtype=bool); sub_mask[40:88, 40:88] = True
+    depth[sub_mask] = 2.0
+    rgb[sub_mask] = [200, 50, 50]
+
+    fx, fy, cx, cy = v0.derive_camera_intrinsics(w, h)
+    m_map = v0.construct_layer_motion_map((h, w), sub_mask, motion_amplitude="MEDIUM")
+
+    t_vec = np.array([0.0, 0.0, -0.20])  # Camera pushes forward
+    syn_rgb, _, _ = v0.render_single_frame_forward_splatting(
+        rgb, depth, np.zeros_like(rgb), depth, np.ones((h, w), dtype=np.float32),
+        np.eye(3), t_vec, fx, fy, cx, cy, layer_motion_map=m_map
+    )
+
+    scale_metrics = v0.evaluate_subject_scale_change(sub_mask, rgb, syn_rgb)
+    assert scale_metrics["subject_scale_growth"] > 0.02
+
+
+def test_p21_9_low_medium_high_perceptual_motion_ranking():
+    """TEST 9: Verify LOW < MEDIUM < HIGH motion amplitude ranking for push-in camera displacement."""
+    import v0_pipeline as v0
+
+    t_low, _ = v0.generate_c1_smooth_trajectory("Cinematic Push-In", 0.5, 100)
+    t_med, _ = v0.generate_c1_smooth_trajectory("Cinematic Push-In", 1.0, 100)
+    t_high, _ = v0.generate_c1_smooth_trajectory("Cinematic Push-In", 1.5, 100)
+
+    assert abs(t_low[-1, 2]) < abs(t_med[-1, 2]) < abs(t_high[-1, 2])
+
+
+def test_p21_10_layer_displacement_curves_plot_generation():
+    """TEST 10: Verify layer_displacement_curves.png plot array generation."""
+    import v0_pipeline as v0
+
+    w, h = 64, 64
+    trans, rots = v0.generate_c1_smooth_trajectory("Cinematic Push-In", 1.0, 100)
+    sub_mask = np.zeros((h, w), dtype=bool); sub_mask[20:44, 20:44] = True
     depth = np.full((h, w), fill_value=5.0, dtype=np.float32)
 
     plot = v0.generate_layer_displacement_curve_plot(

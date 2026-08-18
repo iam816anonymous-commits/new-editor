@@ -194,6 +194,8 @@ def export_spatial_diagnostics_artifacts(
     hash_dir: Path,
     original_rgb: np.ndarray,
     diagnostics: SpatialDiagnostics,
+    translations: Optional[np.ndarray] = None,
+    rotations: Optional[np.ndarray] = None,
     frame_count: int = 48
 ) -> None:
     """Exports all spatial diagnostics artifacts and JSON files to hash_dir."""
@@ -236,10 +238,13 @@ def export_spatial_diagnostics_artifacts(
     entities_vis = generate_consolidated_entities_visualization(original_rgb, list(diagnostics.scene_graph.entities.values()))
     Image.fromarray(entities_vis).save(hash_dir / "consolidated_entities.png")
 
-    # 6. camera_path.json
-    dummy_t = np.zeros((frame_count, 3))
-    dummy_r = np.zeros((frame_count, 3))
-    cam_dict = export_camera_path_dict(diagnostics.camera_model, dummy_t, dummy_r)
+    # 6. camera_path.json (synchronizes actual camera trajectory poses)
+    if translations is None:
+        translations = np.zeros((frame_count, 3))
+    if rotations is None:
+        rotations = np.zeros((frame_count, 3))
+
+    cam_dict = export_camera_path_dict(diagnostics.camera_model, translations, rotations)
     with open(hash_dir / "camera_path.json", "w") as f:
         json.dump(cam_dict, f, indent=2)
 
