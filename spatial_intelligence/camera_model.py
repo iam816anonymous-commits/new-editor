@@ -46,37 +46,40 @@ def compute_normalized_depth(
 
 def compute_layer_motion_multiplier(layer_role_str: str, motion_amplitude: str = "MEDIUM") -> float:
     """
-    Returns layer parallax motion multipliers for depth-aware 2.5D perspective projection.
-    Strictly enforces layer parallax motion ordering: FOREGROUND > PRIMARY_SUBJECT > MIDGROUND > BACKGROUND.
+    Returns depth-weighted motion multipliers for cinematic 2.5D view synthesis.
+    Philosophy: The primary subject remains dignified and stable (small displacement & scale growth),
+    while the environment (background & foreground) provides strong cinematic camera travel/parallax.
+
+    Layer Hierarchy: FOREGROUND (2.80x) > MIDGROUND (1.50x) > BACKGROUND (1.00x) > PRIMARY_SUBJECT (0.50x).
 
     Explicit Amplitude Tiers:
-    LOW (1.0x base):
-      BACKGROUND: 0.05x, MIDGROUND: 0.80x, PRIMARY_SUBJECT: 2.50x, FOREGROUND: 4.00x
-    MEDIUM (2.2x base):
-      BACKGROUND: 0.11x, MIDGROUND: 1.76x, PRIMARY_SUBJECT: 5.50x, FOREGROUND: 8.80x
-    HIGH (4.0x base):
-      BACKGROUND: 0.20x, MIDGROUND: 3.20x, PRIMARY_SUBJECT: 10.00x, FOREGROUND: 16.00x
+    LOW (0.6x base):
+      BACKGROUND: 0.60x, MIDGROUND: 0.90x, PRIMARY_SUBJECT: 0.30x, FOREGROUND: 1.68x
+    MEDIUM (1.2x base):
+      BACKGROUND: 1.20x, MIDGROUND: 1.80x, PRIMARY_SUBJECT: 0.60x, FOREGROUND: 3.36x
+    HIGH (2.5x base):
+      BACKGROUND: 2.50x, MIDGROUND: 3.75x, PRIMARY_SUBJECT: 1.25x, FOREGROUND: 7.00x
     """
     role_upper = layer_role_str.upper()
     amp_upper = motion_amplitude.upper()
 
     base_multipliers = {
-        "BACKGROUND": 0.05,
-        "MIDGROUND": 0.80,
-        "PRIMARY_SUBJECT": 2.50,
-        "PRIMARY_SUBJECT_PART": 2.50,
-        "FOREGROUND": 4.00,
-        "ANALYSIS_ONLY": 0.02
+        "BACKGROUND": 1.00,
+        "MIDGROUND": 1.50,
+        "PRIMARY_SUBJECT": 0.50,
+        "PRIMARY_SUBJECT_PART": 0.50,
+        "FOREGROUND": 2.80,
+        "ANALYSIS_ONLY": 0.10
     }
 
     tier_scales = {
-        "LOW": 1.0,
-        "MEDIUM": 2.2,
-        "HIGH": 4.0
+        "LOW": 0.6,
+        "MEDIUM": 1.2,
+        "HIGH": 2.5
     }
-    scale = tier_scales.get(amp_upper, 2.2)
+    scale = tier_scales.get(amp_upper, 1.2)
 
-    base = base_multipliers.get(role_upper, 0.80)
+    base = base_multipliers.get(role_upper, 1.00)
     return round(base * scale, 4)
 
 

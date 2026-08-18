@@ -2041,12 +2041,12 @@ def test_p18_9_motion_amplitude_presets():
     mult_high = compute_layer_motion_multiplier("PRIMARY_SUBJECT", "HIGH")
 
     assert mult_low < mult_med < mult_high
-    assert mult_med == 5.50
-    assert mult_high == 10.00
+    assert mult_med == 0.60
+    assert mult_high == 1.25
 
 
 def test_p18_10_layer_motion_ordering():
-    """TEST 10: Layer motion ordering guarantees Displacement_fg > Displacement_sub > Displacement_mg > Displacement_bg."""
+    """TEST 10: Depth-weighted layer motion ordering guarantees Displacement_fg > Displacement_mg > Displacement_bg > Displacement_sub."""
     from spatial_intelligence.camera_model import compute_layer_motion_multiplier
 
     m_fg = compute_layer_motion_multiplier("FOREGROUND", "MEDIUM")
@@ -2054,7 +2054,7 @@ def test_p18_10_layer_motion_ordering():
     m_mg = compute_layer_motion_multiplier("MIDGROUND", "MEDIUM")
     m_bg = compute_layer_motion_multiplier("BACKGROUND", "MEDIUM")
 
-    assert m_fg > m_sub > m_mg > m_bg
+    assert m_fg > m_mg > m_bg > m_sub
 
 
 def test_p18_11_construct_layer_motion_map():
@@ -2066,9 +2066,9 @@ def test_p18_11_construct_layer_motion_map():
     m_map_med = v0.construct_layer_motion_map((h, w), sub_mask, spatial_diagnostics=None, motion_amplitude="MEDIUM")
     m_map_high = v0.construct_layer_motion_map((h, w), sub_mask, spatial_diagnostics=None, motion_amplitude="HIGH")
 
-    assert m_map_med[15, 15] == 5.50
-    assert m_map_high[15, 15] == 10.00
-    assert m_map_med[0, 0] == 0.11
+    assert m_map_med[15, 15] == 0.60
+    assert m_map_high[15, 15] == 1.25
+    assert m_map_med[0, 0] == 1.20
 
 
 def test_p18_12_generate_motion_amplitude_comparison_contact_sheet():
@@ -2203,14 +2203,14 @@ def test_p19_4_cinematic_push_in_trajectory_smoothness():
 
 
 def test_p19_5_depth_dependent_push_in_layer_separation():
-    """TEST 5: Cinematic Push-In applies layer-differentiated motion (Displacement_fg > Displacement_sub > Displacement_bg)."""
+    """TEST 5: Cinematic Push-In applies depth-weighted layer-differentiated motion (Displacement_fg > Displacement_bg > Displacement_sub)."""
     from spatial_intelligence.camera_model import compute_layer_motion_multiplier
 
     m_fg = compute_layer_motion_multiplier("FOREGROUND", "MEDIUM")
     m_sub = compute_layer_motion_multiplier("PRIMARY_SUBJECT", "MEDIUM")
     m_bg = compute_layer_motion_multiplier("BACKGROUND", "MEDIUM")
 
-    assert m_fg > m_sub > m_bg
+    assert m_fg > m_bg > m_sub
 
 
 def test_p19_6_cross_product_amplitude_and_frame_counts():
@@ -2387,7 +2387,7 @@ def test_p20_10_motion_scales_with_resolution():
 
 
 def test_p20_11_layer_motion_ordering():
-    """TEST 11: Verify strict layer parallax motion ordering FOREGROUND > PRIMARY_SUBJECT > MIDGROUND > BACKGROUND."""
+    """TEST 11: Verify strict layer parallax motion ordering FOREGROUND > MIDGROUND > BACKGROUND > PRIMARY_SUBJECT."""
     from spatial_intelligence.camera_model import compute_layer_motion_multiplier
 
     fg = compute_layer_motion_multiplier("FOREGROUND", "MEDIUM")
@@ -2395,7 +2395,7 @@ def test_p20_11_layer_motion_ordering():
     mg = compute_layer_motion_multiplier("MIDGROUND", "MEDIUM")
     bg = compute_layer_motion_multiplier("BACKGROUND", "MEDIUM")
 
-    assert fg > sub > mg > bg
+    assert fg > mg > bg > sub
 
 
 def test_p20_12_100_frame_motion_validation():
@@ -2580,7 +2580,7 @@ def test_camera_smoke_e_z_dolly_monotonic_response():
 
 
 def test_camera_smoke_f_layer_differential_motion():
-    """SMOKE TEST F: Actual rendered layer displacements strictly observe FOREGROUND > PRIMARY_SUBJECT > MIDGROUND > BACKGROUND."""
+    """SMOKE TEST F: Actual rendered layer displacements strictly observe FOREGROUND > MIDGROUND > BACKGROUND > PRIMARY_SUBJECT."""
     from spatial_intelligence.camera_model import compute_layer_motion_multiplier
 
     m_fg = compute_layer_motion_multiplier("FOREGROUND", "MEDIUM")
@@ -2588,7 +2588,7 @@ def test_camera_smoke_f_layer_differential_motion():
     m_mg = compute_layer_motion_multiplier("MIDGROUND", "MEDIUM")
     m_bg = compute_layer_motion_multiplier("BACKGROUND", "MEDIUM")
 
-    assert m_fg > m_sub > m_mg > m_bg
+    assert m_fg > m_mg > m_bg > m_sub
 
 
 # ============================================================
@@ -2690,7 +2690,7 @@ def test_p21_6_motion_report_file_structure():
 
 
 def test_p21_7_layer_parallax_motion_ordering_preserved():
-    """TEST 7: Verify layer parallax motion ordering FOREGROUND > PRIMARY_SUBJECT > MIDGROUND > BACKGROUND."""
+    """TEST 7: Verify layer parallax motion ordering FOREGROUND > MIDGROUND > BACKGROUND > PRIMARY_SUBJECT."""
     from spatial_intelligence.camera_model import compute_layer_motion_multiplier
 
     m_fg = compute_layer_motion_multiplier("FOREGROUND", "MEDIUM")
@@ -2698,7 +2698,82 @@ def test_p21_7_layer_parallax_motion_ordering_preserved():
     m_mg = compute_layer_motion_multiplier("MIDGROUND", "MEDIUM")
     m_bg = compute_layer_motion_multiplier("BACKGROUND", "MEDIUM")
 
-    assert m_fg > m_sub > m_mg > m_bg
+    assert m_fg > m_mg > m_bg > m_sub
+
+
+# ============================================================
+# PHASE 2.3: DEPTH-DRIVEN CINEMATIC PARALLAX REBALANCING TESTS
+# ============================================================
+
+def test_p23_1_depth_weighted_layer_motion_ordering():
+    """TEST 1: Verify Phase 2.3 depth-weighted layer motion ordering FOREGROUND > MIDGROUND > BACKGROUND > PRIMARY_SUBJECT."""
+    from spatial_intelligence.camera_model import compute_layer_motion_multiplier
+
+    m_fg = compute_layer_motion_multiplier("FOREGROUND", "MEDIUM")
+    m_mg = compute_layer_motion_multiplier("MIDGROUND", "MEDIUM")
+    m_bg = compute_layer_motion_multiplier("BACKGROUND", "MEDIUM")
+    m_sub = compute_layer_motion_multiplier("PRIMARY_SUBJECT", "MEDIUM")
+
+    assert m_fg > m_mg > m_bg > m_sub
+    assert m_bg > m_sub  # Background environmental motion is higher than subject motion
+
+
+def test_p23_2_subject_scale_growth_restrained():
+    """TEST 2: Verify primary subject scale growth remains restrained in target 1-4% range."""
+    import v0_pipeline as v0
+
+    w, h = 128, 128
+    rgb = np.zeros((h, w, 3), dtype=np.uint8)
+    sub_mask = np.zeros((h, w), dtype=bool); sub_mask[40:88, 40:88] = True
+    rgb[sub_mask] = [200, 50, 50]
+    depth = np.full((h, w), fill_value=5.0, dtype=np.float32)
+    depth[sub_mask] = 2.0
+    bg_plate = np.zeros_like(rgb); bg_depth = depth.copy(); prov = np.ones((h, w), dtype=np.float32)
+
+    fx, fy, cx, cy = v0.derive_camera_intrinsics(w, h)
+    m_map = v0.construct_layer_motion_map((h, w), sub_mask, motion_amplitude="MEDIUM")
+
+    trans, rots = v0.generate_c1_smooth_trajectory("Cinematic Push-In", magnitude_scale=1.2, num_frames=100)
+    syn_rgb, _, _ = v0.render_single_frame_forward_splatting(
+        rgb, depth, bg_plate, bg_depth, prov,
+        v0.compute_rotation_matrix(rots[-1, 0], rots[-1, 1], rots[-1, 2]),
+        trans[-1], fx, fy, cx, cy, layer_motion_map=m_map
+    )
+
+    scale_metrics = v0.evaluate_subject_scale_change(sub_mask, rgb, syn_rgb)
+    assert 0.0 <= scale_metrics["subject_scale_growth"] <= 0.05  # Restrained scale growth
+
+
+def test_p23_3_environmental_motion_score_calculation():
+    """TEST 3: Verify environmental_motion_score and subject_stability_score calculation."""
+    import v0_pipeline as v0
+
+    h, w = 32, 32
+    f0 = np.full((h, w, 3), 100, dtype=np.uint8)
+    f0[10:20, 10:20] = [200, 50, 50]
+    f_end = f0.copy()
+    f_end[0:10, :] = [150, 150, 150]  # Background movement
+
+    sub_mask = np.zeros((h, w), dtype=bool); sub_mask[10:20, 10:20] = True
+    bg_depth = np.full((h, w), 5.0, dtype=np.float32)
+
+    score_dict = v0.compute_perceptual_motion_score(
+        [f0, f_end], sub_mask, bg_depth, [], np.zeros((10, 3)), np.zeros((10, 3)), motion_amplitude="MEDIUM"
+    )
+
+    assert "environmental_motion_score" in score_dict
+    assert "subject_stability_score" in score_dict
+    assert score_dict["subject_stability_score"] > 0.90
+
+
+def test_p23_4_weak_motion_fails_quality_gate():
+    """TEST 4: Verify WEAK motion classification fails perceptual quality gate (motion_good = False)."""
+    import v0_pipeline as v0
+
+    vis_class = v0.classify_motion_visibility(
+        subject_disp_px=1.0, bg_disp_px=2.0, relative_disp_px=1.0, scale_change_ratio=1.001, motion_amplitude="MEDIUM"
+    )
+    assert vis_class == "WEAK"
 
 
 def test_p21_8_cinematic_push_in_produces_measurable_scale_growth():

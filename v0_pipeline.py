@@ -2090,29 +2090,30 @@ def classify_motion_visibility(
 ) -> str:
     """
     Classifies motion visibility into:
-    NEGLIGIBLE, SUBTLE, VISIBLE, CINEMATIC, EXCESSIVE, UNSAFE
-    Enforces perceptual motion floors for MEDIUM and HIGH amplitude presets:
-    - MEDIUM target: subject scale growth >= 8% (scale_ratio >= 1.08) OR relative_disp_px >= 15px.
-    - HIGH target: subject scale growth >= 12% (scale_ratio >= 1.12) OR relative_disp_px >= 25px.
+    NEGLIGIBLE, SUBTLE, VISIBLE, CINEMATIC, EXCESSIVE, UNSAFE, WEAK
+    Phase 2.3 Environmental Motion Philosophy:
+    - Replaces subject scale growth floors with Environmental Motion & Background Parallax Floors.
+    - MEDIUM target: bg_disp_px >= 10px OR relative bg/subject separation >= 5px.
+    - HIGH target: bg_disp_px >= 18px OR relative bg/subject separation >= 10px.
     """
     if edge_artifact_ratio > 0.08:
         return "UNSAFE"
 
     amp_upper = motion_amplitude.upper()
-    scale_growth = (scale_change_ratio ** 0.5) - 1.0 if scale_change_ratio > 0 else 0.0
+    rel_bg_sub = abs(bg_disp_px - subject_disp_px)
 
-    if amp_upper == "MEDIUM" and (scale_growth < 0.05 and relative_disp_px < 10.0):
+    if amp_upper == "MEDIUM" and (bg_disp_px < 8.0 and rel_bg_sub < 3.0):
         return "WEAK"
-    elif amp_upper == "HIGH" and (scale_growth < 0.08 and relative_disp_px < 18.0):
+    elif amp_upper == "HIGH" and (bg_disp_px < 15.0 and rel_bg_sub < 6.0):
         return "WEAK"
 
-    if subject_disp_px < 3.0 and abs(scale_change_ratio - 1.0) < 0.005:
+    if bg_disp_px < 2.0 and subject_disp_px < 2.0:
         return "NEGLIGIBLE"
-    elif subject_disp_px < 8.0:
+    elif bg_disp_px < 6.0:
         return "SUBTLE"
-    elif subject_disp_px < 18.0:
+    elif bg_disp_px < 15.0:
         return "VISIBLE"
-    elif subject_disp_px < 45.0:
+    elif bg_disp_px < 50.0:
         return "CINEMATIC"
     else:
         return "EXCESSIVE"
@@ -2189,12 +2190,15 @@ def compute_perceptual_motion_score(
     background_depth: np.ndarray,
     per_frame_metrics: list,
     camera_translations: np.ndarray,
-    camera_rotations: np.ndarray
+    camera_rotations: np.ndarray,
+    motion_amplitude: str = "MEDIUM"
 ) -> Dict[str, Any]:
     """
-    Calculates first-class perceptual_motion_score and motion effectiveness gate from actual rendered frames.
-    Reports both Camera Space and Image Space parameters and classifies motion visibility.
-    Enforces Hard Acceptance Gate failing renders where subject motion or scale growth is locked or static.
+    Calculates environmental motion scores and subject stability scores from actual rendered frames.
+    Phase 2.3 Environmental Motion Philosophy:
+    - Primary subject remains dignified & stable (subject_stability_score near 1.0).
+    - Environmental layers (background & foreground) supply strong cinematic camera travel (environmental_motion_score).
+    - Fails render gate if motion_visibility_class is WEAK, NEGLIGIBLE, or UNSAFE.
     """
     f0 = rendered_frames[0]
     f_last = rendered_frames[-1]
@@ -2209,33 +2213,35 @@ def compute_perceptual_motion_score(
 
     bg_disp_px = float(np.mean(mean_diff[bg_mask]))
     sub_disp_px = float(np.mean(mean_diff[subject_mask]))
-    fg_disp_px = sub_disp_px * 1.5
+    fg_disp_px = sub_disp_px * 2.8
     mg_disp_px = (bg_disp_px + sub_disp_px) / 2.0
 
-    rel_sub_bg_px = float(sub_disp_px - bg_disp_px)
+    rel_bg_sub_px = float(abs(bg_disp_px - sub_disp_px))
     rel_fg_bg_px = float(fg_disp_px - bg_disp_px)
 
     scale_metrics = evaluate_subject_scale_change(subject_mask, f0, f_last)
     scale_ratio = scale_metrics["scale_change_ratio"]
     scale_growth = scale_metrics["subject_scale_growth"]
 
-    vis_class = classify_motion_visibility(sub_disp_px, bg_disp_px, rel_sub_bg_px, scale_ratio)
+    vis_class = classify_motion_visibility(
+        sub_disp_px, bg_disp_px, rel_bg_sub_px, scale_ratio, motion_amplitude=motion_amplitude
+    )
 
     cam_tx_max = float(np.max(np.abs(camera_translations[:, 0])))
     cam_ty_max = float(np.max(np.abs(camera_translations[:, 1])))
     cam_tz_max = float(np.max(np.abs(camera_translations[:, 2])))
 
-    # Motion effectiveness & stability metrics separation
+    # Separate Environmental Motion Score vs Subject Stability Score
+    environmental_motion_score = float(np.clip((bg_disp_px / 15.0) * 0.5 + (rel_bg_sub_px / 10.0) * 0.5, 0.0, 1.0))
+    subject_stability_score = float(1.0 - np.clip(abs(scale_growth) / 0.15, 0.0, 0.8))
+    cinematic_motion_score = float(0.6 * environmental_motion_score + 0.4 * subject_stability_score)
+
     temp_mads = [float(m["mean_disparity_px"]) for m in per_frame_metrics] if per_frame_metrics else [0.5]
     motion_stability_score = float(1.0 - np.clip(np.std(temp_mads) / 10.0, 0.0, 0.5))
-    motion_effectiveness_score = float(np.clip((sub_disp_px / 20.0) * 0.4 + (rel_sub_bg_px / 10.0) * 0.3 + (max(0.0, scale_growth) / 0.05) * 0.3, 0.0, 1.0))
 
     # Hard Perceptual Motion Acceptance Gate:
-    # Fail if subject scale growth is <0.005 and relative sub/bg displacement is <1.5px, or if only foreground moves
-    motion_gate_passed = bool(
-        (sub_disp_px >= 2.0 or scale_growth >= 0.008 or abs(rel_sub_bg_px) >= 1.2) and
-        vis_class not in ["NEGLIGIBLE", "UNSAFE"]
-    )
+    # Fail if motion_visibility_class is WEAK, NEGLIGIBLE, or UNSAFE
+    motion_gate_passed = bool(vis_class not in ["WEAK", "NEGLIGIBLE", "UNSAFE"])
 
     return {
         "camera_space": {
@@ -2251,16 +2257,19 @@ def compute_perceptual_motion_score(
             "midground_displacement_px": mg_disp_px,
             "subject_displacement_px": sub_disp_px,
             "foreground_displacement_px": fg_disp_px,
-            "relative_subject_background_motion_px": rel_sub_bg_px,
+            "relative_background_subject_motion_px": rel_bg_sub_px,
             "relative_foreground_background_motion_px": rel_fg_bg_px,
             "subject_scale_change_ratio": scale_ratio,
             "subject_scale_growth": scale_growth
         },
+        "environmental_motion_score": environmental_motion_score,
+        "subject_stability_score": subject_stability_score,
+        "cinematic_motion_score": cinematic_motion_score,
         "motion_stability_score": motion_stability_score,
-        "motion_effectiveness_score": motion_effectiveness_score,
-        "perceptual_motion_score": motion_effectiveness_score,
+        "motion_effectiveness_score": environmental_motion_score,
+        "perceptual_motion_score": cinematic_motion_score,
         "motion_visibility_class": vis_class,
-        "motion_ordering_valid": bool(fg_disp_px >= sub_disp_px >= mg_disp_px >= bg_disp_px),
+        "motion_ordering_valid": bool(fg_disp_px >= mg_disp_px >= bg_disp_px >= sub_disp_px),
         "perceptual_motion_gate_passed": motion_gate_passed,
         "motion_good": motion_gate_passed
     }
@@ -3645,9 +3654,11 @@ def main():
         "background_centroid_delta": perceptual_motion_diag["image_space"]["background_displacement_px"],
         "midground_centroid_delta": perceptual_motion_diag["image_space"]["midground_displacement_px"],
         "foreground_centroid_delta": perceptual_motion_diag["image_space"]["foreground_displacement_px"],
-        "relative_subject_background_motion": perceptual_motion_diag["image_space"]["relative_subject_background_motion_px"],
+        "relative_background_subject_motion": perceptual_motion_diag["image_space"]["relative_background_subject_motion_px"],
         "relative_foreground_background_motion": perceptual_motion_diag["image_space"]["relative_foreground_background_motion_px"],
-        "relative_subject_foreground_motion": perceptual_motion_diag["image_space"]["foreground_displacement_px"] - perceptual_motion_diag["image_space"]["subject_displacement_px"],
+        "environmental_motion_score": perceptual_motion_diag["environmental_motion_score"],
+        "subject_stability_score": perceptual_motion_diag["subject_stability_score"],
+        "cinematic_motion_score": perceptual_motion_diag["cinematic_motion_score"],
         "camera_translation": perceptual_motion_diag["camera_space"]["translation_max_xyz"],
         "camera_rotation": perceptual_motion_diag["camera_space"]["rotation_max_pitch_yaw_roll"],
         "motion_stability": perceptual_motion_diag["motion_stability_score"],
@@ -3657,7 +3668,7 @@ def main():
         "depth_parallax_score": perceptual_motion_diag["perceptual_motion_score"],
         "motion_classification": perceptual_motion_diag["motion_visibility_class"],
         "motion_good": perceptual_motion_diag["motion_good"],
-        "failure_reasons": [] if perceptual_motion_diag["motion_good"] else ["Insufficient subject scale growth or relative parallax motion"]
+        "failure_reasons": [] if perceptual_motion_diag["motion_good"] else ["Insufficient environmental parallax motion or weak trajectory response"]
     }
     with open(hash_dir / "motion_report.json", "w") as f:
         json.dump(motion_report, f, indent=2)
