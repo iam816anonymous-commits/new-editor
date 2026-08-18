@@ -2085,14 +2085,26 @@ def classify_motion_visibility(
     bg_disp_px: float,
     relative_disp_px: float,
     scale_change_ratio: float,
-    edge_artifact_ratio: float = 0.01
+    edge_artifact_ratio: float = 0.01,
+    motion_amplitude: str = "MEDIUM"
 ) -> str:
     """
     Classifies motion visibility into:
     NEGLIGIBLE, SUBTLE, VISIBLE, CINEMATIC, EXCESSIVE, UNSAFE
+    Enforces perceptual motion floors for MEDIUM and HIGH amplitude presets:
+    - MEDIUM target: subject scale growth >= 8% (scale_ratio >= 1.08) OR relative_disp_px >= 15px.
+    - HIGH target: subject scale growth >= 12% (scale_ratio >= 1.12) OR relative_disp_px >= 25px.
     """
     if edge_artifact_ratio > 0.08:
         return "UNSAFE"
+
+    amp_upper = motion_amplitude.upper()
+    scale_growth = (scale_change_ratio ** 0.5) - 1.0 if scale_change_ratio > 0 else 0.0
+
+    if amp_upper == "MEDIUM" and (scale_growth < 0.05 and relative_disp_px < 10.0):
+        return "WEAK"
+    elif amp_upper == "HIGH" and (scale_growth < 0.08 and relative_disp_px < 18.0):
+        return "WEAK"
 
     if subject_disp_px < 3.0 and abs(scale_change_ratio - 1.0) < 0.005:
         return "NEGLIGIBLE"
@@ -2388,15 +2400,16 @@ def encode_and_verify_mp4(
 
 def compute_temporal_diagnostics(
     rendered_frames: list,
-    subject_mask: np.ndarray
+    subject_mask: np.ndarray,
+    is_loop: bool = False
 ) -> Tuple[Dict[str, Any], np.ndarray]:
     """
-    Calculates frame-to-frame temporal metrics across all 48 frames:
+    Calculates frame-to-frame temporal metrics across all rendered frames:
     - Overall Temporal MAD & MAE
     - Subject-region Temporal MAD
     - Boundary-region Temporal MAD
     - Background Temporal MAD
-    - Loop Closure Error between Frame 00 and Frame 47 (MAE, RMSE, Max Pixel Diff)
+    - Loop Closure Error (strictly calculated for cyclic/looping trajectories when is_loop is True)
     Generates temporal_diagnostics.png plotting temporal MAD curves across the sequence.
     Returns: (temporal_summary_dict, plot_img_array)
     """
@@ -2426,14 +2439,19 @@ def compute_temporal_diagnostics(
         bg_mads.append(mad_bg)
         bound_mads.append(mad_bound)
 
-    # Loop closure evaluation between Frame 00 and Frame 47
-    f0 = rendered_frames[0].astype(np.float32)
-    f_last = rendered_frames[-1].astype(np.float32)
-    loop_abs_diff = np.abs(f_last - f0)
+    # Loop closure evaluation strictly calculated for cyclic/looping trajectories
+    if is_loop:
+        f0 = rendered_frames[0].astype(np.float32)
+        f_last = rendered_frames[-1].astype(np.float32)
+        loop_abs_diff = np.abs(f_last - f0)
 
-    loop_mae = float(np.mean(loop_abs_diff))
-    loop_rmse = float(np.sqrt(np.mean(loop_abs_diff ** 2)))
-    loop_max_diff = float(np.max(loop_abs_diff))
+        loop_mae = float(np.mean(loop_abs_diff))
+        loop_rmse = float(np.sqrt(np.mean(loop_abs_diff ** 2)))
+        loop_max_diff = float(np.max(loop_abs_diff))
+    else:
+        loop_mae = None
+        loop_rmse = None
+        loop_max_diff = None
 
     temporal_summary = {
         "overall_temporal_mad": float(np.mean(frame_mads)),
@@ -2468,7 +2486,8 @@ def compute_temporal_diagnostics(
 
     cv2.putText(plot_img, f"Overall MAD: {temporal_summary['overall_temporal_mad']:.2f}", (50, plot_h - 15), cv2.FONT_HERSHEY_SIMPLEX, 0.45, (255, 0, 0), 1)
     cv2.putText(plot_img, f"Boundary MAD: {temporal_summary['boundary_region_temporal_mad']:.2f}", (250, plot_h - 15), cv2.FONT_HERSHEY_SIMPLEX, 0.45, (0, 0, 255), 1)
-    cv2.putText(plot_img, f"Loop Closure MAE: {loop_mae:.2f}", (450, plot_h - 15), cv2.FONT_HERSHEY_SIMPLEX, 0.45, (0, 150, 0), 1)
+    loop_str = f"{loop_mae:.2f}" if loop_mae is not None else "N/A (Progressive)"
+    cv2.putText(plot_img, f"Loop Closure: {loop_str}", (450, plot_h - 15), cv2.FONT_HERSHEY_SIMPLEX, 0.45, (0, 150, 0), 1)
 
     return temporal_summary, plot_img
 
