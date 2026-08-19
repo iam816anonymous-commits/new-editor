@@ -2231,9 +2231,15 @@ def compute_perceptual_motion_score(
     cam_ty_max = float(np.max(np.abs(camera_translations[:, 1])))
     cam_tz_max = float(np.max(np.abs(camera_translations[:, 2])))
 
-    # Separate Environmental Motion Score vs Subject Stability Score
-    environmental_motion_score = float(np.clip((bg_disp_px / 15.0) * 0.5 + (rel_bg_sub_px / 10.0) * 0.5, 0.0, 1.0))
-    subject_stability_score = float(1.0 - np.clip(abs(scale_growth) / 0.15, 0.0, 0.8))
+    # Decompose Environmental Motion Score and Subject Stability Score
+    # subject_stability_score: range [0.0, 1.0], higher is better (1.0 = scale growth <= 4% and stable centroid)
+    background_motion_score = float(np.clip(bg_disp_px / 15.0, 0.0, 1.0))
+    midground_motion_score = float(np.clip(mg_disp_px / 25.0, 0.0, 1.0))
+    foreground_motion_score = float(np.clip(fg_disp_px / 40.0, 0.0, 1.0))
+    subject_stability_component = float(1.0 - np.clip(abs(scale_growth) / 0.10, 0.0, 1.0))
+
+    environmental_motion_score = float(0.4 * background_motion_score + 0.3 * midground_motion_score + 0.3 * foreground_motion_score)
+    subject_stability_score = subject_stability_component
     cinematic_motion_score = float(0.6 * environmental_motion_score + 0.4 * subject_stability_score)
 
     temp_mads = [float(m["mean_disparity_px"]) for m in per_frame_metrics] if per_frame_metrics else [0.5]
@@ -2262,8 +2268,12 @@ def compute_perceptual_motion_score(
             "subject_scale_change_ratio": scale_ratio,
             "subject_scale_growth": scale_growth
         },
+        "background_motion_score": background_motion_score,
+        "midground_motion_score": midground_motion_score,
+        "foreground_motion_score": foreground_motion_score,
         "environmental_motion_score": environmental_motion_score,
         "subject_stability_score": subject_stability_score,
+        "subject_stability_component": subject_stability_component,
         "cinematic_motion_score": cinematic_motion_score,
         "motion_stability_score": motion_stability_score,
         "motion_effectiveness_score": environmental_motion_score,
