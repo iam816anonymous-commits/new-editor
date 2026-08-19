@@ -2416,6 +2416,55 @@ def test_p20_12_100_frame_motion_validation():
     assert np.any(plot > 0)
 
 
+def test_p23b_independent_raster_layer_motion_measurement():
+    """TEST 23B: Verify all layer motion metrics are measured independently from actual layer raster data without synthetic formulas."""
+    import v0_pipeline as v0
+
+    w, h = 128, 128
+    sub_mask = np.zeros((h, w), dtype=bool)
+    sub_mask[40:80, 40:80] = True
+    bg_mask = ~sub_mask
+
+    # Depth gradient across background
+    bg_depth = np.linspace(1.0, 10.0, h * w).reshape(h, w).astype(np.float32)
+    q20, q70 = np.quantile(bg_depth[bg_mask], [0.20, 0.70])
+    fg_mask = bg_mask & (bg_depth <= q20)
+    mg_mask = bg_mask & (bg_depth > q20) & (bg_depth <= q70)
+    bg_layer_mask = bg_mask & (bg_depth > q70)
+
+    # Generate synthetic textured frame F0
+    rng = np.random.RandomState(42)
+    f0 = rng.randint(50, 200, (h, w, 3), dtype=np.uint8)
+
+    # Generate F_last with actual independent layer raster shifts
+    f_last = np.copy(f0)
+    f_last[fg_mask] = np.roll(f0, 12, axis=1)[fg_mask]
+    f_last[mg_mask] = np.roll(f0, 6, axis=1)[mg_mask]
+    f_last[bg_layer_mask] = np.roll(f0, 3, axis=1)[bg_layer_mask]
+    f_last[sub_mask] = np.roll(f0, 1, axis=1)[sub_mask]
+
+    cam_trans = np.zeros((10, 3), dtype=np.float32)
+    cam_rot = np.zeros((10, 3), dtype=np.float32)
+
+    metrics = v0.compute_perceptual_motion_score(
+        [f0, f_last], sub_mask, bg_depth, [], cam_trans, cam_rot, motion_amplitude="MEDIUM"
+    )
+
+    img_space = metrics["image_space"]
+
+    fg_delta = img_space["foreground_displacement_px"]
+    mg_delta = img_space["midground_displacement_px"]
+    bg_delta = img_space["background_displacement_px"]
+    sub_delta = img_space["subject_displacement_px"]
+
+    # Verify layer displacement ordering FOREGROUND > MIDGROUND > BACKGROUND > PRIMARY_SUBJECT
+    assert fg_delta > mg_delta > bg_delta > sub_delta
+
+    # Verify no synthetic multiplier relationships hold exactly
+    assert not np.isclose(fg_delta, sub_delta * 2.8, rtol=1e-3)
+    assert not np.isclose(mg_delta, (bg_delta + sub_delta) / 2.0, rtol=1e-3)
+
+
 # ============================================================
 # PHASE 2.2: MONOTONIC RENDERED OUTPUT & CONTACT SHEET TESTS
 # ============================================================

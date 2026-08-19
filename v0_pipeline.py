@@ -2205,16 +2205,48 @@ def compute_perceptual_motion_score(
 
     bg_mask = ~subject_mask
 
-    # Measure image-space displacements across layers at peak/end frame
+    # Measure image-space displacements across layers directly from rendered keyframes f0 and f_last
     f0_f = f0.astype(np.float32)
     fl_f = f_last.astype(np.float32)
-    diff = np.abs(fl_f - f0_f)
-    mean_diff = np.mean(diff, axis=2)
+    diff = np.mean(np.abs(fl_f - f0_f), axis=2)
 
-    bg_disp_px = float(np.mean(mean_diff[bg_mask]))
-    sub_disp_px = float(np.mean(mean_diff[subject_mask]))
-    fg_disp_px = sub_disp_px * 2.8
-    mg_disp_px = (bg_disp_px + sub_disp_px) / 2.0
+    # Farneback optical flow for directional motion vector & centroid shift analysis
+    g0 = cv2.cvtColor(f0, cv2.COLOR_RGB2GRAY) if f0.ndim == 3 else f0
+    gl = cv2.cvtColor(f_last, cv2.COLOR_RGB2GRAY) if f_last.ndim == 3 else f_last
+    flow = cv2.calcOpticalFlowFarneback(g0, gl, None, 0.5, 3, 15, 3, 5, 1.2, 0)
+    flow_u = flow[..., 0]
+    flow_v = flow[..., 1]
+    flow_mag = np.sqrt(flow_u**2 + flow_v**2)
+
+    # Extract independent layer masks using depth quantiles
+    h, w = subject_mask.shape
+    if background_depth is not None and background_depth.shape == (h, w) and np.any(bg_mask):
+        bg_depths = background_depth[bg_mask]
+        q20, q70 = np.quantile(bg_depths, [0.20, 0.70])
+        fg_mask = bg_mask & (background_depth <= q20)
+        mg_mask = bg_mask & (background_depth > q20) & (background_depth <= q70)
+        bg_layer_mask = bg_mask & (background_depth > q70)
+    else:
+        fg_mask = bg_mask
+        mg_mask = bg_mask
+        bg_layer_mask = bg_mask
+
+    def _measure_raster_layer_motion(mask: np.ndarray) -> Tuple[float, float]:
+        if not np.any(mask):
+            return 0.0, 0.0
+        mean_diff = float(np.mean(diff[mask]))
+        u_mean = float(np.mean(flow_u[mask]))
+        v_mean = float(np.mean(flow_v[mask]))
+        c_delta = float(np.sqrt(u_mean**2 + v_mean**2))
+        p_disp = float(np.mean(flow_mag[mask]))
+        if p_disp > 0.01:
+            return c_delta, p_disp
+        return mean_diff, mean_diff
+
+    sub_c_delta, sub_disp_px = _measure_raster_layer_motion(subject_mask)
+    fg_c_delta, fg_disp_px = _measure_raster_layer_motion(fg_mask)
+    mg_c_delta, mg_disp_px = _measure_raster_layer_motion(mg_mask)
+    bg_c_delta, bg_disp_px = _measure_raster_layer_motion(bg_layer_mask)
 
     rel_bg_sub_px = float(abs(bg_disp_px - sub_disp_px))
     rel_fg_bg_px = float(fg_disp_px - bg_disp_px)
