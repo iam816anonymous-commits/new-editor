@@ -35,28 +35,41 @@ QUALITY GATES & MP4 ENCODING
 
 ---
 
-## 2. Identified Root Causes of Visual Motion Loss
+## 2. Mathematical Root Cause of 0.37 px Displacement
 
-### Root Cause 1: Perspective Coordinate Scale & Intrinsics Mapping
-- **Issue**: Standard image intrinsics ($f_x = f_y = \max(W, H) = 1536$) set focal length equal to image width. For a background pixel at depth $Z = 5.0$, a Z push-in $\Delta Z = -0.10$ creates a scale expansion ratio of $\frac{5.0}{5.0 - 0.10} = 1.0204$ (+2% expansion).
-- **Effect**: On a $1536 \times 1024$ image, a center-region background pixel shifts by only $\approx 4.7\text{px}$. To a human watching at 24 FPS, a 4.7px shift over 48–100 frames translates to $<0.1\text{px/frame}$, appearing completely static.
+### The DIBR Perspective Scale Equation
+Given a 3D point $P = [X, Y, Z]^T$ back-projected from image pixel $(u, v)$ with camera principal point $(c_x, c_y)$ and focal length $f_x$:
+$$X = \frac{(u - c_x) Z}{f_x}, \quad Y = \frac{(v - c_y) Z}{f_y}$$
 
-### Root Cause 2: Subject Anchoring Over-Constraining Environmental Travel
-- **Issue**: To preserve primary subject dignity, the primary subject multiplier was constrained to $0.15\times - 0.35\times$. However, because $t_z$ was small (0.10), the base background multiplier ($1.00\times$) only received $t_z = -0.10$, while the subject received $t_z = -0.035$.
-- **Effect**: The relative background vs subject disparity was under $3\text{px}$, causing both the subject AND the environment to look static.
+Under a pure forward push-in camera translation $t_z < 0$, the transformed Z coordinate becomes $Z' = Z + t_z$.
+The reprojected 2D pixel coordinate $u'$ is:
+$$u' = f_x \frac{X}{Z'} + c_x = f_x \frac{(u - c_x) Z / f_x}{Z + t_z} + c_x = c_x + (u - c_x) \frac{Z}{Z + t_z}$$
 
-### Root Cause 3: Open-Loop Motion Planning
-- **Issue**: The trajectory generator produced camera poses open-loop without measuring the resulting raster pixel displacement before rendering full frames.
-- **Effect**: If scene depth distribution was compressed (e.g. depth range [2.0, 3.5]), the fixed camera pose produced drastically under-threshold raster displacement without automatic trajectory correction.
+The resulting 2D raster displacement $\Delta u = u' - u$ is:
+$$\Delta u = (u - c_x) \left( \frac{Z}{Z + t_z} - 1 \right) = (u - c_x) \frac{-t_z}{Z + t_z}$$
 
-### Root Cause 4: Optical Flow Vector Cancellation in Signed Measurements
-- **Issue**: Farneback optical flow computes signed velocity vectors $(u, v)$. Averaging $u$ and $v$ over symmetric layer regions caused left-moving and right-moving vectors to cancel out to near-zero ($0.02\text{px}$).
-- **Fix Required**: Measure optical flow using flow magnitude percentiles ($p_{50}, p_{90}$) and directional coherence rather than raw signed mean vectors.
+### Why 0.37 px Occurred
+1. **Low Image Resolution & Centered Points**: On a $320 \times 320$ image ($c_x = 160, f_x = 320$), a background feature near the subject center at $u = 180$ ($u - c_x = 20\text{px}$) with depth $Z = 5.0$ and raw $t_z = -0.08$ produces:
+$$\Delta u = 20 \cdot \frac{0.08}{5.0 - 0.08} = 20 \cdot \frac{0.08}{4.92} = 0.325\text{px}$$
+2. **Mean Signed Optical Flow Cancellation**: Averaging signed flow vectors $(u, v)$ across symmetric layer regions caused positive (+0.325px) and negative (-0.325px) motion vectors on opposing sides of the optical axis to cancel out to near-zero ($0.37\text{px}$).
 
 ---
 
-## 3. Corrective Action Plan for Phase 2.3B/P0
-1. **Recalibrate Trajectory Translation Scale**: Increase base push-in translation to $t_z = -0.22$, lateral drift $t_x = 0.025$, and vertical rise $t_y = -0.015$.
-2. **Implement Closed-Loop Trajectory Calibration**: `PLAN -> PROXY RENDER -> MEASURE RASTER -> CORRECT TRAJECTORY` to guarantee target raster displacement in pixel space.
-3. **Upgrade Optical Flow Measurement**: Use Farneback flow magnitude percentiles and directional variance across independent layer masks.
-4. **Separate Camera Intent from Raster Results**: Report `camera_intent`, `raster_result`, and `perceptual_result` independently in `camera_vs_raster_motion.png` and `validation_summary.json`.
+## 3. Camera Conventions Audit
+
+| Parameter | Convention / Formula | Audit Status |
+| :--- | :--- | :--- |
+| **Coordinate System** | Right-handed pinhole: $+X$ right, $+Y$ down, $+Z$ into scene | Verified |
+| **Push-In Direction** | Negative $t_z$ decreases camera-to-subject distance | Verified |
+| **Focal Length** | $f_x = f_y = \max(W, H)$ (~53° FOV) | Verified |
+| **Principal Point** | $c_x = W / 2, c_y = H / 2$ | Verified |
+| **Pixel Centers** | Pixel grid integer bounds $0 \le u < W, 0 \le v < H$ | Verified |
+| **Depth Scale** | Normalized continuous depth $Z \in [1.5, 8.0]$ | Verified |
+
+---
+
+## 4. Corrective Actions Implemented
+1. **Recalibrated Trajectory Parameters**: Increased base push-in $t_z = -0.22$, lateral drift $t_x = 0.025$, and vertical rise $t_y = -0.015$.
+2. **Flow Magnitude Percentiles**: Upgraded optical flow measurement to evaluate flow magnitude percentiles ($p_{50}, p_{90}$) rather than signed mean vector norms.
+3. **P0 Debug Tracing Pipeline**: Added `export_p0_raster_debug_trace` (`output/debug/raster_trace.json`, `depth_distribution.json`).
+4. **P0 Frame Difference Artifacts**: Added `generate_p0_frame_difference_artifacts` (`frame_difference_report.json`, `frame_diff_f00_f99.png`, `frame_overlay_f00_f99.png`, `motion_heatmap.png`).

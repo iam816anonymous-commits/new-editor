@@ -2416,6 +2416,35 @@ def test_p20_12_100_frame_motion_validation():
     assert np.any(plot > 0)
 
 
+def test_p0_post_fix_debug_tracing_and_frame_difference():
+    """P0-POST-FIX TEST: Verify export_p0_raster_debug_trace and generate_p0_frame_difference_artifacts output valid report structures."""
+    import v0_pipeline as v0
+    import tempfile
+    from pathlib import Path
+
+    w, h = 64, 64
+    sub_mask = np.zeros((h, w), dtype=bool); sub_mask[20:44, 20:44] = True
+    depth = np.full((h, w), 5.0, dtype=np.float32); depth[sub_mask] = 2.0
+    f0 = np.full((h, w, 3), 100, dtype=np.uint8)
+    f_end = np.full((h, w, 3), 100, dtype=np.uint8); f_end[sub_mask] = [200, 50, 50]
+
+    trans, rots = v0.generate_c1_smooth_trajectory("Cinematic Push-In", 1.0, num_frames=10)
+
+    with tempfile.TemporaryDirectory() as tmp_dir:
+        tmp_path = Path(tmp_dir)
+        trace_p, dist_p = v0.export_p0_raster_debug_trace(
+            trans, rots, sub_mask, depth, 64.0, 64.0, 32.0, 32.0, tmp_path
+        )
+        assert trace_p.exists()
+        assert dist_p.exists()
+
+        diff_report = v0.generate_p0_frame_difference_artifacts([f0, f_end], sub_mask, tmp_path)
+        assert "end_to_end" in diff_report
+        assert (tmp_path / "debug" / "frame_diff_f00_f99.png").exists()
+        assert (tmp_path / "debug" / "frame_overlay_f00_f99.png").exists()
+        assert (tmp_path / "debug" / "motion_heatmap.png").exists()
+
+
 def test_p0_low_medium_high_raster_displacement_separation():
     """P0 REGRESSION TEST: Verify LOW < MEDIUM < HIGH raster displacement separation on actual rendered output."""
     import v0_pipeline as v0

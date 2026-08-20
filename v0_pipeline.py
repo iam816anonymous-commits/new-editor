@@ -7,6 +7,7 @@ Phase A & B Pipeline Core:
 
 import argparse
 import hashlib
+import json
 import os
 import subprocess
 import sys
@@ -1517,6 +1518,201 @@ def generate_motion_amplitude_comparison_contact_sheet(
         np.hstack(row3_panels)
     ])
     return sheet
+
+
+def generate_p0_frame_difference_artifacts(
+    rendered_frames: list,
+    subject_mask: np.ndarray,
+    output_dir: Path
+) -> dict:
+    """
+    Generates P0 frame difference diagnostic report and visualizations:
+    1. output/debug/frame_difference_report.json (F00->F99 & F_k->F_{k+1} pixel differences)
+    2. output/debug/frame_diff_f00_f99.png
+    3. output/debug/frame_overlay_f00_f99.png (Red/Cyan channel overlay showing spatial motion)
+    4. output/debug/motion_heatmap.png (COLORMAP_JET visual motion heatmap)
+    """
+    debug_dir = output_dir / "debug"
+    debug_dir.mkdir(parents=True, exist_ok=True)
+
+    f0 = rendered_frames[0]
+    f_end = rendered_frames[-1]
+    h, w, _ = f0.shape
+    bg_mask = ~subject_mask
+
+    f0_f = f0.astype(np.float32)
+    fe_f = f_end.astype(np.float32)
+
+    # Intensity diff map
+    diff_2d = np.mean(np.abs(fe_f - f0_f), axis=2)
+    changed_mask = diff_2d > 2.0
+    pct_changed = float((np.sum(changed_mask) / diff_2d.size) * 100.0)
+
+    # Optical flow between F00 and F_end
+    g0 = cv2.cvtColor(f0, cv2.COLOR_RGB2GRAY) if f0.ndim == 3 else f0
+    ge = cv2.cvtColor(f_end, cv2.COLOR_RGB2GRAY) if f_end.ndim == 3 else f_end
+    flow = cv2.calcOpticalFlowFarneback(g0, ge, None, 0.5, 3, 15, 3, 5, 1.2, 0)
+    flow_mag = np.sqrt(flow[..., 0] ** 2 + flow[..., 1] ** 2)
+
+    # Difference Visualization (Grayscale diff)
+    diff_vis = np.clip(diff_2d * 5.0, 0, 255).astype(np.uint8)
+    Image.fromarray(diff_vis).save(debug_dir / "frame_diff_f00_f99.png")
+
+    # Overlay Visualization (F_end Red channel, F0 Green/Blue channels)
+    overlay = np.zeros((h, w, 3), dtype=np.uint8)
+    overlay[:, :, 0] = f_end[:, :, 0]
+    overlay[:, :, 1] = f0[:, :, 1]
+    overlay[:, :, 2] = f0[:, :, 2]
+    Image.fromarray(overlay).save(debug_dir / "frame_overlay_f00_f99.png")
+
+    # Motion Heatmap (COLORMAP_JET from flow magnitude)
+    heatmap_norm = np.clip((flow_mag / max(0.1, np.max(flow_mag))) * 255.0, 0, 255).astype(np.uint8)
+    heatmap_color = cv2.applyColorMap(heatmap_norm, cv2.COLORMAP_JET)
+    Image.fromarray(cv2.cvtColor(heatmap_color, cv2.COLOR_BGR2RGB)).save(debug_dir / "motion_heatmap.png")
+
+    # Per-frame differences F_k -> F_{k+1}
+    num_f = len(rendered_frames)
+    frame_step_diffs = []
+    for k in range(num_f - 1):
+        fk = rendered_frames[k].astype(np.float32)
+        fk1 = rendered_frames[k + 1].astype(np.float32)
+        d_k = np.mean(np.abs(fk1 - fk), axis=2)
+        frame_step_diffs.append({
+            "frame_step": f"F{k:02d}->F{k+1:02d}",
+            "mean_abs_diff": float(round(float(np.mean(d_k)), 4)),
+            "median_abs_diff": float(round(float(np.median(d_k)), 4)),
+            "p95_abs_diff": float(round(float(np.percentile(d_k, 95.0)), 4))
+        })
+
+    report = {
+        "end_to_end": {
+            "mean_abs_diff": float(round(float(np.mean(diff_2d)), 4)),
+            "median_abs_diff": float(round(float(np.median(diff_2d)), 4)),
+            "p95_abs_diff": float(round(float(np.percentile(diff_2d, 95.0)), 4)),
+            "pct_pixels_changed": float(round(pct_changed, 2)),
+            "subject_mean_diff": float(round(float(np.mean(diff_2d[subject_mask])), 4)),
+            "background_mean_diff": float(round(float(np.mean(diff_2d[bg_mask])), 4)),
+            "flow_magnitude_p50": float(round(float(np.median(flow_mag)), 4)),
+            "flow_magnitude_p90": float(round(float(np.percentile(flow_mag, 90.0)), 4))
+        },
+        "frame_steps": frame_step_diffs
+    }
+
+    with open(debug_dir / "frame_difference_report.json", "w") as f:
+        json.dump(report, f, indent=2)
+
+    return report
+
+
+def export_p0_raster_debug_trace(
+    translations: np.ndarray,
+    rotations: np.ndarray,
+    subject_mask: np.ndarray,
+    depth_map: np.ndarray,
+    fx: float,
+    fy: float,
+    cx: float,
+    cy: float,
+    output_dir: Path,
+    motion_amplitude: str = "MEDIUM"
+) -> Tuple[Path, Path]:
+    """
+    Exports P0 Raster Motion Debug Mode tracing outputs:
+    1. output/debug/raster_trace.json (records 3D world, camera-space, projected x/y, and raster coordinates across frames F00, F25, F50, F75, F99)
+    2. output/debug/depth_distribution.json (records Z_min, Z_median, Z_max for all scene depth layers)
+    """
+    debug_dir = output_dir / "debug"
+    debug_dir.mkdir(parents=True, exist_ok=True)
+
+    h, w = subject_mask.shape
+    bg_mask = ~subject_mask
+
+    # Depth Quantile Layer Masks
+    bg_depths = depth_map[bg_mask]
+    q20, q70 = np.quantile(bg_depths, [0.20, 0.70])
+    fg_mask = bg_mask & (depth_map <= q20)
+    mg_mask = bg_mask & (depth_map > q20) & (depth_map <= q70)
+    bg_layer_mask = bg_mask & (depth_map > q70)
+
+    # Depth Distribution JSON
+    def _layer_depth_stats(m: np.ndarray):
+        if not np.any(m):
+            return {"z_min": 0.0, "z_median": 0.0, "z_max": 0.0}
+        vals = depth_map[m]
+        return {
+            "z_min": float(round(float(vals.min()), 4)),
+            "z_median": float(round(float(np.median(vals)), 4)),
+            "z_max": float(round(float(vals.max()), 4))
+        }
+
+    depth_dist = {
+        "PRIMARY_SUBJECT": _layer_depth_stats(subject_mask),
+        "FOREGROUND": _layer_depth_stats(fg_mask),
+        "MIDGROUND": _layer_depth_stats(mg_mask),
+        "BACKGROUND": _layer_depth_stats(bg_layer_mask),
+        "OVERALL_SCENE": _layer_depth_stats(np.ones((h, w), dtype=bool))
+    }
+    with open(debug_dir / "depth_distribution.json", "w") as f:
+        json.dump(depth_dist, f, indent=2)
+
+    # Pixel Tracing Setup
+    def _get_rep_pixel(m: np.ndarray):
+        ys, xs = np.where(m)
+        if len(ys) == 0:
+            return (int(w // 2), int(h // 2))
+        idx = len(ys) // 2
+        return (int(xs[idx]), int(ys[idx]))
+
+    sample_pixels = [
+        ("PRIMARY_SUBJECT", _get_rep_pixel(subject_mask)),
+        ("FOREGROUND", _get_rep_pixel(fg_mask)),
+        ("MIDGROUND", _get_rep_pixel(mg_mask)),
+        ("BACKGROUND", _get_rep_pixel(bg_layer_mask))
+    ]
+
+    m_map = construct_layer_motion_map((h, w), subject_mask, motion_amplitude=motion_amplitude)
+
+    num_f = len(translations)
+    frame_indices = [0, max(0, int(num_f * 0.25)), max(0, int(num_f * 0.50)), max(0, int(num_f * 0.75)), num_f - 1]
+
+    trace_records = []
+    for f_idx in frame_indices:
+        t_k = translations[f_idx]
+        r_k = rotations[f_idx]
+        R_k = compute_rotation_matrix(r_k[0], r_k[1], r_k[2])
+
+        for layer_name, (px, py) in sample_pixels:
+            z_val = float(depth_map[py, px])
+            mult = float(m_map[py, px])
+
+            x_w = (px - cx) * z_val / fx
+            y_w = (py - cy) * z_val / fy
+            p_3d = np.array([x_w, y_w, z_val])
+
+            p_cam = (R_k @ p_3d) + (t_k * mult)
+
+            u_proj = float(fx * (p_cam[0] / p_cam[2]) + cx) if p_cam[2] > 1e-3 else -999.0
+            v_proj = float(fy * (p_cam[1] / p_cam[2]) + cy) if p_cam[2] > 1e-3 else -999.0
+
+            visible = bool(p_cam[2] > 0.05 and 0 <= u_proj < w and 0 <= v_proj < h)
+
+            trace_records.append({
+                "frame": f_idx,
+                "layer": layer_name,
+                "source_pixel": [px, py],
+                "world_xyz": [float(round(x, 4)) for x in p_3d],
+                "camera_xyz": [float(round(x, 4)) for x in p_cam],
+                "projected_xy": [float(round(u_proj, 2)), float(round(v_proj, 2))],
+                "raster_xy": [int(round(u_proj)), int(round(v_proj))] if visible else None,
+                "visible": visible,
+                "z_value": float(round(float(p_cam[2]), 4))
+            })
+
+    trace_file = debug_dir / "raster_trace.json"
+    with open(trace_file, "w") as f:
+        json.dump(trace_records, f, indent=2)
+
+    return trace_file, debug_dir / "depth_distribution.json"
 
 
 def generate_camera_vs_raster_motion_plot(
@@ -3247,8 +3443,7 @@ def render_single_frame_forward_splatting(
         return z_buf, accum_col, accum_w, out_prov
 
     # Render Background Layer
-    bg_mult = np.full_like(bg_depth, 0.10) if layer_motion_map is not None else None
-    bg_z, bg_col, bg_w, bg_p = splat_layer(bg_plate, bg_depth, provenance_map, bg_mult, is_fg=False)
+    bg_z, bg_col, bg_w, bg_p = splat_layer(bg_plate, bg_depth, provenance_map, layer_motion_map, is_fg=False)
 
     # Render Foreground Layer
     fg_z, fg_col, fg_w, fg_p = splat_layer(rgb_array, depth_map, provenance_map, layer_motion_map, is_fg=True)
@@ -3262,7 +3457,17 @@ def render_single_frame_forward_splatting(
     # Background layer synthesis
     bg_valid = bg_w > 0
     syn_rgb[bg_valid] = bg_col[bg_valid] / bg_w[bg_valid][..., None]
-    syn_rgb[~bg_valid] = bg_plate[~bg_valid].astype(np.float32)
+
+    # Inpaint or fill background disocclusion holes
+    if not np.all(bg_valid):
+        hole_mask = (~bg_valid).astype(np.uint8) * 255
+        syn_uint8 = np.clip(syn_rgb, 0, 255).astype(np.uint8)
+        # Check if zero camera translation (identity render)
+        if np.max(np.abs(t)) < 1e-4 and abs(R[0, 0] - 1.0) < 1e-4:
+            syn_rgb[~bg_valid] = bg_plate[~bg_valid].astype(np.float32)
+        else:
+            inpainted = cv2.inpaint(syn_uint8, hole_mask, 3, cv2.INPAINT_TELEA)
+            syn_rgb[~bg_valid] = inpainted[~bg_valid].astype(np.float32)
 
     # Foreground layer overlay
     syn_rgb[fg_mask] = fg_col[fg_mask] / fg_w[fg_mask][..., None]
@@ -3779,6 +3984,14 @@ def main():
     }
     cam_vs_raster_plot = generate_camera_vs_raster_motion_plot(camera_intent_dict, raster_results_dict, motion_amplitude=args.motion_amplitude)
     Image.fromarray(cam_vs_raster_plot).save(hash_dir / "camera_vs_raster_motion.png")
+
+    # Export P0 Raster Debug Trace, Frame Difference Report, Motion Heatmaps & Depth Distribution JSON
+    export_p0_raster_debug_trace(
+        trans_plan, rot_plan, subject_mask, refined_depth, fx, fy, cx, cy, hash_dir, motion_amplitude=args.motion_amplitude
+    )
+    generate_p0_frame_difference_artifacts(
+        rendered_frames, subject_mask, hash_dir
+    )
 
     # Export machine-readable motion_report.json
     motion_report = {
