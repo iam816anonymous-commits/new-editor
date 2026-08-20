@@ -66,9 +66,9 @@ def compute_layer_motion_multiplier(layer_role_str: str, motion_amplitude: str =
     base_multipliers = {
         "BACKGROUND": 1.00,
         "MIDGROUND": 1.50,
-        "PRIMARY_SUBJECT": 0.50,
-        "PRIMARY_SUBJECT_PART": 0.50,
-        "FOREGROUND": 2.80,
+        "PRIMARY_SUBJECT": 0.35,
+        "PRIMARY_SUBJECT_PART": 0.35,
+        "FOREGROUND": 2.20,
         "ANALYSIS_ONLY": 0.10
     }
 

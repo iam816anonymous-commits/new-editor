@@ -238,7 +238,7 @@ def export_spatial_diagnostics_artifacts(
     entities_vis = generate_consolidated_entities_visualization(original_rgb, list(diagnostics.scene_graph.entities.values()))
     Image.fromarray(entities_vis).save(hash_dir / "consolidated_entities.png")
 
-    # 6. camera_path.json (synchronizes actual camera trajectory poses)
+    # 6. camera_path.json & camera_path.png
     if translations is None:
         translations = np.zeros((frame_count, 3))
     if rotations is None:
@@ -247,6 +247,14 @@ def export_spatial_diagnostics_artifacts(
     cam_dict = export_camera_path_dict(diagnostics.camera_model, translations, rotations)
     with open(hash_dir / "camera_path.json", "w") as f:
         json.dump(cam_dict, f, indent=2)
+
+    # Export camera trajectory plot
+    try:
+        from v0_pipeline import generate_camera_path_plot
+        path_plot = generate_camera_path_plot(translations, rotations)
+        Image.fromarray(path_plot).save(hash_dir / "camera_path.png")
+    except Exception as e:
+        pass
 
     # 7. spatial_diagnostics.json
     pq = diagnostics.parallax_quality

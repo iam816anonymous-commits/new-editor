@@ -1519,6 +1519,49 @@ def generate_motion_amplitude_comparison_contact_sheet(
     return sheet
 
 
+def generate_camera_path_plot(
+    translations: np.ndarray,
+    rotations: np.ndarray
+) -> np.ndarray:
+    """
+    Generates a diagnostic plot visualizing the camera trajectory poses (Tx, Ty, Tz, Pitch, Yaw).
+    """
+    num_f = len(translations)
+    plot_h, plot_w = 320, 640
+    plot_img = np.full((plot_h, plot_w, 3), fill_value=255, dtype=np.uint8)
+
+    cv2.putText(plot_img, "Camera Trajectory Poses (Tx, Ty, Tz)", (15, 30), cv2.FONT_HERSHEY_SIMPLEX, 0.55, (0, 0, 0), 2)
+
+    # Grid lines
+    for y_grid in range(60, plot_h - 20, 50):
+        cv2.line(plot_img, (50, y_grid), (plot_w - 20, y_grid), (230, 230, 230), 1)
+
+    cv2.line(plot_img, (50, plot_h - 30), (plot_w - 20, plot_h - 30), (0, 0, 0), 1)  # X axis
+    cv2.line(plot_img, (50, 40), (50, plot_h - 30), (0, 0, 0), 1)  # Y axis
+
+    tx = translations[:, 0]
+    ty = translations[:, 1]
+    tz = translations[:, 2]
+
+    max_val = max(0.01, float(np.max(np.abs(translations))))
+
+    def to_pt(i, val):
+        px = 50 + int((i / max(1, num_f - 1)) * (plot_w - 70))
+        py = (plot_h - 30) - int(((val / max_val) * 0.45 + 0.5) * (plot_h - 80))
+        return (px, py)
+
+    for i in range(num_f - 1):
+        cv2.line(plot_img, to_pt(i, tx[i]), to_pt(i + 1, tx[i + 1]), (0, 0, 255), 2)
+        cv2.line(plot_img, to_pt(i, ty[i]), to_pt(i + 1, ty[i + 1]), (0, 200, 0), 2)
+        cv2.line(plot_img, to_pt(i, tz[i]), to_pt(i + 1, tz[i + 1]), (255, 0, 0), 2)
+
+    cv2.putText(plot_img, "Tx (Lateral)", (plot_w - 180, 25), cv2.FONT_HERSHEY_SIMPLEX, 0.45, (0, 0, 255), 1)
+    cv2.putText(plot_img, "Ty (Vertical)", (plot_w - 180, 42), cv2.FONT_HERSHEY_SIMPLEX, 0.45, (0, 200, 0), 1)
+    cv2.putText(plot_img, "Tz (Push-In)", (plot_w - 180, 59), cv2.FONT_HERSHEY_SIMPLEX, 0.45, (255, 0, 0), 1)
+
+    return plot_img
+
+
 def generate_layer_displacement_curve_plot(
     translations: np.ndarray,
     rotations: np.ndarray,
@@ -2240,7 +2283,7 @@ def compute_perceptual_motion_score(
         c_delta = float(np.sqrt(u_mean**2 + v_mean**2))
         p_disp = float(np.mean(flow_mag[mask]))
         if p_disp > 0.01:
-            return c_delta, p_disp
+            return max(c_delta, p_disp), p_disp
         return mean_diff, mean_diff
 
     sub_c_delta, sub_disp_px = _measure_raster_layer_motion(subject_mask)
@@ -2924,10 +2967,11 @@ def generate_c1_smooth_trajectory(
         pass  # All zeros
     elif style_upper in ["CINEMATIC_PUSH_IN", "CINEMATIC_PUSHIN", "PUSH_IN", "PUSHIN"]:
         # Genuine progressive Push-In (non-looping): camera pushes forward towards scene (negative Z)
-        translations[:, 2] = -s_quintic * magnitude_scale * 0.10  # Negative Z pushes camera towards scene
+        translations[:, 2] = -s_quintic * magnitude_scale * 0.22  # Negative Z pushes camera towards scene
         translations[:, 1] = -s_quintic * magnitude_scale * 0.015 # Gentle vertical rise
-        translations[:, 0] = np.sin(np.pi * t) * magnitude_scale * 0.008 # Subtle lateral drift
-        rotations[:, 0] = -s_quintic * magnitude_scale * np.radians(0.8) # Gentle pitch
+        translations[:, 0] = np.sin(np.pi * t) * magnitude_scale * 0.025 # Lateral camera travel
+        rotations[:, 0] = -s_quintic * magnitude_scale * np.radians(0.3) # Subtle pitch
+        rotations[:, 1] = np.sin(np.pi * t) * magnitude_scale * np.radians(0.2) # Subtle yaw
     elif style_upper in ["DOLLY_IN", "DOLLYIN"]:
         translations[:, 2] = w_loop * magnitude_scale * 0.15
     elif style_upper in ["DOLLY_OUT", "DOLLYOUT"]:

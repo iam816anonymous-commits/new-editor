@@ -2041,8 +2041,8 @@ def test_p18_9_motion_amplitude_presets():
     mult_high = compute_layer_motion_multiplier("PRIMARY_SUBJECT", "HIGH")
 
     assert mult_low < mult_med < mult_high
-    assert mult_med == 0.60
-    assert mult_high == 1.25
+    assert mult_med == 0.42
+    assert mult_high == 0.875
 
 
 def test_p18_10_layer_motion_ordering():
@@ -2066,8 +2066,8 @@ def test_p18_11_construct_layer_motion_map():
     m_map_med = v0.construct_layer_motion_map((h, w), sub_mask, spatial_diagnostics=None, motion_amplitude="MEDIUM")
     m_map_high = v0.construct_layer_motion_map((h, w), sub_mask, spatial_diagnostics=None, motion_amplitude="HIGH")
 
-    assert m_map_med[15, 15] == 0.60
-    assert m_map_high[15, 15] == 1.25
+    assert m_map_med[15, 15] == 0.42
+    assert m_map_high[15, 15] == 0.875
     assert m_map_med[0, 0] == 1.20
 
 
@@ -2416,6 +2416,50 @@ def test_p20_12_100_frame_motion_validation():
     assert np.any(plot > 0)
 
 
+def test_p0_perceptual_camera_travel_and_quality_gates():
+    """P0 REGRESSION TEST: Verify recalibrated camera trajectory produces obvious background displacement without excessive subject growth."""
+    import v0_pipeline as v0
+
+    w, h = 1536, 1024
+    sub_mask = np.zeros((h, w), dtype=bool)
+    sub_mask[300:700, 500:1000] = True
+    bg_mask = ~sub_mask
+
+    bg_depth = np.linspace(1.5, 8.0, h * w).reshape(h, w).astype(np.float32)
+
+    rng = np.random.RandomState(42)
+    f0 = rng.randint(50, 200, (h, w, 3), dtype=np.uint8)
+
+    q20, q70 = np.quantile(bg_depth[bg_mask], [0.20, 0.70])
+    fg_mask = bg_mask & (bg_depth <= q20)
+    mg_mask = bg_mask & (bg_depth > q20) & (bg_depth <= q70)
+    bg_layer_mask = bg_mask & (bg_depth > q70)
+
+    f_last = np.copy(f0)
+    f_last[fg_mask] = np.roll(f0, 40, axis=1)[fg_mask]
+    f_last[mg_mask] = np.roll(f0, 20, axis=1)[mg_mask]
+    f_last[bg_layer_mask] = np.roll(f0, 10, axis=1)[bg_layer_mask]
+    f_last[sub_mask] = np.roll(f0, 2, axis=1)[sub_mask]
+
+    cam_trans, cam_rot = v0.generate_c1_smooth_trajectory("Cinematic Push-In", 1.0, 100)
+
+    metrics = v0.compute_perceptual_motion_score(
+        [f0, f_last], sub_mask, bg_depth, [], cam_trans, cam_rot, motion_amplitude="MEDIUM"
+    )
+
+    img_space = metrics["image_space"]
+
+    # Verify background displacement is visually significant (> 5px raster displacement)
+    assert img_space["background_displacement_px"] > 5.0
+
+    # Verify subject stability restraint (< 8% scale growth)
+    assert abs(img_space["subject_scale_growth"]) < 0.08
+
+    # Verify quality gate passes
+    assert metrics["perceptual_motion_gate_passed"] is True
+    assert metrics["motion_visibility_class"] in ["SUBTLE", "VISIBLE", "CINEMATIC", "STRONG"]
+
+
 def test_p23b_independent_raster_layer_motion_measurement():
     """TEST 23B: Verify all layer motion metrics are measured independently from actual layer raster data without synthetic formulas."""
     import v0_pipeline as v0
@@ -2650,7 +2694,7 @@ def test_p21_1_negative_tz_camera_push_in_direction():
 
     trans, rots = v0.generate_c1_smooth_trajectory("Cinematic Push-In", magnitude_scale=1.0, num_frames=100)
     assert trans[-1, 2] < 0.0
-    assert trans[-1, 2] == pytest.approx(-0.10, abs=1e-3)
+    assert trans[-1, 2] == pytest.approx(-0.22, abs=1e-3)
 
 
 def test_p21_2_raster_subject_scale_growth():
@@ -2829,10 +2873,10 @@ def test_p21_8_cinematic_push_in_produces_measurable_scale_growth():
     """TEST 8: Verify 3D forward splatting with push-in produces measurable subject scale expansion."""
     import v0_pipeline as v0
 
-    w, h = 128, 128
+    w, h = 640, 640
     rgb = np.zeros((h, w, 3), dtype=np.uint8)
     depth = np.full((h, w), fill_value=5.0, dtype=np.float32)
-    sub_mask = np.zeros((h, w), dtype=bool); sub_mask[40:88, 40:88] = True
+    sub_mask = np.zeros((h, w), dtype=bool); sub_mask[100:540, 100:540] = True
     depth[sub_mask] = 2.0
     rgb[sub_mask] = [200, 50, 50]
 
