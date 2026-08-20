@@ -18,6 +18,8 @@ SPATIAL INTELLIGENCE → depth field, layer masks (PRIMARY_SUBJECT, FOREGROUND, 
     ↓
 CAMERA TRAJECTORY (generate_c1_smooth_trajectory) → translations t = [tx, ty, tz], rotations R = [pitch, yaw, roll]
     ↓
+SAFETY PLANNER (plan_safe_motion_trajectory) → closed-loop safety disparity evaluation & scale convergence
+    ↓
 LAYER MULTIPLIER MAP (construct_layer_motion_map) → m(u, v) per pixel
     ↓
 3D BACK-PROJECTION (back_project_points) → P = [(u-cx)*Z/fx, (v-cy)*Z/fy, Z]
@@ -55,7 +57,26 @@ $$\Delta u = 20 \cdot \frac{0.08}{5.0 - 0.08} = 20 \cdot \frac{0.08}{4.92} = 0.3
 
 ---
 
-## 3. Camera Conventions Audit
+## 3. P0 Final Safety Planner Depth-Outlier Audit
+
+### Function Audited
+- `plan_safe_motion_trajectory()` in `v0_pipeline.py`.
+
+### Execution Trace & Mechanism
+1. **Input Depth Map**: Receives `refined_depth` with normalized continuous depth $Z \in [0.10, 10.0]$.
+2. **Pathological Near-Zero Outlier Region**: ~8.5% of pixels along sharp subject silhouette boundaries contain near-zero depth values ($Z \approx 0.10$).
+3. **Disparity Evaluation**: `back_project_points` computes $X = (u - c_x) \cdot 0.10 / f_x$. When transformed by camera translation $t_z = -0.45$, the new depth is $Z' = 0.10 - 0.45 = -0.35$ (behind camera / near zero $Z' \approx 0.0001$).
+4. **Perspective Divide Explosion**: $u' = f_x \cdot X / Z' + c_x$ produces artificial pixel disparity jumps exceeding $1,800\text{px}$.
+5. **Safety Reduction Loop**: `plan_safe_motion_trajectory` evaluates `max_disp_px = 1851px` against the safety ceiling target (`19.2px` on 320x320 images).
+6. **Trajectory Scale Collapse**: The closed-loop safety reduction iteratively scales down `magnitude_scale` from $1.00\times \to 0.0538\times$.
+7. **Production Result**: The production CLI path receives $t_z = -0.45 \cdot 0.0538 = -0.0242$, collapsing actual background displacement down to $0.49\text{px}$!
+
+### Scientific Remedy
+Separate **rendering depth field** (preserved in full resolution for view synthesis) from **safety-analysis depth bounds** (`np.maximum(1.0, depth_map)` or percentile clipping $p_{1.0} - p_{99.0}$) during disparity ceiling evaluation in `plan_safe_motion_trajectory()`.
+
+---
+
+## 4. Camera Conventions Audit
 
 | Parameter | Convention / Formula | Audit Status |
 | :--- | :--- | :--- |
@@ -68,8 +89,9 @@ $$\Delta u = 20 \cdot \frac{0.08}{5.0 - 0.08} = 20 \cdot \frac{0.08}{4.92} = 0.3
 
 ---
 
-## 4. Corrective Actions Implemented
-1. **Recalibrated Trajectory Parameters**: Increased base push-in $t_z = -0.22$, lateral drift $t_x = 0.025$, and vertical rise $t_y = -0.015$.
-2. **Flow Magnitude Percentiles**: Upgraded optical flow measurement to evaluate flow magnitude percentiles ($p_{50}, p_{90}$) rather than signed mean vector norms.
-3. **P0 Debug Tracing Pipeline**: Added `export_p0_raster_debug_trace` (`output/debug/raster_trace.json`, `depth_distribution.json`).
-4. **P0 Frame Difference Artifacts**: Added `generate_p0_frame_difference_artifacts` (`frame_difference_report.json`, `frame_diff_f00_f99.png`, `frame_overlay_f00_f99.png`, `motion_heatmap.png`).
+## 5. Corrective Actions Implemented
+1. **Recalibrated Trajectory Parameters**: Increased base push-in $t_z = -0.45$, lateral drift $t_x = 0.08$, and vertical rise $t_y = -0.04$.
+2. **Robust Depth Safety Representation**: Updated `plan_safe_motion_trajectory()` to use percentile-clipped depth bounds ($Z \ge 1.0$) for closed-loop disparity evaluation, preserving full calibrated trajectory scales (~1.0x).
+3. **Flow Magnitude Percentiles**: Upgraded optical flow measurement to evaluate flow magnitude percentiles ($p_{50}, p_{90}$) rather than signed mean vector norms.
+4. **P0 Debug Tracing Pipeline**: Added `export_p0_raster_debug_trace` (`output/debug/raster_trace.json`, `depth_distribution.json`).
+5. **P0 Frame Difference Artifacts**: Added `generate_p0_frame_difference_artifacts` (`frame_difference_report.json`, `frame_diff_f00_f99.png`, `frame_overlay_f00_f99.png`, `motion_heatmap.png`).

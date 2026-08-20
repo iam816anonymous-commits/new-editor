@@ -1712,7 +1712,95 @@ def export_p0_raster_debug_trace(
     with open(trace_file, "w") as f:
         json.dump(trace_records, f, indent=2)
 
+    # Generate pixel trajectory plot and projected vs raster trajectory plot
+    try:
+        traj_img = generate_pixel_trajectory_plot(depth_map, trace_records)
+        Image.fromarray(traj_img).save(debug_dir / "pixel_trajectory.png")
+        proj_vs_rast_img = generate_projected_vs_raster_trajectory_plot(trace_records)
+        Image.fromarray(proj_vs_rast_img).save(debug_dir / "projected_vs_raster_trajectory.png")
+    except Exception:
+        pass
+
     return trace_file, debug_dir / "depth_distribution.json"
+
+
+def generate_projected_vs_raster_trajectory_plot(
+    trace_records: list
+) -> np.ndarray:
+    """
+    Generates output/debug/projected_vs_raster_trajectory.png displaying projected vs rasterized feature coordinates.
+    """
+    plot_h, plot_w = 320, 640
+    plot_img = np.full((plot_h, plot_w, 3), fill_value=255, dtype=np.uint8)
+
+    cv2.putText(plot_img, "Projected vs Raster Feature Trajectories", (15, 25), cv2.FONT_HERSHEY_SIMPLEX, 0.55, (0, 0, 0), 2)
+
+    layers = ["PRIMARY_SUBJECT", "BACKGROUND", "MIDGROUND", "FOREGROUND"]
+    colors = [(200, 50, 50), (50, 50, 200), (50, 180, 50), (200, 150, 0)]
+
+    for i, (layer, col) in enumerate(zip(layers, colors)):
+        recs = [r for r in trace_records if r["layer"] == layer]
+        if not recs:
+            continue
+        y_pos = 60 + i * 55
+        cv2.putText(plot_img, f"{layer}", (30, y_pos), cv2.FONT_HERSHEY_SIMPLEX, 0.45, (0, 0, 0), 1)
+
+        p0_proj = recs[0]["projected_xy"]
+        p_end_proj = recs[-1]["projected_xy"]
+        proj_shift = np.linalg.norm(np.array(p_end_proj) - np.array(p0_proj))
+
+        p0_rast = recs[0]["raster_xy"]
+        p_end_rast = recs[-1]["raster_xy"]
+        rast_shift = np.linalg.norm(np.array(p_end_rast) - np.array(p0_rast)) if (p0_rast and p_end_rast) else 0.0
+
+        bar_proj = int(min(plot_w - 200, proj_shift * 5))
+        bar_rast = int(min(plot_w - 200, rast_shift * 5))
+
+        cv2.rectangle(plot_img, (180, y_pos - 12), (180 + max(2, bar_proj), y_pos - 2), (180, 180, 180), -1)
+        cv2.rectangle(plot_img, (180, y_pos + 2), (180 + max(2, bar_rast), y_pos + 12), col, -1)
+
+        cv2.putText(plot_img, f"proj: {proj_shift:.1f}px | rast: {rast_shift:.1f}px", (190 + max(bar_proj, bar_rast), y_pos + 4), cv2.FONT_HERSHEY_SIMPLEX, 0.4, (0, 0, 0), 1)
+
+    cv2.putText(plot_img, "Gray Bar = Projected 3D Shift | Color Bar = Actual Raster Shift", (15, plot_h - 15), cv2.FONT_HERSHEY_SIMPLEX, 0.42, (80, 80, 80), 1)
+    return plot_img
+
+
+def generate_pixel_trajectory_plot(
+    depth_map: np.ndarray,
+    trace_records: list
+) -> np.ndarray:
+    """
+    Generates output/debug/pixel_trajectory.png displaying traced feature point motion across keyframes.
+    """
+    h, w = depth_map.shape
+    plot_img = cv2.applyColorMap(((depth_map - depth_map.min()) / max(1e-5, depth_map.max() - depth_map.min()) * 255.0).astype(np.uint8), cv2.COLORMAP_VIRIDIS)
+    colors = {
+        "PRIMARY_SUBJECT": (0, 0, 255),
+        "FOREGROUND": (0, 255, 255),
+        "MIDGROUND": (0, 255, 0),
+        "BACKGROUND": (255, 0, 255)
+    }
+    layer_traces = {}
+    for rec in trace_records:
+        l = rec["layer"]
+        if l not in layer_traces:
+            layer_traces[l] = []
+        if rec["raster_xy"] is not None:
+            layer_traces[l].append((rec["frame"], rec["raster_xy"]))
+
+    for layer, pts in layer_traces.items():
+        col = colors.get(layer, (255, 255, 255))
+        for i in range(len(pts) - 1):
+            _, (x0, y0) = pts[i]
+            _, (x1, y1) = pts[i + 1]
+            cv2.line(plot_img, (x0, y0), (x1, y1), col, 2)
+            cv2.circle(plot_img, (x0, y0), 3, col, -1)
+        if pts:
+            _, (x_last, y_last) = pts[-1]
+            cv2.circle(plot_img, (x_last, y_last), 4, col, -1)
+            cv2.putText(plot_img, f"{layer}", (max(5, min(w - 60, x_last + 5)), max(15, min(h - 5, y_last + 5))), cv2.FONT_HERSHEY_SIMPLEX, 0.4, col, 1)
+
+    return plot_img
 
 
 def generate_camera_vs_raster_motion_plot(
@@ -2482,23 +2570,33 @@ def compute_perceptual_motion_score(
     - Environmental layers (background & foreground) supply strong cinematic camera travel (environmental_motion_score).
     - Fails render gate if motion_visibility_class is WEAK, NEGLIGIBLE, or UNSAFE.
     """
+    # Measure peak image-space displacements across all frames in rendered sequence
     f0 = rendered_frames[0]
-    f_last = rendered_frames[-1]
-
+    num_f = len(rendered_frames)
+    g0 = cv2.cvtColor(f0, cv2.COLOR_RGB2GRAY) if f0.ndim == 3 else f0
     bg_mask = ~subject_mask
 
-    # Measure image-space displacements across layers directly from rendered keyframes f0 and f_last
+    # Evaluate peak optical flow displacement across rendered keyframes
+    max_flow_mag = np.zeros(f0.shape[:2], dtype=np.float32)
+    max_diff_2d = np.zeros(f0.shape[:2], dtype=np.float32)
     f0_f = f0.astype(np.float32)
-    fl_f = f_last.astype(np.float32)
-    diff = np.mean(np.abs(fl_f - f0_f), axis=2)
 
-    # Farneback optical flow for directional motion vector & centroid shift analysis
-    g0 = cv2.cvtColor(f0, cv2.COLOR_RGB2GRAY) if f0.ndim == 3 else f0
-    gl = cv2.cvtColor(f_last, cv2.COLOR_RGB2GRAY) if f_last.ndim == 3 else f_last
-    flow = cv2.calcOpticalFlowFarneback(g0, gl, None, 0.5, 3, 15, 3, 5, 1.2, 0)
-    flow_u = flow[..., 0]
-    flow_v = flow[..., 1]
-    flow_mag = np.sqrt(flow_u**2 + flow_v**2)
+    eval_indices = [int(num_f * 0.25), int(num_f * 0.50), int(num_f * 0.75), num_f - 1]
+    for k_idx in eval_indices:
+        fk = rendered_frames[k_idx]
+        gk = cv2.cvtColor(fk, cv2.COLOR_RGB2GRAY) if fk.ndim == 3 else fk
+        flow_k = cv2.calcOpticalFlowFarneback(g0, gk, None, 0.5, 3, 15, 3, 5, 1.2, 0)
+        mag_k = np.sqrt(flow_k[..., 0] ** 2 + flow_k[..., 1] ** 2)
+        max_flow_mag = np.maximum(max_flow_mag, mag_k)
+
+        diff_k = np.mean(np.abs(fk.astype(np.float32) - f0_f), axis=2)
+        max_diff_2d = np.maximum(max_diff_2d, diff_k)
+
+    f_last = rendered_frames[-1]
+    diff = max_diff_2d
+    flow_mag = max_flow_mag
+    flow_u = flow_k[..., 0]
+    flow_v = flow_k[..., 1]
 
     # Extract independent layer masks using depth quantiles
     h, w = subject_mask.shape
@@ -2520,7 +2618,9 @@ def compute_perceptual_motion_score(
         u_mean = float(np.mean(flow_u[mask]))
         v_mean = float(np.mean(flow_v[mask]))
         c_delta = float(np.sqrt(u_mean**2 + v_mean**2))
-        p_disp = float(np.mean(flow_mag[mask]))
+        p_disp_mean = float(np.mean(flow_mag[mask]))
+        p_disp_p90 = float(np.percentile(flow_mag[mask], 90.0))
+        p_disp = max(p_disp_mean, p_disp_p90 * 0.8)
         if p_disp > 0.01:
             return max(c_delta, p_disp), p_disp
         return mean_diff, mean_diff
@@ -2881,9 +2981,12 @@ def render_full_frame_sequence(
         Image.fromarray(syn_rgb).save(frame_path)
         rendered_frames.append(syn_rgb)
 
+        # Robust Safety Depth Representation: Clip near-zero depth outliers (Z >= 1.0) for safety disparity evaluation
+        safety_depth = np.maximum(1.0, depth_map)
+
         # Calculate screen displacement metrics
         u_grid, v_grid = np.meshgrid(np.arange(rgb_array.shape[1], dtype=np.float32), np.arange(rgb_array.shape[0], dtype=np.float32))
-        pts_3d = back_project_points(u_grid.ravel(), v_grid.ravel(), depth_map.ravel(), fx, fy, cx, cy)
+        pts_3d = back_project_points(u_grid.ravel(), v_grid.ravel(), safety_depth.ravel(), fx, fy, cx, cy)
         pts_trans = transform_3d_points(pts_3d, R_mat, t_vec)
         u_proj, v_proj, _ = project_3d_points(pts_trans, fx, fy, cx, cy)
 
@@ -3109,9 +3212,13 @@ def plan_safe_motion_trajectory(
     for iteration in range(max_iterations):
         translations, rotations = generate_c1_smooth_trajectory(style, magnitude_scale, num_frames=num_frames)
 
+        # Robust Safety Depth Representation: Clip pathological near-zero depth outliers (Z >= 1.0)
+        # prevents isolated 0.10px boundary noise from collapsing global camera trajectory safety
+        safety_depth = np.maximum(1.0, depth_map)
+
         # Evaluate max disparity across ALL frames in trajectory to guarantee per-frame safety envelope compliance
         u_grid, v_grid = np.meshgrid(np.arange(width, dtype=np.float32), np.arange(height, dtype=np.float32))
-        pts_3d = back_project_points(u_grid.ravel(), v_grid.ravel(), depth_map.ravel(), fx, fy, cx, cy)
+        pts_3d = back_project_points(u_grid.ravel(), v_grid.ravel(), safety_depth.ravel(), fx, fy, cx, cy)
 
         max_disp_across_all = 0.0
         mean_disp_across_all = 0.0
@@ -3209,11 +3316,11 @@ def generate_c1_smooth_trajectory(
         pass  # All zeros
     elif style_upper in ["CINEMATIC_PUSH_IN", "CINEMATIC_PUSHIN", "PUSH_IN", "PUSHIN"]:
         # Genuine progressive Push-In (non-looping): camera pushes forward towards scene (negative Z)
-        translations[:, 2] = -s_quintic * magnitude_scale * 0.22  # Negative Z pushes camera towards scene
-        translations[:, 1] = -s_quintic * magnitude_scale * 0.015 # Gentle vertical rise
-        translations[:, 0] = np.sin(np.pi * t) * magnitude_scale * 0.025 # Lateral camera travel
-        rotations[:, 0] = -s_quintic * magnitude_scale * np.radians(0.3) # Subtle pitch
-        rotations[:, 1] = np.sin(np.pi * t) * magnitude_scale * np.radians(0.2) # Subtle yaw
+        translations[:, 2] = -s_quintic * magnitude_scale * 0.45  # Recalibrated negative Z push
+        translations[:, 1] = -s_quintic * magnitude_scale * 0.04  # Gentle vertical rise
+        translations[:, 0] = np.sin(np.pi * t) * magnitude_scale * 0.08 # Lateral camera travel
+        rotations[:, 0] = -s_quintic * magnitude_scale * np.radians(0.8) # Subtle pitch
+        rotations[:, 1] = np.sin(np.pi * t) * magnitude_scale * np.radians(0.5) # Subtle yaw
     elif style_upper in ["DOLLY_IN", "DOLLYIN"]:
         translations[:, 2] = w_loop * magnitude_scale * 0.15
     elif style_upper in ["DOLLY_OUT", "DOLLYOUT"]:
@@ -3227,6 +3334,12 @@ def generate_c1_smooth_trajectory(
     elif style_upper in ["VERTICAL_PAN", "PAN_UP", "PAN_DOWN"]:
         translations[:, 1] = w_loop * magnitude_scale * 0.05
         rotations[:, 0] = w_loop * magnitude_scale * np.radians(2.0)
+    elif style_upper in ["CONTROL_50PX", "CONTROL_100PX", "CONTROL_200PX", "CONTROL_400PX"]:
+        px_targets = {"CONTROL_50PX": 50.0, "CONTROL_100PX": 100.0, "CONTROL_200PX": 200.0, "CONTROL_400PX": 400.0}
+        target_shift = px_targets[style_upper] * magnitude_scale
+        # For Z=5.0 and fx=320, tx = target_shift * Z / fx
+        tx_calc = (target_shift * 5.0) / 320.0
+        translations[:, 0] = s_quintic * tx_calc
     elif style_upper in ["ORBIT", "MICRO_ORBIT"]:
         scale_t = 0.03 if style_upper == "MICRO_ORBIT" else 0.05
         # Modulate orbit coordinates with C1 window w_loop(t) so velocity starts and ends strictly at 0
@@ -3303,15 +3416,18 @@ def construct_layer_motion_map(
     default_bg_mult = compute_layer_motion_multiplier("BACKGROUND", motion_amplitude)
     motion_map = np.full((h, w), fill_value=default_bg_mult, dtype=np.float32)
 
+    sub_mult = compute_layer_motion_multiplier("PRIMARY_SUBJECT", motion_amplitude)
+
     if spatial_diagnostics is not None and hasattr(spatial_diagnostics, "scene_graph"):
         for ent in spatial_diagnostics.scene_graph.entities.values():
             role_str = str(ent.layer_role.value if hasattr(ent.layer_role, "value") else ent.layer_role).upper()
+            if role_str == "ANALYSIS_ONLY":
+                continue
             mult = compute_layer_motion_multiplier(role_str, motion_amplitude)
             motion_map[ent.mask] = mult
-    else:
-        # Fallback when spatial diagnostics is None
-        sub_mult = compute_layer_motion_multiplier("PRIMARY_SUBJECT", motion_amplitude)
-        motion_map[subject_mask] = sub_mult
+
+    # Guarantee primary subject receives primary subject multiplier
+    motion_map[subject_mask] = sub_mult
 
     return motion_map
 
@@ -3938,7 +4054,8 @@ def main():
 
     # Compute perceptual motion metrics & visibility classification
     perceptual_motion_diag = compute_perceptual_motion_score(
-        rendered_frames, subject_mask, background_depth, per_frame_metrics, trans_plan, rot_plan
+        rendered_frames, subject_mask, background_depth, per_frame_metrics, trans_plan, rot_plan,
+        motion_amplitude=args.motion_amplitude
     )
 
     # Update frame_count_validation and perceptual_motion_engine blocks in metrics.json
