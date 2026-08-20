@@ -1519,6 +1519,49 @@ def generate_motion_amplitude_comparison_contact_sheet(
     return sheet
 
 
+def generate_camera_vs_raster_motion_plot(
+    camera_intent: dict,
+    raster_results: dict,
+    motion_amplitude: str = "MEDIUM"
+) -> np.ndarray:
+    """
+    Generates a diagnostic plot comparing Camera Intent (planned trajectory parameters)
+    against actual measured Raster Motion across layers (Subject, Background, Midground, Foreground).
+    """
+    plot_h, plot_w = 320, 640
+    plot_img = np.full((plot_h, plot_w, 3), fill_value=255, dtype=np.uint8)
+
+    cv2.putText(plot_img, f"Camera Intent vs Raster Motion ({motion_amplitude})", (15, 25), cv2.FONT_HERSHEY_SIMPLEX, 0.55, (0, 0, 0), 2)
+
+    layers = ["PRIMARY_SUBJECT", "BACKGROUND", "MIDGROUND", "FOREGROUND"]
+    colors = [(200, 50, 50), (50, 50, 200), (50, 180, 50), (200, 150, 0)]
+
+    x_start = 60
+    y_start = 60
+    bar_h = 20
+    gap = 55
+
+    disps = [float(raster_results.get(l.lower() + "_displacement_px", 0.0)) for l in layers]
+    max_disp = max(10.0, max(disps + [30.0]))
+
+    for i, (layer, col) in enumerate(zip(layers, colors)):
+        y_pos = y_start + i * gap
+        disp = float(raster_results.get(layer.lower() + "_displacement_px", 0.0))
+        c_delta = float(raster_results.get(layer.lower() + "_centroid_delta", disp))
+
+        cv2.putText(plot_img, f"{layer}", (x_start, y_pos - 5), cv2.FONT_HERSHEY_SIMPLEX, 0.45, (0, 0, 0), 1)
+
+        bar_len = int((disp / max_disp) * (plot_w - 220))
+        cv2.rectangle(plot_img, (x_start, y_pos), (x_start + max(2, bar_len), y_pos + bar_h), col, -1)
+
+        cv2.putText(plot_img, f"{disp:.1f}px (delta: {c_delta:.1f}px)", (x_start + bar_len + 10, y_pos + 15), cv2.FONT_HERSHEY_SIMPLEX, 0.4, (0, 0, 0), 1)
+
+    intent_str = f"Intent: tx={camera_intent.get('tx_max', 0.0):.3f}, ty={camera_intent.get('ty_max', 0.0):.3f}, tz={camera_intent.get('tz_max', 0.0):.3f}"
+    cv2.putText(plot_img, intent_str, (15, plot_h - 15), cv2.FONT_HERSHEY_SIMPLEX, 0.42, (80, 80, 80), 1)
+
+    return plot_img
+
+
 def generate_camera_path_plot(
     translations: np.ndarray,
     rotations: np.ndarray
@@ -2620,6 +2663,9 @@ def render_full_frame_sequence(
     per_frame_metrics = []
 
     bg_mask = ~subject_mask
+    if frames_dir.exists():
+        import shutil
+        shutil.rmtree(frames_dir)
     frames_dir.mkdir(parents=True, exist_ok=True)
 
     for i in range(num_frames):
@@ -3715,6 +3761,25 @@ def main():
     traj_bytes = trans_plan.tobytes() + rot_plan.tobytes()
     trajectory_hash = hashlib.sha256(traj_bytes).hexdigest()[:12]
 
+    # Export camera intent vs raster motion plot
+    camera_intent_dict = {
+        "tx_max": float(np.max(np.abs(trans_plan[:, 0]))),
+        "ty_max": float(np.max(np.abs(trans_plan[:, 1]))),
+        "tz_max": float(np.max(np.abs(trans_plan[:, 2]))),
+    }
+    raster_results_dict = {
+        "primary_subject_displacement_px": perceptual_motion_diag["image_space"]["subject_displacement_px"],
+        "background_displacement_px": perceptual_motion_diag["image_space"]["background_displacement_px"],
+        "midground_displacement_px": perceptual_motion_diag["image_space"]["midground_displacement_px"],
+        "foreground_displacement_px": perceptual_motion_diag["image_space"]["foreground_displacement_px"],
+        "primary_subject_centroid_delta": perceptual_motion_diag["image_space"]["subject_displacement_px"],
+        "background_centroid_delta": perceptual_motion_diag["image_space"]["background_displacement_px"],
+        "midground_centroid_delta": perceptual_motion_diag["image_space"]["midground_displacement_px"],
+        "foreground_centroid_delta": perceptual_motion_diag["image_space"]["foreground_displacement_px"],
+    }
+    cam_vs_raster_plot = generate_camera_vs_raster_motion_plot(camera_intent_dict, raster_results_dict, motion_amplitude=args.motion_amplitude)
+    Image.fromarray(cam_vs_raster_plot).save(hash_dir / "camera_vs_raster_motion.png")
+
     # Export machine-readable motion_report.json
     motion_report = {
         "trajectory_provenance": {
@@ -3727,6 +3792,8 @@ def main():
             "depth_hash": hashlib.sha256(refined_depth.tobytes()).hexdigest()[:8],
             "render_resolution": [pil_img.width, pil_img.height]
         },
+        "camera_intent": camera_intent_dict,
+        "raster_results": raster_results_dict,
         "requested_motion": args.motion,
         "motion_amplitude": args.motion_amplitude,
         "frame_count": requested_frame_count,
@@ -3758,6 +3825,26 @@ def main():
     }
     with open(hash_dir / "motion_report.json", "w") as f:
         json.dump(motion_report, f, indent=2)
+
+    # Export validation_summary.json (4-tier pass validation: MATHEMATICAL_PASS, RASTER_PASS, PERCEPTUAL_PASS, FINAL_PASS)
+    math_pass = bool(np.max(np.abs(trans_plan)) > 0.0)
+    raster_pass = bool(perceptual_motion_diag["image_space"]["background_displacement_px"] > 2.0)
+    perceptual_pass = bool(perceptual_motion_diag["perceptual_motion_gate_passed"])
+    final_pass = bool(math_pass and raster_pass and perceptual_pass)
+
+    val_summary = {
+        "MATHEMATICAL_PASS": math_pass,
+        "RASTER_PASS": raster_pass,
+        "PERCEPTUAL_PASS": perceptual_pass,
+        "FINAL_PASS": final_pass,
+        "motion_amplitude": args.motion_amplitude,
+        "requested_motion": args.motion,
+        "background_displacement_px": perceptual_motion_diag["image_space"]["background_displacement_px"],
+        "subject_scale_growth": perceptual_motion_diag["image_space"]["subject_scale_growth"],
+        "motion_visibility_class": perceptual_motion_diag["motion_visibility_class"]
+    }
+    with open(hash_dir / "validation_summary.json", "w") as f:
+        json.dump(val_summary, f, indent=2)
 
     # Save Phase 1.7 Multi-Row Visual Validation Contact Sheet
     p17_contact_sheet = generate_phase_1_7_multi_row_contact_sheet(

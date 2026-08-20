@@ -2416,6 +2416,45 @@ def test_p20_12_100_frame_motion_validation():
     assert np.any(plot > 0)
 
 
+def test_p0_low_medium_high_raster_displacement_separation():
+    """P0 REGRESSION TEST: Verify LOW < MEDIUM < HIGH raster displacement separation on actual rendered output."""
+    import v0_pipeline as v0
+
+    w, h = 128, 128
+    sub_mask = np.zeros((h, w), dtype=bool); sub_mask[40:88, 40:88] = True
+    bg_mask = ~sub_mask
+
+    depth = np.linspace(1.5, 8.0, h * w).reshape(h, w).astype(np.float32)
+    depth[sub_mask] = 2.0
+
+    rng = np.random.RandomState(42)
+    rgb = rng.randint(50, 200, (h, w, 3), dtype=np.uint8)
+
+    fx, fy, cx, cy = v0.derive_camera_intrinsics(w, h)
+    trans, rots = v0.generate_c1_smooth_trajectory("Cinematic Push-In", 1.0, num_frames=10)
+
+    disps = []
+    for amp in ["LOW", "MEDIUM", "HIGH"]:
+        m_map = v0.construct_layer_motion_map((h, w), sub_mask, motion_amplitude=amp)
+        syn0, _, _ = v0.render_single_frame_forward_splatting(
+            rgb, depth, rgb.copy(), depth, np.ones((h, w), dtype=np.float32),
+            v0.compute_rotation_matrix(rots[0, 0], rots[0, 1], rots[0, 2]),
+            trans[0], fx, fy, cx, cy, layer_motion_map=m_map
+        )
+        syn_mid, _, _ = v0.render_single_frame_forward_splatting(
+            rgb, depth, rgb.copy(), depth, np.ones((h, w), dtype=np.float32),
+            v0.compute_rotation_matrix(rots[5, 0], rots[5, 1], rots[5, 2]),
+            trans[5], fx, fy, cx, cy, layer_motion_map=m_map
+        )
+        diag = v0.compute_perceptual_motion_score(
+            [syn0, syn_mid], sub_mask, depth, [], trans[:6], rots[:6], motion_amplitude=amp
+        )
+        disps.append(diag["image_space"]["background_displacement_px"])
+
+    # Verify monotonic perceptual separation LOW < MEDIUM < HIGH
+    assert disps[0] < disps[1] < disps[2]
+
+
 def test_p0_perceptual_camera_travel_and_quality_gates():
     """P0 REGRESSION TEST: Verify recalibrated camera trajectory produces obvious background displacement without excessive subject growth."""
     import v0_pipeline as v0
