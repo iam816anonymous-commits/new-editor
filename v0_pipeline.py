@@ -1604,6 +1604,66 @@ def generate_p0_frame_difference_artifacts(
     return report
 
 
+def export_temporal_motion_profile(
+    rendered_frames: list,
+    output_dir: Path
+) -> Tuple[Path, Path]:
+    """
+    Exports debug/temporal_motion_profile.json and debug/temporal_motion_profile.png
+    measuring frame-to-frame displacement, velocity, acceleration, and temporal flicker.
+    """
+    from spatial_intelligence.perceptual_motion import measure_temporal_profile
+    debug_dir = output_dir / "debug"
+    debug_dir.mkdir(parents=True, exist_ok=True)
+
+    profile = measure_temporal_profile(rendered_frames)
+    profile_dict = {
+        "frame_count": profile.frame_count,
+        "frame_to_frame_displacements": [float(round(d, 4)) for d in profile.frame_to_frame_displacements],
+        "mean_velocity_px_per_frame": float(round(profile.mean_velocity_px_per_frame, 4)),
+        "max_velocity_px_per_frame": float(round(profile.max_velocity_px_per_frame, 4)),
+        "velocity_std_px": float(round(profile.velocity_std_px, 4)),
+        "acceleration_mean_px": float(round(profile.acceleration_mean_px, 4)),
+        "acceleration_max_px": float(round(profile.acceleration_max_px, 4)),
+        "flicker_score": float(round(profile.flicker_score, 4)),
+        "is_temporally_smooth": profile.is_temporally_smooth
+    }
+
+    json_path = debug_dir / "temporal_motion_profile.json"
+    with open(json_path, "w") as f:
+        json.dump(profile_dict, f, indent=2)
+
+    plot_h, plot_w = 320, 640
+    plot_img = np.full((plot_h, plot_w, 3), fill_value=255, dtype=np.uint8)
+    cv2.putText(plot_img, "Temporal Motion Profile (Velocity & Acceleration)", (15, 25), cv2.FONT_HERSHEY_SIMPLEX, 0.55, (0, 0, 0), 2)
+
+    disps = profile.frame_to_frame_displacements
+    if len(disps) > 1:
+        max_d = max(1.0, max(disps) * 1.2)
+        n_pts = len(disps)
+        x_start, x_end = 50, plot_w - 30
+        y_start, y_end = plot_h - 40, 50
+
+        cv2.line(plot_img, (x_start, y_start), (x_end, y_start), (180, 180, 180), 1)
+        cv2.line(plot_img, (x_start, y_start), (x_start, y_end), (180, 180, 180), 1)
+
+        pts = []
+        for i, d in enumerate(disps):
+            px = int(x_start + (i / max(1, n_pts - 1)) * (x_end - x_start))
+            py = int(y_start - (d / max_d) * (y_start - y_end))
+            pts.append((px, py))
+
+        for i in range(len(pts) - 1):
+            cv2.line(plot_img, pts[i], pts[i + 1], (200, 50, 50), 2)
+
+        cv2.putText(plot_img, f"Mean Vel: {profile.mean_velocity_px_per_frame:.2f} px/f | Flicker: {profile.flicker_score:.2f}",
+                    (15, plot_h - 10), cv2.FONT_HERSHEY_SIMPLEX, 0.45, (50, 50, 50), 1)
+
+    img_path = debug_dir / "temporal_motion_profile.png"
+    Image.fromarray(plot_img).save(img_path)
+    return json_path, img_path
+
+
 def export_p0_raster_debug_trace(
     translations: np.ndarray,
     rotations: np.ndarray,
@@ -4108,6 +4168,9 @@ def main():
     )
     generate_p0_frame_difference_artifacts(
         rendered_frames, subject_mask, hash_dir
+    )
+    export_temporal_motion_profile(
+        rendered_frames, hash_dir
     )
 
     # Export machine-readable motion_report.json

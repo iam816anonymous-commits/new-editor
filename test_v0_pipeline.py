@@ -2416,6 +2416,76 @@ def test_p20_12_100_frame_motion_validation():
     assert np.any(plot > 0)
 
 
+def test_phase_2_3c_perceptual_motion_model_evaluation():
+    """Phase 2.3C: Test formal perceptual motion evaluation model with synthetic rendered frame sequence."""
+    from spatial_intelligence.perceptual_motion import evaluate_formal_perceptual_motion
+
+    h, w = 64, 64
+    f0 = np.full((h, w, 3), 100, dtype=np.uint8)
+    f1 = np.full((h, w, 3), 120, dtype=np.uint8)
+    frames = [f0, f1]
+
+    sub_mask = np.zeros((h, w), dtype=bool)
+    sub_mask[20:44, 20:44] = True
+    bg_depth = np.full((h, w), fill_value=5.0, dtype=np.float32)
+
+    metrics = evaluate_formal_perceptual_motion(frames, sub_mask, bg_depth, motion_amplitude_preset="MEDIUM")
+
+    assert metrics.motion_amplitude_preset == "MEDIUM"
+    assert "PRIMARY_SUBJECT" in metrics.layer_profiles
+    assert "FOREGROUND" in metrics.layer_profiles
+    assert "BACKGROUND" in metrics.layer_profiles
+    assert metrics.subject_rigidity.is_rigid
+    assert metrics.temporal_profile.frame_count == 2
+
+
+def test_phase_2_3c_subject_rigidity_profile():
+    """Phase 2.3C: Verify subject rigidity profile calculations on synthetic frames."""
+    from spatial_intelligence.perceptual_motion import measure_subject_rigidity
+
+    h, w = 64, 64
+    f0 = np.zeros((h, w, 3), dtype=np.uint8)
+    f1 = np.zeros((h, w, 3), dtype=np.uint8)
+    sub_mask = np.zeros((h, w), dtype=bool)
+    sub_mask[16:48, 16:48] = True
+    flow_uv = np.zeros((h, w, 2), dtype=np.float32)
+
+    rigidity = measure_subject_rigidity(sub_mask, f0, f1, flow_uv)
+    assert rigidity.centroid_drift_px == 0.0
+    assert rigidity.scale_growth_ratio == 0.0
+    assert rigidity.is_rigid is True
+
+
+def test_phase_2_3c_temporal_motion_profile():
+    """Phase 2.3C: Verify temporal motion profile velocity and acceleration calculations."""
+    from spatial_intelligence.perceptual_motion import measure_temporal_profile
+
+    h, w = 64, 64
+    f0 = np.full((h, w, 3), 50, dtype=np.uint8)
+    f1 = np.full((h, w, 3), 100, dtype=np.uint8)
+    f2 = np.full((h, w, 3), 150, dtype=np.uint8)
+
+    profile = measure_temporal_profile([f0, f1, f2])
+    assert profile.frame_count == 3
+    assert len(profile.frame_to_frame_displacements) == 2
+    assert profile.is_temporally_smooth is True
+
+
+def test_phase_2_3c_temporal_motion_profile_export(tmp_path):
+    """Phase 2.3C: Verify export_temporal_motion_profile writes JSON and PNG artifacts."""
+    import v0_pipeline as v0
+
+    h, w = 64, 64
+    f0 = np.full((h, w, 3), 50, dtype=np.uint8)
+    f1 = np.full((h, w, 3), 100, dtype=np.uint8)
+    frames = [f0, f1]
+
+    json_path, img_path = v0.export_temporal_motion_profile(frames, tmp_path)
+
+    assert json_path.exists()
+    assert img_path.exists()
+
+
 def test_p0_safety_planner_outlier_robustness():
     """P0 SAFETY PLANNER TEST: Verify near-zero depth outliers do not collapse trajectory scale on valid depth fields."""
     import v0_pipeline as v0

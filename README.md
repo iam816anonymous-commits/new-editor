@@ -115,7 +115,18 @@ $$u' = f_x \cdot \frac{X'}{Z'} + c_x, \quad v' = f_y \cdot \frac{Y'}{Z'} + c_y$$
 
 ---
 
-## 7. Development & Testing
+## 7. Phase 2.3C Documentation & Audits
+
+- **Baseline Audit:** `docs/PHASE_2_3C_BASELINE_AUDIT.md`
+- **Technical Reference Study:** `research/phase_2_3c_perceptual_motion_reference_study.md`
+- **Formal Perceptual Motion Model:** `spatial_intelligence/perceptual_motion.py`
+- **Visual Review Report:** `docs/PHASE_2_3C_VISUAL_REVIEW.md`
+- **Multi-Resolution Benchmark:** `output/phase_2_3c_benchmark/`
+- **Final Validation Report:** `docs/PHASE_2_3C_FINAL_REPORT.md`
+
+---
+
+## 8. Development & Testing
 
 Run unit and integration tests:
 
@@ -123,4 +134,4 @@ Run unit and integration tests:
 python -m pytest
 ```
 
-Level 1 tests verify pure 3D camera geometry math, trajectory generation, and CLI setup. Level 2 tests verify real model loading and tensor outputs. Level 3 tests verify full E2E pipeline execution.
+Level 1 tests verify pure 3D camera geometry math, trajectory generation, and CLI setup. Level 2 tests verify real model loading and tensor outputs. Level 3 tests verify full E2E pipeline execution and Phase 2.3C formal perceptual motion models.
