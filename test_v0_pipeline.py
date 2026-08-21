@@ -2416,6 +2416,94 @@ def test_p20_12_100_frame_motion_validation():
     assert np.any(plot > 0)
 
 
+def test_phase_2_4_parallax_region_depth_statistics():
+    """Phase 2.4: Test region depth statistics calculation."""
+    from spatial_intelligence.parallax_region import compute_region_depth_statistics
+
+    h, w = 64, 64
+    depth = np.full((h, w), 2.5, dtype=np.float32)
+    mask = np.zeros((h, w), dtype=bool); mask[20:44, 20:44] = True
+
+    stats = compute_region_depth_statistics(mask, depth)
+    assert stats["mean"] == 2.5
+    assert stats["median"] == 2.5
+    assert stats["std"] == 0.0
+
+
+def test_phase_2_4_depth_discontinuity_detection():
+    """Phase 2.4: Test continuous depth gradient discontinuity detection."""
+    from spatial_intelligence.parallax_region import detect_depth_discontinuities
+
+    h, w = 64, 64
+    depth = np.full((h, w), 5.0, dtype=np.float32)
+    depth[20:44, 20:44] = 1.0 # Sharp step
+    rgb = np.full((h, w, 3), 100, dtype=np.uint8)
+
+    grad_mag, edges = detect_depth_discontinuities(depth, rgb)
+    assert grad_mag.shape == (h, w)
+    assert np.any(edges)
+
+
+def test_phase_2_4_region_attachment_inference():
+    """Phase 2.4: Test attachment relationship reasoning between parallax regions."""
+    from spatial_intelligence.parallax_region import ParallaxRegion, DepthStructureType
+    from spatial_intelligence.parallax_coupling import infer_region_attachments, AttachmentType
+
+    h, w = 64, 64
+    depth = np.full((h, w), 5.0, dtype=np.float32)
+    rgb = np.full((h, w, 3), 100, dtype=np.uint8)
+
+    m1 = np.zeros((h, w), dtype=bool); m1[10:30, 10:30] = True
+    m2 = np.zeros((h, w), dtype=bool); m2[25:50, 10:30] = True
+
+    r1 = ParallaxRegion(
+        region_id="R1", entity_ids=["E1"], semantic_role="PRIMARY_SUBJECT", parent_region_id=None,
+        mask=m1, area=400, centroid=(20, 20), depth_mean=2.0, depth_median=2.0, depth_p10=2.0,
+        depth_p25=2.0, depth_p50=2.0, depth_p75=2.0, depth_p90=2.0, depth_std=0.1, depth_iqr=0.0,
+        local_depth_gradient=0.1, depth_discontinuity_score=0.1, boundary_strength=0.85,
+        occlusion_boundary_mask=m1, disocclusion_risk=0.1, rigidity_score=0.9, attachment_score=1.0,
+        support_score=1.0, independent_motion_allowed=False, motion_coupling_group="G1",
+        motion_eligibility="PRIMARY_CAMERA_PARALLAX", parallax_priority=1, confidence=0.95,
+        depth_structure_type=DepthStructureType.UNIFORM_DEPTH
+    )
+    r2 = ParallaxRegion(
+        region_id="R2", entity_ids=["E2"], semantic_role="PRIMARY_SUBJECT", parent_region_id=None,
+        mask=m2, area=500, centroid=(35, 20), depth_mean=2.1, depth_median=2.1, depth_p10=2.1,
+        depth_p25=2.1, depth_p50=2.1, depth_p75=2.1, depth_p90=2.1, depth_std=0.1, depth_iqr=0.0,
+        local_depth_gradient=0.1, depth_discontinuity_score=0.1, boundary_strength=0.85,
+        occlusion_boundary_mask=m2, disocclusion_risk=0.1, rigidity_score=0.9, attachment_score=1.0,
+        support_score=1.0, independent_motion_allowed=False, motion_coupling_group="G1",
+        motion_eligibility="PRIMARY_CAMERA_PARALLAX", parallax_priority=1, confidence=0.95,
+        depth_structure_type=DepthStructureType.UNIFORM_DEPTH
+    )
+
+    attachments = infer_region_attachments([r1, r2], depth, rgb)
+    assert len(attachments) == 1
+    assert attachments[0]["attachment_type"] == AttachmentType.RIGIDLY_ATTACHED
+
+
+def test_phase_2_4_disocclusion_forecasting():
+    """Phase 2.4: Test trajectory-aware disocclusion forecasting."""
+    from spatial_intelligence.parallax_region import ParallaxRegion, DepthStructureType, forecast_disocclusion_regions
+
+    h, w = 64, 64
+    m = np.zeros((h, w), dtype=bool); m[20:44, 20:44] = True
+    r1 = ParallaxRegion(
+        region_id="R1", entity_ids=["E1"], semantic_role="PRIMARY_SUBJECT", parent_region_id=None,
+        mask=m, area=576, centroid=(32, 32), depth_mean=2.0, depth_median=2.0, depth_p10=2.0,
+        depth_p25=2.0, depth_p50=2.0, depth_p75=2.0, depth_p90=2.0, depth_std=0.1, depth_iqr=0.0,
+        local_depth_gradient=0.1, depth_discontinuity_score=0.1, boundary_strength=0.85,
+        occlusion_boundary_mask=m, disocclusion_risk=0.1, rigidity_score=0.9, attachment_score=1.0,
+        support_score=1.0, independent_motion_allowed=False, motion_coupling_group="G1",
+        motion_eligibility="PRIMARY_CAMERA_PARALLAX", parallax_priority=1, confidence=0.95,
+        depth_structure_type=DepthStructureType.UNIFORM_DEPTH
+    )
+
+    forecast = forecast_disocclusion_regions([r1], np.array([0.1, 0.0, -0.5]), fx=64.0)
+    assert "total_forecast_area_px" in forecast
+    assert forecast["total_forecast_area_px"] > 0
+
+
 def test_forensic_benchmark_matrix_completeness():
     """FORENSIC TEST 1: Verify all 36 benchmark matrix configurations are executed and non-empty."""
     import glob, json, os
