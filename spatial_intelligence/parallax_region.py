@@ -20,6 +20,13 @@ class DepthStructureType(str, Enum):
     UNCERTAIN_DEPTH = "UNCERTAIN_DEPTH"
 
 
+class EdgeAlignmentStatus(str, Enum):
+    ALIGNED = "ALIGNED"
+    PARTIALLY_ALIGNED = "PARTIALLY_ALIGNED"
+    MISALIGNED = "MISALIGNED"
+    UNCERTAIN = "UNCERTAIN"
+
+
 @dataclass
 class ParallaxRegion:
     """
@@ -128,23 +135,62 @@ def compute_region_depth_statistics(
     }
 
 
-def detect_depth_discontinuities(
+def classify_depth_rgb_edge_alignment(
     depth_map: np.ndarray,
     rgb_array: np.ndarray
-) -> Tuple[np.ndarray, np.ndarray]:
+) -> Tuple[EdgeAlignmentStatus, float, np.ndarray]:
     """
-    Computes continuous depth gradient magnitude |∇depth| fused with RGB edges.
-    Returns: (depth_gradient_map, depth_edge_mask)
+    Classifies alignment between depth gradient edges and RGB color boundaries.
+    Suppresses unaligned depth edges to eliminate depth-edge halos and double edges.
+    Returns: (alignment_status, alignment_iou, validated_depth_edge_mask)
     """
     gx = cv2.Sobel(depth_map, cv2.CV_32F, 1, 0, ksize=3)
     gy = cv2.Sobel(depth_map, cv2.CV_32F, 0, 1, ksize=3)
     grad_mag = np.sqrt(gx**2 + gy**2)
 
-    # Threshold gradient discontinuities
     thresh = float(np.percentile(grad_mag, 90.0))
-    edge_mask = grad_mag > max(0.5, thresh)
+    d_edges = grad_mag > max(0.5, thresh)
 
-    return grad_mag, edge_mask
+    gray = cv2.cvtColor(rgb_array, cv2.COLOR_RGB2GRAY)
+    c_edges = cv2.Canny(gray, 50, 150) > 0
+
+    # Dilate Canny edges by 3px to allow minor alignment tolerance
+    c_dilated = cv2.dilate(c_edges.astype(np.uint8), cv2.getStructuringElement(cv2.MORPH_RECT, (3, 3))) > 0
+
+    # Validated depth edges are depth edges that lie within dilated RGB boundaries
+    validated_d_edges = d_edges & c_dilated
+
+    intersection = np.sum(validated_d_edges)
+    union = np.sum(d_edges | c_edges)
+    iou = float(intersection / max(1, union))
+
+    if iou >= 0.50:
+        status = EdgeAlignmentStatus.ALIGNED
+    elif iou >= 0.25:
+        status = EdgeAlignmentStatus.PARTIALLY_ALIGNED
+    elif iou >= 0.10:
+        status = EdgeAlignmentStatus.UNCERTAIN
+    else:
+        status = EdgeAlignmentStatus.MISALIGNED
+
+    return status, iou, validated_d_edges
+
+
+def detect_depth_discontinuities(
+    depth_map: np.ndarray,
+    rgb_array: np.ndarray
+) -> Tuple[np.ndarray, np.ndarray]:
+    """
+    Computes continuous depth gradient magnitude |∇depth| fused with RGB edge alignment validation.
+    Returns: (depth_gradient_map, validated_depth_edge_mask)
+    """
+    gx = cv2.Sobel(depth_map, cv2.CV_32F, 1, 0, ksize=3)
+    gy = cv2.Sobel(depth_map, cv2.CV_32F, 0, 1, ksize=3)
+    grad_mag = np.sqrt(gx**2 + gy**2)
+
+    status, iou, validated_edge_mask = classify_depth_rgb_edge_alignment(depth_map, rgb_array)
+
+    return grad_mag, validated_edge_mask
 
 
 def construct_parallax_regions(

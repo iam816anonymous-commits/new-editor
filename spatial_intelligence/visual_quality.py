@@ -252,6 +252,67 @@ def evaluate_disocclusion_quality(
     )
 
 
+def compute_expected_3d_geometric_flow(
+    depth_map: np.ndarray,
+    camera_translation: np.ndarray,
+    camera_rotation: np.ndarray,
+    fx: float,
+    fy: float,
+    cx: float,
+    cy: float
+) -> np.ndarray:
+    """
+    Computes exact expected 3D geometric flow vectors d_expected = project(T_camera(backproject(p, Z))) - p.
+    Returns: expected_flow_uv array of shape (H, W, 2)
+    """
+    h, w = depth_map.shape
+    u_grid, v_grid = np.meshgrid(np.arange(w, dtype=np.float32), np.arange(h, dtype=np.float32))
+
+    X = (u_grid - cx) * depth_map / fx
+    Y = (v_grid - cy) * depth_map / fy
+    Z = depth_map
+
+    # SE(3) Transformation
+    pitch, yaw, roll = camera_rotation[0], camera_rotation[1], camera_rotation[2]
+    Rx = np.array([[1, 0, 0], [0, np.cos(pitch), -np.sin(pitch)], [0, np.sin(pitch), np.cos(pitch)]], dtype=np.float32)
+    Ry = np.array([[np.cos(yaw), 0, np.sin(yaw)], [0, 1, 0], [-np.sin(yaw), 0, np.cos(yaw)]], dtype=np.float32)
+    R = Ry @ Rx
+
+    pts_3d = np.column_stack([X.ravel(), Y.ravel(), Z.ravel()])
+    pts_trans = (pts_3d @ R.T) + camera_translation
+
+    Z_trans = np.where(np.abs(pts_trans[:, 2]) < 1e-6, 1e-6, pts_trans[:, 2])
+    u_proj = (fx * (pts_trans[:, 0] / Z_trans) + cx).reshape(h, w)
+    v_proj = (fy * (pts_trans[:, 1] / Z_trans) + cy).reshape(h, w)
+
+    expected_flow = np.zeros((h, w, 2), dtype=np.float32)
+    expected_flow[..., 0] = u_proj - u_grid
+    expected_flow[..., 1] = v_proj - v_grid
+    return expected_flow
+
+
+def compute_surface_residual_flow_error(
+    observed_flow: np.ndarray,
+    expected_flow: np.ndarray,
+    mask: np.ndarray
+) -> Dict[str, float]:
+    """
+    Measures surface residual flow error e_residual = ||d_observed - d_expected|| across a region mask.
+    """
+    if not np.any(mask):
+        return {"residual_mean_px": 0.0, "residual_p95_px": 0.0, "residual_var": 0.0}
+
+    residual_u = observed_flow[..., 0][mask] - expected_flow[..., 0][mask]
+    residual_v = observed_flow[..., 1][mask] - expected_flow[..., 1][mask]
+    residual_mags = np.sqrt(residual_u**2 + residual_v**2)
+
+    return {
+        "residual_mean_px": float(np.mean(residual_mags)),
+        "residual_p95_px": float(np.percentile(residual_mags, 95.0)),
+        "residual_var": float(np.var(residual_mags))
+    }
+
+
 def evaluate_motion_aware_temporal_stability(
     rendered_frames: List[np.ndarray],
     subject_mask: np.ndarray,

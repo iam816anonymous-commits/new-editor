@@ -449,6 +449,14 @@ def export_phase_2_4_diagnostic_package(
     e_vis = (depth_edges * 255).astype(np.uint8)
     Image.fromarray(e_vis).save(analysis_dir / "02_depth_edges.png")
 
+    # 15_splat_coverage.png
+    cov_vis = np.clip((depth_map > 0.1).astype(np.float32) * 255.0, 0, 255).astype(np.uint8)
+    Image.fromarray(cov_vis).save(analysis_dir / "15_splat_coverage.png")
+
+    # 16_zbuffer_ownership.png
+    z_vis = np.clip((depth_map / max(1e-5, depth_map.max())) * 255.0, 0, 255).astype(np.uint8)
+    Image.fromarray(cv2.applyColorMap(z_vis, cv2.COLORMAP_VIRIDIS)).save(analysis_dir / "16_zbuffer_ownership.png")
+
     # 00_primary_spatial_overlay.png (PRIMARY OVERLAY VISUALIZATION)
     overlay = rgb_array.copy()
     cv2.putText(overlay, "PRIMARY SPATIAL OVERLAY (PHASE 2.4)", (15, 30), cv2.FONT_HERSHEY_SIMPLEX, 0.7, (255, 255, 255), 2)

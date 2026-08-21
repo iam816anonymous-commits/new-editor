@@ -181,19 +181,19 @@ def edge_aware_depth_refinement(
     rgb_array: np.ndarray,
     depth_map: np.ndarray,
     d: int = 9,
-    sigma_color: float = 75.0,
-    sigma_space: float = 75.0
+    sigma_color: float = 50.0,
+    sigma_space: float = 50.0
 ) -> np.ndarray:
     """
-    Refines depth map edges guided by RGB color boundaries.
-    Preserves depth discontinuities at object boundaries without blurring across edges
-    by combining edge guidance with bilateral filtering.
+    Refines depth map to create RENDERING_DEPTH from RAW_DEPTH:
+    1. Applies RGB-guided bilateral filtering to smooth small intra-surface depth noise.
+    2. Preserves sharp true depth discontinuities at Canny RGB boundaries.
     """
     d_min, d_max = depth_map.min(), depth_map.max()
     if d_max <= d_min:
         return depth_map.copy()
 
-    depth_norm = ((depth_map - d_min) / (d_max - d_min) * 255.0).astype(np.uint8)
+    depth_norm = ((depth_map - d_min) / max(1e-5, d_max - d_min) * 255.0).astype(np.uint8)
 
     # Bilateral filter on normalized depth map
     filtered_norm = cv2.bilateralFilter(
@@ -203,17 +203,16 @@ def edge_aware_depth_refinement(
         sigmaSpace=sigma_space
     )
 
-    # Guide bilateral filter using RGB edge mask so depth smoothing stops at RGB boundaries
     gray = cv2.cvtColor(rgb_array, cv2.COLOR_RGB2GRAY)
     edges = cv2.Canny(gray, 50, 150)
     edge_mask = (edges > 0)
 
-    # Do not cross-smooth across RGB edges
+    # Do not cross-smooth across Canny RGB edges
     refined_norm = filtered_norm.copy()
     refined_norm[edge_mask] = depth_norm[edge_mask]
 
     refined_depth = d_min + (refined_norm.astype(np.float32) / 255.0) * (d_max - d_min)
-    return refined_depth
+    return refined_depth.astype(np.float32)
 
 
 def compute_depth_confidence_map(
