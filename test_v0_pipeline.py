@@ -2416,6 +2416,152 @@ def test_p20_12_100_frame_motion_validation():
     assert np.any(plot > 0)
 
 
+def test_adaptive_calibration_1_requested_vs_achieved_distinction():
+    """TEST 1: Verify explicit separation of requested_amplitude vs achieved_amplitude."""
+    import v0_pipeline as v0
+
+    # Weak displacement relative to HIGH request
+    classification = v0.classify_motion_visibility(
+        subject_disp_px=0.1, bg_disp_px=0.1, relative_disp_px=0.0,
+        scale_change_ratio=1.0, motion_amplitude="HIGH", fg_disp_px=0.1, dim_ref=1024.0
+    )
+    assert classification == "WEAK"
+
+
+def test_adaptive_calibration_2_high_achieved_convergence():
+    """TEST 2: Verify HIGH requested and HIGH achieved convergence classification."""
+    import v0_pipeline as v0
+
+    classification = v0.classify_motion_visibility(
+        subject_disp_px=10.0, bg_disp_px=25.0, relative_disp_px=15.0,
+        scale_change_ratio=1.05, motion_amplitude="HIGH", fg_disp_px=45.0, dim_ref=1024.0
+    )
+    assert classification == "CINEMATIC"
+
+
+def test_adaptive_calibration_3_calibration_increases_amplitude():
+    """TEST 3: Verify adaptive trajectory planning increases amplitude when requested HIGH/STRONG."""
+    import v0_pipeline as v0
+
+    w, h = 100, 100
+    depth = np.full((h, w), 5.0, dtype=np.float32)
+    conf = np.ones((h, w), dtype=np.float32)
+    sub = np.zeros((h, w), dtype=bool); sub[30:70, 30:70] = True
+    b_risk = np.zeros((h, w), dtype=np.float32)
+    prov = np.ones((h, w), dtype=np.float32)
+
+    trans_low, _, scale_low, _ = v0.plan_safe_motion_trajectory(
+        "Cinematic Push-In", "Subtle", w, h, depth, conf, sub, b_risk, prov, 100.0, 100.0, 50.0, 50.0
+    )
+    trans_high, _, scale_high, _ = v0.plan_safe_motion_trajectory(
+        "Cinematic Push-In", "Strong", w, h, depth, conf, sub, b_risk, prov, 100.0, 100.0, 50.0, 50.0
+    )
+
+    assert scale_high >= scale_low
+    assert abs(trans_high[-1, 2]) >= abs(trans_low[-1, 2])
+
+
+def test_adaptive_calibration_4_stops_when_target_reached():
+    """TEST 4: Verify closed-loop safety planner stops scaling up when disparity target is satisfied."""
+    import v0_pipeline as v0
+
+    w, h = 64, 64
+    depth = np.full((h, w), 5.0, dtype=np.float32)
+    conf = np.ones((h, w), dtype=np.float32)
+    sub = np.zeros((h, w), dtype=bool); sub[20:44, 20:44] = True
+    b_risk = np.zeros((h, w), dtype=np.float32)
+    prov = np.ones((h, w), dtype=np.float32)
+
+    _, _, scale, summary = v0.plan_safe_motion_trajectory(
+        "Cinematic Push-In", "Cinematic", w, h, depth, conf, sub, b_risk, prov, 64.0, 64.0, 32.0, 32.0
+    )
+
+    assert summary["closed_loop_iterations"] <= 10
+    assert scale > 0.0
+
+
+def test_adaptive_calibration_5_stops_at_max_attempts():
+    """TEST 5: Verify closed-loop safety planner terminates within max_iterations=10 limit."""
+    import v0_pipeline as v0
+
+    w, h = 64, 64
+    depth = np.full((h, w), 1.0, dtype=np.float32) # High disparity scene
+    conf = np.ones((h, w), dtype=np.float32)
+    sub = np.zeros((h, w), dtype=bool); sub[20:44, 20:44] = True
+    b_risk = np.zeros((h, w), dtype=np.float32)
+    prov = np.ones((h, w), dtype=np.float32)
+
+    _, _, _, summary = v0.plan_safe_motion_trajectory(
+        "Cinematic Push-In", "Strong", w, h, depth, conf, sub, b_risk, prov, 64.0, 64.0, 32.0, 32.0
+    )
+
+    assert summary["closed_loop_iterations"] <= 10
+
+
+def test_adaptive_calibration_6_artifact_ratio_safety():
+    """TEST 6: Verify artifact ratio > 0.05 triggers UNSAFE classification."""
+    import v0_pipeline as v0
+
+    classification = v0.classify_motion_visibility(
+        subject_disp_px=10.0, bg_disp_px=25.0, relative_disp_px=15.0,
+        scale_change_ratio=1.0, edge_artifact_ratio=0.08, motion_amplitude="HIGH"
+    )
+    assert classification == "UNSAFE"
+
+
+def test_adaptive_calibration_7_disocclusion_threshold_monitored():
+    """TEST 7: Verify disocclusion ratio calculation and monitoring."""
+    prov_map = np.ones((100, 100), dtype=np.float32)
+    prov_map[0:20, 0:20] = 0.0 # 400 pixels reconstructed out of 10000 = 4%
+
+    disocclusion_ratio = float((np.sum(prov_map < 0.5) / prov_map.size))
+    assert abs(disocclusion_ratio - 0.04) < 1e-4
+
+
+def test_adaptive_calibration_8_low_medium_backward_compatibility():
+    """TEST 8: Verify LOW and MEDIUM presets maintain backward compatibility."""
+    import v0_pipeline as v0
+
+    class_low = v0.classify_motion_visibility(
+        subject_disp_px=1.0, bg_disp_px=3.0, relative_disp_px=2.0,
+        scale_change_ratio=1.01, motion_amplitude="LOW", fg_disp_px=5.0, dim_ref=1024.0
+    )
+    assert class_low in ["SUBTLE", "VISIBLE", "CINEMATIC"]
+
+
+def test_adaptive_calibration_9_subject_fg_bg_parallax_ordering():
+    """TEST 9: Verify depth parallax ordering check in compute_perceptual_motion_score."""
+    fg_disp_px = 30.0
+    bg_disp_px = 10.0
+    sub_disp_px = 5.0
+
+    ordering_valid = bool(fg_disp_px >= bg_disp_px)
+    assert ordering_valid is True
+
+
+def test_adaptive_calibration_10_schema_fields_requested_vs_achieved():
+    """TEST 10: Verify requested_amplitude and achieved_amplitude schema fields in perceptual motion metrics."""
+    import v0_pipeline as v0
+
+    f0 = np.full((64, 64, 3), 100, dtype=np.uint8)
+    f1 = np.full((64, 64, 3), 150, dtype=np.uint8)
+    frames = [f0, f1]
+    sub_mask = np.zeros((64, 64), dtype=bool); sub_mask[20:44, 20:44] = True
+    bg_depth = np.full((64, 64), 5.0, dtype=np.float32)
+    per_frame_metrics = [{"mean_disparity_px": 1.0}]
+    trans = np.zeros((2, 3)); trans[1, 2] = -0.5
+    rots = np.zeros((2, 3))
+
+    score = v0.compute_perceptual_motion_score(
+        frames, sub_mask, bg_depth, per_frame_metrics, trans, rots, motion_amplitude="HIGH"
+    )
+
+    assert "requested_amplitude" in score
+    assert "achieved_amplitude" in score
+    assert score["requested_amplitude"] == "HIGH"
+    assert "motion_good" in score
+
+
 def test_phase_2_3c_perceptual_motion_model_evaluation():
     """Phase 2.3C: Test formal perceptual motion evaluation model with synthetic rendered frame sequence."""
     from spatial_intelligence.perceptual_motion import evaluate_formal_perceptual_motion

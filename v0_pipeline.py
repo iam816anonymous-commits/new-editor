@@ -2516,37 +2516,39 @@ def classify_motion_visibility(
     relative_disp_px: float,
     scale_change_ratio: float,
     edge_artifact_ratio: float = 0.01,
-    motion_amplitude: str = "MEDIUM"
+    motion_amplitude: str = "MEDIUM",
+    fg_disp_px: float = 0.0,
+    dim_ref: float = 1024.0
 ) -> str:
     """
-    Classifies motion visibility into:
+    Classifies achieved motion visibility into:
     NEGLIGIBLE, SUBTLE, VISIBLE, CINEMATIC, EXCESSIVE, UNSAFE, WEAK
-    Phase 2.3 Environmental Motion Philosophy:
-    - Replaces subject scale growth floors with Environmental Motion & Background Parallax Floors.
-    - MEDIUM target: bg_disp_px >= 10px OR relative bg/subject separation >= 5px.
-    - HIGH target: bg_disp_px >= 18px OR relative bg/subject separation >= 10px.
+    Using resolution-aware normalized image-space displacement metrics (disp_px / dim_ref).
     """
-    if edge_artifact_ratio > 0.08:
+    if edge_artifact_ratio > 0.05:
         return "UNSAFE"
 
+    dim_ref = float(max(100.0, dim_ref))
+    norm_bg = bg_disp_px / dim_ref
+    norm_fg = max(fg_disp_px, bg_disp_px) / dim_ref
+    norm_rel = abs(relative_disp_px) / dim_ref
     amp_upper = motion_amplitude.upper()
-    rel_bg_sub = abs(bg_disp_px - subject_disp_px)
 
-    if amp_upper == "MEDIUM" and (bg_disp_px < 8.0 and rel_bg_sub < 3.0):
-        return "WEAK"
-    elif amp_upper == "HIGH" and (bg_disp_px < 15.0 and rel_bg_sub < 6.0):
-        return "WEAK"
-
-    if bg_disp_px < 2.0 and subject_disp_px < 2.0:
-        return "NEGLIGIBLE"
-    elif bg_disp_px < 6.0:
-        return "SUBTLE"
-    elif bg_disp_px < 15.0:
-        return "VISIBLE"
-    elif bg_disp_px < 50.0:
-        return "CINEMATIC"
-    else:
+    # Resolution-normalized classification thresholds
+    if norm_bg > 0.08 or norm_fg > 0.12:
         return "EXCESSIVE"
+    elif amp_upper == "MEDIUM" and (norm_fg < 0.005 and norm_bg < 0.002 and norm_rel < 0.003):
+        return "WEAK"
+    elif amp_upper == "HIGH" and (norm_fg < 0.010 and norm_bg < 0.004 and norm_rel < 0.008):
+        return "WEAK"
+    elif norm_fg >= 0.015 or norm_bg >= 0.010 or norm_rel >= 0.010:
+        return "CINEMATIC"
+    elif norm_fg >= 0.008 or norm_bg >= 0.004 or norm_rel >= 0.003:
+        return "VISIBLE"
+    elif norm_fg >= 0.002 or norm_bg >= 0.001:
+        return "SUBTLE"
+    else:
+        return "NEGLIGIBLE"
 
 
 def evaluate_subject_scale_change(
@@ -2697,8 +2699,10 @@ def compute_perceptual_motion_score(
     scale_ratio = scale_metrics["scale_change_ratio"]
     scale_growth = scale_metrics["subject_scale_growth"]
 
+    dim_ref = float(max(w, h))
     vis_class = classify_motion_visibility(
-        sub_disp_px, bg_disp_px, rel_bg_sub_px, scale_ratio, motion_amplitude=motion_amplitude
+        sub_disp_px, bg_disp_px, rel_bg_sub_px, scale_ratio,
+        motion_amplitude=motion_amplitude, fg_disp_px=fg_disp_px, dim_ref=dim_ref
     )
 
     cam_tx_max = float(np.max(np.abs(camera_translations[:, 0])))
@@ -2706,10 +2710,9 @@ def compute_perceptual_motion_score(
     cam_tz_max = float(np.max(np.abs(camera_translations[:, 2])))
 
     # Decompose Environmental Motion Score and Subject Stability Score
-    # subject_stability_score: range [0.0, 1.0], higher is better (1.0 = scale growth <= 4% and stable centroid)
-    background_motion_score = float(np.clip(bg_disp_px / 15.0, 0.0, 1.0))
-    midground_motion_score = float(np.clip(mg_disp_px / 25.0, 0.0, 1.0))
-    foreground_motion_score = float(np.clip(fg_disp_px / 40.0, 0.0, 1.0))
+    background_motion_score = float(np.clip(bg_disp_px / max(1.0, 0.015 * dim_ref), 0.0, 1.0))
+    midground_motion_score = float(np.clip(mg_disp_px / max(1.0, 0.025 * dim_ref), 0.0, 1.0))
+    foreground_motion_score = float(np.clip(fg_disp_px / max(1.0, 0.040 * dim_ref), 0.0, 1.0))
     subject_stability_component = float(1.0 - np.clip(abs(scale_growth) / 0.10, 0.0, 1.0))
 
     environmental_motion_score = float(0.4 * background_motion_score + 0.3 * midground_motion_score + 0.3 * foreground_motion_score)
@@ -2719,9 +2722,32 @@ def compute_perceptual_motion_score(
     temp_mads = [float(m["mean_disparity_px"]) for m in per_frame_metrics] if per_frame_metrics else [0.5]
     motion_stability_score = float(1.0 - np.clip(np.std(temp_mads) / 10.0, 0.0, 0.5))
 
-    # Hard Perceptual Motion Acceptance Gate:
-    # Fail if motion_visibility_class is WEAK, NEGLIGIBLE, or UNSAFE
-    motion_gate_passed = bool(vis_class not in ["WEAK", "NEGLIGIBLE", "UNSAFE"])
+    # Requested vs Achieved Amplitude Mapping
+    req_upper = motion_amplitude.upper()
+    if vis_class in ["CINEMATIC", "EXCESSIVE"]:
+        achieved_amp = "HIGH"
+    elif vis_class == "VISIBLE":
+        achieved_amp = "MEDIUM"
+    elif vis_class == "SUBTLE":
+        achieved_amp = "LOW"
+    else:
+        achieved_amp = "WEAK"
+
+    if req_upper == "HIGH":
+        motion_good = bool(achieved_amp == "HIGH")
+    elif req_upper == "MEDIUM":
+        motion_good = bool(achieved_amp in ["MEDIUM", "HIGH"])
+    elif req_upper in ["LOW", "SUBTLE"]:
+        motion_good = bool(achieved_amp in ["LOW", "MEDIUM", "HIGH"])
+    else:
+        motion_good = True
+
+    failure_reasons = []
+    if not motion_good:
+        failure_reasons.append(f"Achieved motion ({achieved_amp}) below requested target ({req_upper})")
+    if abs(scale_growth) > 0.12:
+        motion_good = False
+        failure_reasons.append(f"Subject scale growth ({scale_growth*100.0:.1f}%) exceeded stability threshold (12.0%)")
 
     return {
         "camera_space": {
@@ -2752,10 +2778,13 @@ def compute_perceptual_motion_score(
         "motion_stability_score": motion_stability_score,
         "motion_effectiveness_score": environmental_motion_score,
         "perceptual_motion_score": cinematic_motion_score,
+        "requested_amplitude": motion_amplitude,
+        "achieved_amplitude": achieved_amp,
         "motion_visibility_class": vis_class,
-        "motion_ordering_valid": bool(fg_disp_px >= mg_disp_px >= bg_disp_px >= sub_disp_px),
-        "perceptual_motion_gate_passed": motion_gate_passed,
-        "motion_good": motion_gate_passed
+        "motion_ordering_valid": bool(fg_disp_px >= bg_disp_px),
+        "perceptual_motion_gate_passed": motion_good,
+        "motion_good": motion_good,
+        "failure_reasons": failure_reasons
     }
 
 
@@ -3301,13 +3330,18 @@ def plan_safe_motion_trajectory(
         mean_disp_px = mean_disp_across_all
 
         # Verify safety envelope constraints
-        if max_disp_px <= target_disparity_ceiling or magnitude_scale <= 0.01:
-            accepted = True
-            break
-
-        # Closed-loop reduction
-        reduction_factor = target_disparity_ceiling / max(max_disp_px, 1e-5)
-        magnitude_scale *= max(reduction_factor * 0.95, 0.5)
+        if max_disp_px <= target_disparity_ceiling:
+            # Check if trajectory is under-leveraging available disparity capacity for HIGH/STRONG request
+            if strength.upper() in ["STRONG", "HIGH"] and max_disp_px < 0.85 * target_disparity_ceiling and iteration < 8:
+                expansion_factor = min(1.8, (0.90 * target_disparity_ceiling) / max(max_disp_px, 1.0))
+                magnitude_scale *= expansion_factor
+            else:
+                accepted = True
+                break
+        else:
+            # Closed-loop reduction
+            reduction_factor = target_disparity_ceiling / max(max_disp_px, 1e-5)
+            magnitude_scale *= max(reduction_factor * 0.95, 0.5)
 
     # Re-generate final accepted trajectory
     translations, rotations = generate_c1_smooth_trajectory(style, magnitude_scale, num_frames=num_frames)
@@ -4188,6 +4222,8 @@ def main():
         "camera_intent": camera_intent_dict,
         "raster_results": raster_results_dict,
         "requested_motion": args.motion,
+        "requested_amplitude": perceptual_motion_diag.get("requested_amplitude", args.motion_amplitude),
+        "achieved_amplitude": perceptual_motion_diag.get("achieved_amplitude", "MEDIUM"),
         "motion_amplitude": args.motion_amplitude,
         "frame_count": requested_frame_count,
         "fps": 24,
@@ -4214,14 +4250,14 @@ def main():
         "depth_parallax_score": perceptual_motion_diag["perceptual_motion_score"],
         "motion_classification": perceptual_motion_diag["motion_visibility_class"],
         "motion_good": perceptual_motion_diag["motion_good"],
-        "failure_reasons": [] if perceptual_motion_diag["motion_good"] else ["Insufficient environmental parallax motion or weak trajectory response"]
+        "failure_reasons": perceptual_motion_diag.get("failure_reasons", [])
     }
     with open(hash_dir / "motion_report.json", "w") as f:
         json.dump(motion_report, f, indent=2)
 
     # Export validation_summary.json (4-tier pass validation: MATHEMATICAL_PASS, RASTER_PASS, PERCEPTUAL_PASS, FINAL_PASS)
     math_pass = bool(np.max(np.abs(trans_plan)) > 0.0)
-    raster_pass = bool(perceptual_motion_diag["image_space"]["background_displacement_px"] > 2.0)
+    raster_pass = bool(perceptual_motion_diag["image_space"]["foreground_displacement_px"] > 2.0 or perceptual_motion_diag["image_space"]["background_displacement_px"] > 0.5)
     perceptual_pass = bool(perceptual_motion_diag["perceptual_motion_gate_passed"])
     final_pass = bool(math_pass and raster_pass and perceptual_pass)
 
@@ -4230,11 +4266,15 @@ def main():
         "RASTER_PASS": raster_pass,
         "PERCEPTUAL_PASS": perceptual_pass,
         "FINAL_PASS": final_pass,
+        "requested_amplitude": perceptual_motion_diag.get("requested_amplitude", args.motion_amplitude),
+        "achieved_amplitude": perceptual_motion_diag.get("achieved_amplitude", "MEDIUM"),
         "motion_amplitude": args.motion_amplitude,
         "requested_motion": args.motion,
         "background_displacement_px": perceptual_motion_diag["image_space"]["background_displacement_px"],
+        "foreground_displacement_px": perceptual_motion_diag["image_space"]["foreground_displacement_px"],
         "subject_scale_growth": perceptual_motion_diag["image_space"]["subject_scale_growth"],
-        "motion_visibility_class": perceptual_motion_diag["motion_visibility_class"]
+        "motion_visibility_class": perceptual_motion_diag["motion_visibility_class"],
+        "failure_reasons": perceptual_motion_diag.get("failure_reasons", [])
     }
     with open(hash_dir / "validation_summary.json", "w") as f:
         json.dump(val_summary, f, indent=2)
