@@ -26,8 +26,12 @@ from .scene_graph import create_scene_graph, export_scene_graph_dict
 from .entity_consolidator import consolidate_candidates
 from .entity_trust import compute_entity_trust_score, classify_entity_class_role_and_relevance, process_entity_trust_and_roles
 from .relationship_inferencer import infer_spatial_relationships
+from .visual_quality import compute_composite_quality_score, VisualQualityMetrics, ArtifactCode
 
 __all__ = [
+    "compute_composite_quality_score",
+    "VisualQualityMetrics",
+    "ArtifactCode",
     "RelationType",
     "EntityClass",
     "LayerRole",

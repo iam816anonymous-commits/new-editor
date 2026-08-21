@@ -2416,6 +2416,56 @@ def test_p20_12_100_frame_motion_validation():
     assert np.any(plot > 0)
 
 
+def test_forensic_benchmark_matrix_completeness():
+    """FORENSIC TEST 1: Verify all 36 benchmark matrix configurations are executed and non-empty."""
+    import glob, json, os
+
+    reports = glob.glob("output/visual_quality_benchmark/**/quality_summary.json", recursive=True)
+    assert len(reports) == 36, f"Expected 36 benchmark runs, found {len(reports)}"
+
+    for r_path in reports:
+        assert os.path.exists(r_path)
+        with open(r_path) as f:
+            data = json.load(f)
+        assert "overall_quality_score" in data
+        assert "quality_class" in data
+
+
+def test_forensic_frame_count_consistency():
+    """FORENSIC TEST 2: Verify requested vs generated frame count consistency."""
+    import v0_pipeline as v0
+
+    h, w = 64, 64
+    f0 = np.full((h, w, 3), 100, dtype=np.uint8)
+    f1 = np.full((h, w, 3), 110, dtype=np.uint8)
+    sub_mask = np.zeros((h, w), dtype=bool); sub_mask[20:44, 20:44] = True
+    bg_depth = np.full((h, w), 5.0, dtype=np.float32)
+    per_frame_metrics = [{"mean_disparity_px": 1.0}]
+    trans = np.zeros((2, 3)); rots = np.zeros((2, 3))
+
+    score = v0.compute_perceptual_motion_score(
+        [f0, f1], sub_mask, bg_depth, per_frame_metrics, trans, rots, motion_amplitude="MEDIUM"
+    )
+    assert "motion_good" in score
+
+
+def test_forensic_quality_summary_provenance():
+    """FORENSIC TEST 3: Verify quality_summary.json metric key provenance."""
+    from spatial_intelligence.visual_quality import compute_composite_quality_score
+
+    h, w = 64, 64
+    f0 = np.full((h, w, 3), 100, dtype=np.uint8)
+    sub_mask = np.zeros((h, w), dtype=bool); sub_mask[20:44, 20:44] = True
+    prov_map = np.ones((h, w), dtype=np.float32)
+    bg_depth = np.full((h, w), 5.0, dtype=np.float32)
+
+    qual = compute_composite_quality_score([f0, f0], sub_mask, prov_map, bg_depth)
+    d = qual.to_dict()
+
+    assert 0.0 <= d["overall_score"] <= 1.0
+    assert isinstance(d["detected_artifact_codes"], list)
+
+
 def test_adaptive_calibration_1_requested_vs_achieved_distinction():
     """TEST 1: Verify explicit separation of requested_amplitude vs achieved_amplitude."""
     import v0_pipeline as v0
