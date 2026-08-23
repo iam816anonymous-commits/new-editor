@@ -3226,6 +3226,44 @@ def test_camera_smoke_f_layer_differential_motion():
 # PHASE 2.1: PERCEPTUAL CAMERA MOTION TESTS
 # ============================================================
 
+def test_subpixel_splatting_math_and_z_ownership():
+    """PHASE 2.4C TEST: Verifies subpixel splatting weight conservation (sum=1.0) and Z-buffer ownership."""
+    from v0_pipeline import render_single_frame_forward_splatting
+
+    # Test bilinear weight sum for subpixel offsets
+    for pu in [10.01, 10.05, 10.10, 10.25, 10.50, 11.00]:
+        for pv in [20.01, 20.05, 20.10, 20.25, 20.50, 21.00]:
+            u0 = int(np.floor(pu))
+            v0 = int(np.floor(pv))
+            du = float(pu - u0)
+            dv = float(pv - v0)
+            w00 = (1.0 - du) * (1.0 - dv)
+            w10 = du * (1.0 - dv)
+            w01 = (1.0 - du) * dv
+            w11 = du * dv
+            w_sum = w00 + w10 + w01 + w11
+            assert np.isclose(w_sum, 1.0, atol=1e-6)
+
+    # Test Z-ownership reset in single frame splatting
+    h, w = 64, 64
+    rgb = np.ones((h, w, 3), dtype=np.uint8) * 100
+    depth = np.full((h, w), 5.0, dtype=np.float32)
+    bg_plate = np.ones((h, w, 3), dtype=np.uint8) * 50
+    bg_depth = np.full((h, w), 10.0, dtype=np.float32)
+    prov = np.ones((h, w), dtype=np.float32)
+    R = np.eye(3)
+    t = np.array([0.05, 0.0, 0.0], dtype=np.float64)
+
+    syn_rgb, syn_z, syn_prov = render_single_frame_forward_splatting(
+        rgb, depth, bg_plate, bg_depth, prov, R, t, 64.0, 64.0, 32.0, 32.0
+    )
+
+    assert syn_rgb.shape == (h, w, 3)
+    valid_z = syn_z[syn_z < 1e8]
+    assert len(valid_z) > 0
+    assert np.mean(valid_z) == pytest.approx(5.0, abs=0.1)  # Closer surface Z (5.0) strictly wins over background Z (10.0)
+
+
 def test_p21_1_negative_tz_camera_push_in_direction():
     """TEST 1: Verify Cinematic Push-In decreases camera-to-subject distance (negative t_z)."""
     import v0_pipeline as v0

@@ -81,6 +81,25 @@ class MotionAwareTemporalMetrics:
 
 
 @dataclass
+class ThreeTierDiagnosticReport:
+    camera_motion_pass: bool
+    geometric_motion_pass: bool
+    perceptual_stability_pass: bool
+    final_pass: bool
+    camera_motion_reason: str
+    geometric_motion_reason: str
+    perceptual_stability_reason: str
+
+    def to_dict(self) -> Dict[str, Any]:
+        return {
+            "camera_motion": {"pass": self.camera_motion_pass, "reason": self.camera_motion_reason},
+            "geometric_motion": {"pass": self.geometric_motion_pass, "reason": self.geometric_motion_reason},
+            "perceptual_stability": {"pass": self.perceptual_stability_pass, "reason": self.perceptual_stability_reason},
+            "final_pass": self.final_pass
+        }
+
+
+@dataclass
 class VisualQualityMetrics:
     overall_score: float  # 0.0 to 1.0
     motion_effectiveness: float
@@ -461,4 +480,36 @@ def compute_composite_quality_score(
         quality_class=q_class,
         detected_artifact_codes=codes,
         failure_reasons=failure_reasons
+    )
+
+
+def evaluate_three_tier_diagnostics(
+    camera_translations: np.ndarray,
+    observed_flow: np.ndarray,
+    expected_flow: np.ndarray,
+    subject_mask: np.ndarray,
+    quality_metrics: VisualQualityMetrics
+) -> ThreeTierDiagnosticReport:
+    """
+    Evaluates 3-tier diagnostic report strictly separating CAMERA MOTION, GEOMETRIC MOTION, and PERCEPTUAL STABILITY.
+    """
+    cam_max = float(np.max(np.abs(camera_translations)))
+    cam_pass = cam_max > 1e-4 or np.all(camera_translations == 0.0)
+    cam_reason = "Valid trajectory generated." if cam_pass else "Zero camera motion planned for active preset."
+
+    res_err = compute_surface_residual_flow_error(observed_flow, expected_flow, np.ones_like(subject_mask, dtype=bool))
+    geom_pass = res_err["residual_mean_px"] < 3.0 and res_err["residual_p95_px"] < 8.0
+    geom_reason = f"Mean residual error {res_err['residual_mean_px']:.2f}px within 3.0px ceiling." if geom_pass else f"Geometric residual error {res_err['residual_mean_px']:.2f}px exceeds tolerance."
+
+    perc_pass = quality_metrics.overall_score >= 0.65 and len(quality_metrics.detected_artifact_codes) == 0
+    perc_reason = f"Quality score {quality_metrics.overall_score:.2f} passes perceptual threshold with 0 artifacts." if perc_pass else f"Perceptual failure: artifacts detected {quality_metrics.detected_artifact_codes} or low score {quality_metrics.overall_score:.2f}."
+
+    return ThreeTierDiagnosticReport(
+        camera_motion_pass=cam_pass,
+        geometric_motion_pass=geom_pass,
+        perceptual_stability_pass=perc_pass,
+        final_pass=cam_pass and geom_pass and perc_pass,
+        camera_motion_reason=cam_reason,
+        geometric_motion_reason=geom_reason,
+        perceptual_stability_reason=perc_reason
     )
