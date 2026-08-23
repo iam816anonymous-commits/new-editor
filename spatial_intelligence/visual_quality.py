@@ -381,7 +381,8 @@ def detect_visual_artifacts(
     rendered_frames: List[np.ndarray],
     subject_mask: np.ndarray,
     provenance_map: np.ndarray,
-    background_depth: np.ndarray
+    background_depth: np.ndarray,
+    expected_flow: Optional[np.ndarray] = None
 ) -> Tuple[List[str], float]:
     """
     Detects specific 2.5D rendering artifact codes:
@@ -413,11 +414,17 @@ def detect_visual_artifacts(
 
     # 3. TEXTURE_SWIM / RUBBER_SHEET
     flow = cv2.calcOpticalFlowFarneback(f0_gray, last_gray, None, 0.5, 3, 15, 3, 5, 1.2, 0)
-    flow_sub = flow[subject_mask] if np.any(subject_mask) else flow
-    u_var = float(np.var(flow_sub[..., 0])) if len(flow_sub) > 0 else 0.0
-    if u_var > 400.0:
-        codes.append(ArtifactCode.TEXTURE_SWIM.value)
-        penalty += 0.10
+    if expected_flow is not None and expected_flow.shape[:2] == flow.shape[:2]:
+        res_err = compute_surface_residual_flow_error(flow, expected_flow, subject_mask)
+        if res_err["residual_mean_px"] > 4.0 or res_err["residual_var"] > 16.0:
+            codes.append(ArtifactCode.TEXTURE_SWIM.value)
+            penalty += 0.15
+    else:
+        flow_sub = flow[subject_mask] if np.any(subject_mask) else flow
+        u_var = float(np.var(flow_sub[..., 0])) if len(flow_sub) > 0 else 0.0
+        if u_var > 400.0:
+            codes.append(ArtifactCode.TEXTURE_SWIM.value)
+            penalty += 0.10
 
     return codes, float(np.clip(penalty, 0.0, 1.0))
 
