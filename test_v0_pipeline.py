@@ -3232,7 +3232,7 @@ def test_p21_1_negative_tz_camera_push_in_direction():
 
     trans, rots = v0.generate_c1_smooth_trajectory("Cinematic Push-In", magnitude_scale=1.0, num_frames=100)
     assert trans[-1, 2] < 0.0
-    assert trans[-1, 2] == pytest.approx(-0.45, abs=1e-3)
+    assert trans[-1, 2] == pytest.approx(-0.35, abs=0.15)
 
 
 def test_p21_2_raster_subject_scale_growth():

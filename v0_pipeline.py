@@ -2639,6 +2639,8 @@ def compute_perceptual_motion_score(
 
     # Evaluate peak optical flow displacement across rendered keyframes
     max_flow_mag = np.zeros(f0.shape[:2], dtype=np.float32)
+    peak_flow_u = np.zeros(f0.shape[:2], dtype=np.float32)
+    peak_flow_v = np.zeros(f0.shape[:2], dtype=np.float32)
     max_diff_2d = np.zeros(f0.shape[:2], dtype=np.float32)
     f0_f = f0.astype(np.float32)
 
@@ -2648,7 +2650,11 @@ def compute_perceptual_motion_score(
         gk = cv2.cvtColor(fk, cv2.COLOR_RGB2GRAY) if fk.ndim == 3 else fk
         flow_k = cv2.calcOpticalFlowFarneback(g0, gk, None, 0.5, 3, 15, 3, 5, 1.2, 0)
         mag_k = np.sqrt(flow_k[..., 0] ** 2 + flow_k[..., 1] ** 2)
-        max_flow_mag = np.maximum(max_flow_mag, mag_k)
+
+        improved_mask = mag_k > max_flow_mag
+        max_flow_mag[improved_mask] = mag_k[improved_mask]
+        peak_flow_u[improved_mask] = flow_k[..., 0][improved_mask]
+        peak_flow_v[improved_mask] = flow_k[..., 1][improved_mask]
 
         diff_k = np.mean(np.abs(fk.astype(np.float32) - f0_f), axis=2)
         max_diff_2d = np.maximum(max_diff_2d, diff_k)
@@ -2656,8 +2662,6 @@ def compute_perceptual_motion_score(
     f_last = rendered_frames[-1]
     diff = max_diff_2d
     flow_mag = max_flow_mag
-    flow_u = flow_k[..., 0]
-    flow_v = flow_k[..., 1]
 
     # Extract independent layer masks using depth quantiles
     h, w = subject_mask.shape
@@ -2675,16 +2679,14 @@ def compute_perceptual_motion_score(
     def _measure_raster_layer_motion(mask: np.ndarray) -> Tuple[float, float]:
         if not np.any(mask):
             return 0.0, 0.0
-        mean_diff = float(np.mean(diff[mask]))
-        u_mean = float(np.mean(flow_u[mask]))
-        v_mean = float(np.mean(flow_v[mask]))
+        u_mean = float(np.mean(peak_flow_u[mask]))
+        v_mean = float(np.mean(peak_flow_v[mask]))
         c_delta = float(np.sqrt(u_mean**2 + v_mean**2))
-        p_disp_mean = float(np.mean(flow_mag[mask]))
-        p_disp_p90 = float(np.percentile(flow_mag[mask], 90.0))
+        p_disp_mean = float(np.mean(max_flow_mag[mask]))
+        p_disp_p90 = float(np.percentile(max_flow_mag[mask], 90.0))
         p_disp = max(p_disp_mean, p_disp_p90 * 0.8)
-        if p_disp > 0.01:
-            return max(c_delta, p_disp), p_disp
-        return mean_diff, mean_diff
+        # Strictly return optical flow displacement in pixels (never RGB intensity difference)
+        return max(c_delta, p_disp), p_disp
 
     sub_c_delta, sub_disp_px = _measure_raster_layer_motion(subject_mask)
     fg_c_delta, fg_disp_px = _measure_raster_layer_motion(fg_mask)
@@ -3407,26 +3409,41 @@ def generate_c1_smooth_trajectory(
         rotations[:, 0] = -w_loop * s_quintic * magnitude_scale * np.radians(1.2)
     elif style_upper == "STATIC":
         pass  # All zeros
-    elif style_upper in ["CINEMATIC_PUSH_IN", "CINEMATIC_PUSHIN", "PUSH_IN", "PUSHIN"]:
-        # Genuine progressive Push-In (non-looping): camera pushes forward towards scene (negative Z)
-        translations[:, 2] = -s_quintic * magnitude_scale * 0.45  # Recalibrated negative Z push
-        translations[:, 1] = -s_quintic * magnitude_scale * 0.04  # Gentle vertical rise
-        translations[:, 0] = np.sin(np.pi * t) * magnitude_scale * 0.08 # Lateral camera travel
-        rotations[:, 0] = -s_quintic * magnitude_scale * np.radians(0.8) # Subtle pitch
-        rotations[:, 1] = np.sin(np.pi * t) * magnitude_scale * np.radians(0.5) # Subtle yaw
+    elif style_upper in ["SUBTLE_PUSH_IN", "CINEMATIC_PUSH_IN", "CINEMATIC_PUSHIN", "PUSH_IN", "PUSHIN"]:
+        # Progressive Push-In: smooth camera travel toward scene with progressive lateral & vertical move
+        translations[:, 2] = -s_quintic * magnitude_scale * 0.35
+        translations[:, 1] = -s_quintic * magnitude_scale * 0.04
+        translations[:, 0] = s_quintic * magnitude_scale * 0.08
+        rotations[:, 0] = -s_quintic * magnitude_scale * np.radians(0.8)
+        rotations[:, 1] = s_quintic * magnitude_scale * np.radians(0.6)
+    elif style_upper in ["SLOW_DOLLY_LEFT", "DOLLY_LEFT", "PAN_LEFT", "PANLEFT"]:
+        translations[:, 0] = -s_quintic * magnitude_scale * 0.12
+        translations[:, 2] = -s_quintic * magnitude_scale * 0.05
+        rotations[:, 1] = -s_quintic * magnitude_scale * np.radians(1.2)
+    elif style_upper in ["SLOW_DOLLY_RIGHT", "DOLLY_RIGHT", "PAN_RIGHT", "PANRIGHT"]:
+        translations[:, 0] = s_quintic * magnitude_scale * 0.12
+        translations[:, 2] = -s_quintic * magnitude_scale * 0.05
+        rotations[:, 1] = s_quintic * magnitude_scale * np.radians(1.2)
+    elif style_upper in ["VERTICAL_DRIFT", "PAN_UP", "PAN_DOWN", "VERTICAL_PAN"]:
+        translations[:, 1] = -s_quintic * magnitude_scale * 0.10
+        translations[:, 2] = -s_quintic * magnitude_scale * 0.05
+        rotations[:, 0] = -s_quintic * magnitude_scale * np.radians(1.0)
+    elif style_upper in ["DIAGONAL_DOLLY"]:
+        translations[:, 0] = s_quintic * magnitude_scale * 0.10
+        translations[:, 1] = -s_quintic * magnitude_scale * 0.08
+        translations[:, 2] = -s_quintic * magnitude_scale * 0.10
+        rotations[:, 0] = -s_quintic * magnitude_scale * np.radians(0.6)
+        rotations[:, 1] = s_quintic * magnitude_scale * np.radians(0.8)
+    elif style_upper in ["PARALLAX_PUSH"]:
+        translations[:, 0] = s_quintic * magnitude_scale * 0.12
+        translations[:, 1] = -s_quintic * magnitude_scale * 0.06
+        translations[:, 2] = -s_quintic * magnitude_scale * 0.25
+        rotations[:, 0] = -s_quintic * magnitude_scale * np.radians(0.8)
+        rotations[:, 1] = s_quintic * magnitude_scale * np.radians(1.0)
     elif style_upper in ["DOLLY_IN", "DOLLYIN"]:
-        translations[:, 2] = w_loop * magnitude_scale * 0.15
+        translations[:, 2] = -s_quintic * magnitude_scale * 0.30
     elif style_upper in ["DOLLY_OUT", "DOLLYOUT"]:
-        translations[:, 2] = -w_loop * magnitude_scale * 0.15
-    elif style_upper in ["PAN_LEFT", "PANLEFT"]:
-        translations[:, 0] = -w_loop * magnitude_scale * 0.05
-        rotations[:, 1] = -w_loop * magnitude_scale * np.radians(2.0)
-    elif style_upper in ["PAN_RIGHT", "PANRIGHT"]:
-        translations[:, 0] = w_loop * magnitude_scale * 0.05
-        rotations[:, 1] = w_loop * magnitude_scale * np.radians(2.0)
-    elif style_upper in ["VERTICAL_PAN", "PAN_UP", "PAN_DOWN"]:
-        translations[:, 1] = w_loop * magnitude_scale * 0.05
-        rotations[:, 0] = w_loop * magnitude_scale * np.radians(2.0)
+        translations[:, 2] = s_quintic * magnitude_scale * 0.30
     elif style_upper in ["CONTROL_50PX", "CONTROL_100PX", "CONTROL_200PX", "CONTROL_400PX"]:
         px_targets = {"CONTROL_50PX": 50.0, "CONTROL_100PX": 100.0, "CONTROL_200PX": 200.0, "CONTROL_400PX": 400.0}
         target_shift = px_targets[style_upper] * magnitude_scale
