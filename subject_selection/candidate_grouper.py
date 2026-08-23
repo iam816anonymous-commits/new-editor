@@ -90,8 +90,8 @@ def generate_candidate_groups(
             combined_score=score_map[cid]
         ))
 
-    # 2. Test pairwise and multi-candidate compound subject grouping for top candidates
-    top_feats = features_list[:min(6, num_cand)]
+    # 2. Test pairwise and multi-candidate compound subject grouping for all plausible candidates
+    top_feats = features_list[:min(16, num_cand)]
 
     for idx1 in range(len(top_feats)):
         for idx2 in range(idx1 + 1, len(top_feats)):

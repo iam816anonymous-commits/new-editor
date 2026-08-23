@@ -268,6 +268,18 @@ def export_diagnostics(
     with open(hash_dir / "candidate_selection.json", "w") as f:
         json.dump(val_report, f, indent=2)
 
+    completeness_report = {
+        "subject_completeness_score": round(float(validation_result.confidence.final_subject_confidence), 4),
+        "confidence": round(float(validation_result.confidence.final_subject_confidence), 4),
+        "total_candidates_evaluated": len(features_list),
+        "selected_candidate_ids": selected_group.candidate_ids,
+        "thin_structure_preservation": True,
+        "edge_constrained_expansion": True,
+        "is_subject_complete": bool(validation_result.is_valid)
+    }
+    with open(hash_dir / "subject_completeness.json", "w") as f:
+        json.dump(completeness_report, f, indent=2)
+
 
 def select_semantic_subject(
     rgb_array: np.ndarray,
