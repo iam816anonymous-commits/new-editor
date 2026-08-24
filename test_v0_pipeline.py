@@ -3226,6 +3226,36 @@ def test_camera_smoke_f_layer_differential_motion():
 # PHASE 2.1: PERCEPTUAL CAMERA MOTION TESTS
 # ============================================================
 
+def test_quality_planner_hardware_aware_routing():
+    """PHASE 2.6 ADDENDUM TEST: Verifies QualityPlanner CPU 720p ceiling, VRAM downgrade, and Quality Honesty contract."""
+    from scene_3d.reconstruction import HardwareProfile, SceneComplexityTier, QualityPlanner
+
+    # Test CPU 4K request triggers 720p ceiling downgrade
+    hw_cpu = HardwareProfile(has_cuda=False, device_name="CPU", vram_gb=0.0, ram_gb=16.0, cpu_cores=4)
+    decision_cpu = QualityPlanner.plan(hw_cpu, SceneComplexityTier.COMPLEX, (3840, 2160), requested_resolution="4k")
+    assert decision_cpu.output_resolution == (1280, 720)
+    assert decision_cpu.downgrade_reason is not None
+    assert "CPU execution constrained" in decision_cpu.downgrade_reason
+
+    # Test GPU VRAM constrained downgrade (< 4GB VRAM)
+    hw_gpu_low = HardwareProfile(has_cuda=True, device_name="Low VRAM GPU", vram_gb=2.0, ram_gb=16.0, cpu_cores=8)
+    decision_low_vram = QualityPlanner.plan(hw_gpu_low, SceneComplexityTier.COMPLEX, (3840, 2160), requested_resolution="4k")
+    assert decision_low_vram.output_resolution == (1280, 720)
+    assert "VRAM constrained" in decision_low_vram.downgrade_reason
+
+    # Test High-End GPU 4K
+    hw_gpu_high = HardwareProfile(has_cuda=True, device_name="NVIDIA RTX 4090", vram_gb=24.0, ram_gb=32.0, cpu_cores=16)
+    decision_high_vram = QualityPlanner.plan(hw_gpu_high, SceneComplexityTier.COMPLEX, (3840, 2160), requested_resolution="4k")
+    assert decision_high_vram.output_resolution == (3840, 2160)
+    assert decision_high_vram.downgrade_reason is None
+
+    # Quality Honesty contract check
+    dict_repr = decision_high_vram.to_dict()
+    assert "source_resolution" in dict_repr
+    assert "reconstruction_resolution" in dict_repr
+    assert "output_resolution" in dict_repr
+
+
 def test_scene_3d_inferred_reconstruction_pipeline():
     """PHASE 2.6 TEST: Verifies scene_3d/ inferred scene reconstruction, complexity routing, and novel view rendering."""
     import scene_3d as s3d

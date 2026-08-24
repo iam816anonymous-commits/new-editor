@@ -3845,6 +3845,20 @@ def parse_args(args: Optional[list] = None) -> argparse.Namespace:
         help="Base output directory."
     )
     parser.add_argument(
+        "--quality",
+        type=str,
+        default="auto",
+        choices=["auto", "fast", "balanced", "high", "ultra"],
+        help="Quality profile tier for hardware-aware rendering."
+    )
+    parser.add_argument(
+        "--resolution",
+        type=str,
+        default="auto",
+        choices=["auto", "480p", "720p", "1080p", "1440p", "4k"],
+        help="Output resolution preference."
+    )
+    parser.add_argument(
         "--render-video",
         action="store_true",
         default=False,
@@ -3909,6 +3923,21 @@ def main():
     original_save_path = hash_dir / "original.png"
     pil_img.save(original_save_path)
     print(f"[✓] Saved reference copy: {original_save_path}")
+
+    # Quality Planner & Decision Export
+    from scene_3d.reconstruction import HardwareProfile, SceneComplexityTier, QualityPlanner
+    hw_prof = HardwareProfile.detect()
+    q_decision = QualityPlanner.plan(
+        hardware=hw_prof,
+        complexity_tier=SceneComplexityTier.MODERATE,
+        input_resolution=(pil_img.width, pil_img.height),
+        requested_quality=getattr(args, "quality", "auto"),
+        requested_resolution=getattr(args, "resolution", "auto"),
+        frame_count=getattr(args, "frames", 48)
+    )
+    with open(hash_dir / "quality_decision.json", "w", encoding="utf-8") as f:
+        json.dump(q_decision.to_dict(), f, indent=2)
+    print(f"[✓] Quality Decision Planned: Profile={q_decision.selected_quality_profile.profile_name}, Res={q_decision.output_resolution[0]}x{q_decision.output_resolution[1]}")
 
     # 4. Device & Model Loading
     device = get_device()
