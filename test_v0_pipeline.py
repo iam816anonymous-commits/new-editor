@@ -3226,6 +3226,29 @@ def test_camera_smoke_f_layer_differential_motion():
 # PHASE 2.1: PERCEPTUAL CAMERA MOTION TESTS
 # ============================================================
 
+def test_scene_3d_inferred_reconstruction_pipeline():
+    """PHASE 2.6 TEST: Verifies scene_3d/ inferred scene reconstruction, complexity routing, and novel view rendering."""
+    import scene_3d as s3d
+
+    h, w = 32, 32
+    rgb = np.ones((h, w, 3), dtype=np.uint8) * 180
+    depth = np.full((h, w), 4.0, dtype=np.float32)
+    sub_mask = np.zeros((h, w), dtype=bool)
+    sub_mask[8:24, 8:24] = True
+
+    tier, score, details = s3d.SceneComplexityAnalyzer.analyze(rgb, depth, sub_mask)
+    assert tier in [s3d.SceneComplexityTier.SIMPLE, s3d.SceneComplexityTier.MODERATE, s3d.SceneComplexityTier.COMPLEX]
+
+    scene = s3d.reconstruct_inferred_3d_scene(rgb, depth, sub_mask)
+    assert len(scene.point_cloud.vertices) == 32 * 32
+    assert len(scene.mesh.faces) > 0
+
+    R = np.eye(3)
+    t = np.array([0.02, 0.0, 0.0], dtype=np.float64)
+    syn_rgb = scene.render_novel_view(R, t)
+    assert syn_rgb.shape == (h, w, 3)
+
+
 def test_render_backend_explicit_3d_mesh_export():
     """PHASE 2.7 TEST: Verifies explicit 3D mesh construction and OBJ/PLY export in render_backend/."""
     import tempfile
