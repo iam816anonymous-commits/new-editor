@@ -14,4 +14,4 @@ test_v0_pipeline.py: 29 warnings
     warnings.warn(
 
 -- Docs: https://docs.pytest.org/en/stable/how-to/capture-warnings.html
-====================== 181 passed, 29 warnings in 29.65s =======================
+====================== 181 passed, 29 warnings in 46.56s =======================
