@@ -8,6 +8,15 @@ from typing import Dict, List, Tuple, Any
 from .schemas import CandidateFeatures, SubjectSelectionConfig
 
 
+def compute_mask_iou(mask1: np.ndarray, mask2: np.ndarray) -> float:
+    """Computes Intersection over Union (IoU) between two boolean masks."""
+    intersection = float(np.logical_and(mask1, mask2).sum())
+    union = float(np.logical_or(mask1, mask2).sum())
+    if union == 0.0:
+        return 0.0
+    return intersection / union
+
+
 def extract_candidate_features(
     mask_bool: np.ndarray,
     sam_score: float,
