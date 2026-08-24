@@ -3226,6 +3226,30 @@ def test_camera_smoke_f_layer_differential_motion():
 # PHASE 2.1: PERCEPTUAL CAMERA MOTION TESTS
 # ============================================================
 
+def test_render_backend_explicit_3d_mesh_export():
+    """PHASE 2.7 TEST: Verifies explicit 3D mesh construction and OBJ/PLY export in render_backend/."""
+    import tempfile
+    from pathlib import Path
+    from render_backend.explicit_3d import construct_explicit_3d_mesh, export_scene_3d_package
+
+    h, w = 32, 32
+    rgb = np.ones((h, w, 3), dtype=np.uint8) * 150
+    depth = np.full((h, w), 5.0, dtype=np.float32)
+    prov = np.ones((h, w), dtype=np.float32)
+
+    mesh = construct_explicit_3d_mesh(rgb, depth, 32.0, 32.0, 16.0, 16.0, provenance_map=prov)
+    assert len(mesh.vertices) == 32 * 32
+    assert len(mesh.faces) > 0
+
+    with tempfile.TemporaryDirectory() as tmpdir:
+        tmp_path = Path(tmpdir)
+        summary = export_scene_3d_package(rgb, depth, 32.0, 32.0, 16.0, 16.0, tmp_path, provenance_map=prov)
+        assert (tmp_path / "scene_mesh.obj").exists()
+        assert (tmp_path / "point_cloud.ply").exists()
+        assert (tmp_path / "scene_3d_graph.json").exists()
+        assert summary["vertex_count"] == 1024
+
+
 def test_subpixel_splatting_math_and_z_ownership():
     """PHASE 2.4C TEST: Verifies subpixel splatting weight conservation (sum=1.0) and Z-buffer ownership."""
     from v0_pipeline import render_single_frame_forward_splatting
