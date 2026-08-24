@@ -3845,6 +3845,13 @@ def parse_args(args: Optional[list] = None) -> argparse.Namespace:
         help="Base output directory."
     )
     parser.add_argument(
+        "--render-mode",
+        type=str,
+        default="auto",
+        choices=["auto", "2.5d", "3d"],
+        help="Selects explicit rendering backend: 2.5d (Mode A), 3d (Mode B), or auto (router selects exactly ONE mode)."
+    )
+    parser.add_argument(
         "--quality",
         type=str,
         default="auto",
