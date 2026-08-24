@@ -3865,6 +3865,12 @@ def parse_args(args: Optional[list] = None) -> argparse.Namespace:
         help="Render full 48-frame video sequence after generating diagnostic artifacts."
     )
     parser.add_argument(
+        "--benchmark-hardware",
+        action="store_true",
+        default=False,
+        help="Executes hardware-aware performance benchmarking and exports hardware_benchmark.json."
+    )
+    parser.add_argument(
         "--frames",
         type=int,
         default=48,

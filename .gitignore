@@ -11,3 +11,7 @@ pip_cache/
 *.pt
 *.bin
 *.safetensors
+hardware_benchmark.json
+reconstruction_comparison.json
+viewpoint_failure.json
+backend_decision.json

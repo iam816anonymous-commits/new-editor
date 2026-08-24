@@ -1,0 +1,68 @@
+{
+  "viewpoint_sweep": [
+    {
+      "viewpoint_orbit_angle_deg": 0,
+      "valid_pixel_coverage_pct": 99.84,
+      "disocclusion_pct": 0.16,
+      "hole_pct": 0.0,
+      "mae_vs_reference_view": 0.0,
+      "status": "SAFE"
+    },
+    {
+      "viewpoint_orbit_angle_deg": 2,
+      "valid_pixel_coverage_pct": 95.32,
+      "disocclusion_pct": 4.68,
+      "hole_pct": 0.0,
+      "mae_vs_reference_view": 6.88,
+      "status": "SAFE"
+    },
+    {
+      "viewpoint_orbit_angle_deg": 5,
+      "valid_pixel_coverage_pct": 88.34,
+      "disocclusion_pct": 11.66,
+      "hole_pct": 0.0,
+      "mae_vs_reference_view": 12.83,
+      "status": "SAFE"
+    },
+    {
+      "viewpoint_orbit_angle_deg": 10,
+      "valid_pixel_coverage_pct": 77.45,
+      "disocclusion_pct": 22.55,
+      "hole_pct": 0.0,
+      "mae_vs_reference_view": 23.17,
+      "status": "SAFE"
+    },
+    {
+      "viewpoint_orbit_angle_deg": 15,
+      "valid_pixel_coverage_pct": 67.4,
+      "disocclusion_pct": 32.6,
+      "hole_pct": 0.0,
+      "mae_vs_reference_view": 28.26,
+      "status": "SAFE"
+    },
+    {
+      "viewpoint_orbit_angle_deg": 20,
+      "valid_pixel_coverage_pct": 57.84,
+      "disocclusion_pct": 42.16,
+      "hole_pct": 0.0,
+      "mae_vs_reference_view": 29.85,
+      "status": "ACCEPTABLE"
+    },
+    {
+      "viewpoint_orbit_angle_deg": 30,
+      "valid_pixel_coverage_pct": 39.49,
+      "disocclusion_pct": 60.51,
+      "hole_pct": 0.0,
+      "mae_vs_reference_view": 21.32,
+      "status": "ACCEPTABLE"
+    },
+    {
+      "viewpoint_orbit_angle_deg": 45,
+      "valid_pixel_coverage_pct": 11.05,
+      "disocclusion_pct": 88.95,
+      "hole_pct": 0.0,
+      "mae_vs_reference_view": 28.4,
+      "status": "UNSAFE_BOUNDARY"
+    }
+  ]
+}

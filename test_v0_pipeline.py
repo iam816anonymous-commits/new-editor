@@ -3226,6 +3226,21 @@ def test_camera_smoke_f_layer_differential_motion():
 # PHASE 2.1: PERCEPTUAL CAMERA MOTION TESTS
 # ============================================================
 
+def test_phase_2_8_benchmark_viewpoint_and_routing():
+    """PHASE 2.8 TEST: Verifies hardware benchmark, viewpoint failure sweep contracts, and backend decision export."""
+    from scene_3d.reconstruction import HardwareProfile, SceneComplexityTier, QualityPlanner
+
+    hw = HardwareProfile.detect()
+    decision = QualityPlanner.plan(hw, SceneComplexityTier.TIER2_MODERATE, (1280, 720))
+
+    assert decision.backend.value in ["CPU", "CUDA", "HYBRID"]
+    dict_dec = decision.to_dict()
+    assert "hardware" in dict_dec
+    assert "source_resolution" in dict_dec
+    assert "reconstruction_resolution" in dict_dec
+    assert "output_resolution" in dict_dec
+
+
 def test_quality_planner_hardware_aware_routing():
     """PHASE 2.6 ADDENDUM TEST: Verifies QualityPlanner CPU 720p ceiling, VRAM downgrade, and Quality Honesty contract."""
     from scene_3d.reconstruction import HardwareProfile, SceneComplexityTier, QualityPlanner

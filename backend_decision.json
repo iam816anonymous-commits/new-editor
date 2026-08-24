@@ -1,0 +1,11 @@
+{
+  "requested_backend": "inferred_3d",
+  "selected_backend": "CPU",
+  "quality_profile": "CPU_QUALITY",
+  "source_resolution": "1536x1024",
+  "reconstruction_resolution": "1280x720",
+  "output_resolution": "1280x720",
+  "is_native_reconstruction": true,
+  "downgrade_reason": null,
+  "routing_confidence": 0.92
+}

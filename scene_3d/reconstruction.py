@@ -6,13 +6,19 @@ from enum import Enum
 from dataclasses import dataclass
 from typing import Dict, Any, Tuple, Optional, List
 import numpy as np
+import cv2
 import torch
 
 
 class SceneComplexityTier(str, Enum):
-    SIMPLE = "SIMPLE"
-    MODERATE = "MODERATE"
-    COMPLEX = "COMPLEX"
+    TIER1_SIMPLE = "TIER 1 - SIMPLE"
+    TIER2_MODERATE = "TIER 2 - MODERATE"
+    TIER3_COMPLEX = "TIER 3 - COMPLEX"
+    TIER4_EXTREME = "TIER 4 - EXTREME"
+    # Legacy backward compatibility aliases
+    SIMPLE = "TIER 1 - SIMPLE"
+    MODERATE = "TIER 2 - MODERATE"
+    COMPLEX = "TIER 3 - COMPLEX"
 
 
 class ExecutionBackendType(str, Enum):
@@ -272,14 +278,22 @@ class SceneComplexityAnalyzer:
         peri = float(sum(len(c) for c in contours))
         edge_density = peri / max(1.0, float(np.sum(subject_mask)))
 
-        score = 0.4 * min(1.0, depth_std / 2.0) + 0.3 * sub_area_pct + 0.3 * min(1.0, edge_density * 5.0)
+        # Depth discontinuity density
+        gx = cv2.Sobel(depth_map, cv2.CV_32F, 1, 0, ksize=3)
+        gy = cv2.Sobel(depth_map, cv2.CV_32F, 0, 1, ksize=3)
+        grad_mag = np.sqrt(gx**2 + gy**2)
+        depth_discont_pct = float(np.mean(grad_mag > 0.5))
 
-        if score >= 0.70:
-            tier = SceneComplexityTier.COMPLEX
-        elif score >= 0.35:
-            tier = SceneComplexityTier.MODERATE
+        score = 0.35 * min(1.0, depth_std / 2.0) + 0.25 * sub_area_pct + 0.25 * min(1.0, edge_density * 5.0) + 0.15 * min(1.0, depth_discont_pct * 10.0)
+
+        if score >= 0.80:
+            tier = SceneComplexityTier.TIER4_EXTREME
+        elif score >= 0.55:
+            tier = SceneComplexityTier.TIER3_COMPLEX
+        elif score >= 0.25:
+            tier = SceneComplexityTier.TIER2_MODERATE
         else:
-            tier = SceneComplexityTier.SIMPLE
+            tier = SceneComplexityTier.TIER1_SIMPLE
 
         details = {
             "complexity_score": round(score, 4),
