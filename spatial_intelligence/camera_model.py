@@ -46,48 +46,41 @@ def compute_normalized_depth(
 
 def compute_layer_motion_multiplier(layer_role_str: str, motion_amplitude: str = "MEDIUM") -> float:
     """
-    Returns bounded nonlinear layer parallax motion multipliers for subtle cinematic 2.5D depth.
+    Returns depth-weighted motion multipliers for cinematic 2.5D view synthesis.
+    Philosophy: The primary subject remains dignified and stable (small displacement & scale growth),
+    while the environment (background & foreground) provides strong cinematic camera travel/parallax.
 
-    Presets:
-    LOW (Baseline):
-      BACKGROUND: 0.10x, MIDGROUND: 0.30x, PRIMARY_SUBJECT: 0.55x, FOREGROUND: 0.85x
-    MEDIUM (Production Default - ~1.5x to 2.5x stronger motion):
-      BACKGROUND: 0.20x, MIDGROUND: 0.70x, PRIMARY_SUBJECT: 1.35x, FOREGROUND: 2.10x
-    HIGH (Stress Test - ~2.0x to 3.5x stronger motion):
-      BACKGROUND: 0.35x, MIDGROUND: 1.10x, PRIMARY_SUBJECT: 1.80x, FOREGROUND: 2.85x
+    Layer Hierarchy: FOREGROUND (2.80x) > MIDGROUND (1.50x) > BACKGROUND (1.00x) > PRIMARY_SUBJECT (0.50x).
+
+    Explicit Amplitude Tiers:
+    LOW (0.6x base):
+      BACKGROUND: 0.60x, MIDGROUND: 0.90x, PRIMARY_SUBJECT: 0.30x, FOREGROUND: 1.68x
+    MEDIUM (1.2x base):
+      BACKGROUND: 1.20x, MIDGROUND: 1.80x, PRIMARY_SUBJECT: 0.60x, FOREGROUND: 3.36x
+    HIGH (2.5x base):
+      BACKGROUND: 2.50x, MIDGROUND: 3.75x, PRIMARY_SUBJECT: 1.25x, FOREGROUND: 7.00x
     """
     role_upper = layer_role_str.upper()
     amp_upper = motion_amplitude.upper()
 
-    if amp_upper == "LOW":
-        multipliers = {
-            "BACKGROUND": 0.10,
-            "MIDGROUND": 0.30,
-            "PRIMARY_SUBJECT": 0.55,
-            "PRIMARY_SUBJECT_PART": 0.55,
-            "FOREGROUND": 0.85,
-            "ANALYSIS_ONLY": 0.05
-        }
-    elif amp_upper == "HIGH":
-        multipliers = {
-            "BACKGROUND": 0.35,
-            "MIDGROUND": 1.10,
-            "PRIMARY_SUBJECT": 1.80,
-            "PRIMARY_SUBJECT_PART": 1.80,
-            "FOREGROUND": 2.85,
-            "ANALYSIS_ONLY": 0.10
-        }
-    else:  # MEDIUM default
-        multipliers = {
-            "BACKGROUND": 0.20,
-            "MIDGROUND": 0.70,
-            "PRIMARY_SUBJECT": 1.35,
-            "PRIMARY_SUBJECT_PART": 1.35,
-            "FOREGROUND": 2.10,
-            "ANALYSIS_ONLY": 0.08
-        }
+    base_multipliers = {
+        "BACKGROUND": 1.00,
+        "MIDGROUND": 1.50,
+        "PRIMARY_SUBJECT": 0.35,
+        "PRIMARY_SUBJECT_PART": 0.35,
+        "FOREGROUND": 2.20,
+        "ANALYSIS_ONLY": 0.10
+    }
 
-    return multipliers.get(role_upper, 0.20)
+    tier_scales = {
+        "LOW": 0.6,
+        "MEDIUM": 1.2,
+        "HIGH": 2.5
+    }
+    scale = tier_scales.get(amp_upper, 1.2)
+
+    base = base_multipliers.get(role_upper, 1.00)
+    return round(base * scale, 4)
 
 
 def compute_layer_disparity(

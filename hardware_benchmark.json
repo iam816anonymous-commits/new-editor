@@ -1,0 +1,50 @@
+{
+  "hardware": {
+    "cuda_available": false,
+    "device_name": "CPU",
+    "vram_gb": 0.0,
+    "ram_gb": 16.0,
+    "cpu_cores": 4
+  },
+  "performance": {
+    "model_load_time_sec": 0.85,
+    "depth_inference_time_sec": 0.0094,
+    "segmentation_time_sec": 0.0001,
+    "reconstruction_time_sec": 0.0114,
+    "geometry_generation_time_sec": 0.05,
+    "rendering_time_sec": 19.0041,
+    "encoding_time_sec": 0.45,
+    "total_time_sec": 19.0424,
+    "fps": 2.53,
+    "peak_ram_gb": 1.72,
+    "peak_vram_gb": 0.0
+  },
+  "quality_decision": {
+    "hardware": {
+      "has_cuda": false,
+      "device_name": "CPU",
+      "vram_gb": 0.0,
+      "ram_gb": 16.0,
+      "cpu_cores": 4
+    },
+    "backend": "CPU",
+    "scene_complexity_tier": "MODERATE",
+    "source_resolution": "320x320",
+    "reconstruction_resolution": "320x320",
+    "output_resolution": "320x320",
+    "selected_quality_profile": {
+      "profile_name": "CPU_FAST",
+      "output_resolution": "320x320",
+      "reconstruction_resolution": "320x320",
+      "depth_model": "Depth-Anything-V2-Small-hf",
+      "segmentation_model": "sam2-hiera-tiny",
+      "depth_refinement_strength": 0.85,
+      "inpainting_quality": "STANDARD",
+      "temporal_quality": "STABLE"
+    },
+    "estimated_ram_gb": 1.72,
+    "estimated_vram_gb": 0.0,
+    "downgrade_reason": null,
+    "is_native_reconstruction": true
+  }
+}

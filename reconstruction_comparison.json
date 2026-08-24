@@ -1,0 +1,22 @@
+{
+  "comparison_metrics": {
+    "mode_a_2_5d": {
+      "source_view_fidelity_ssim": 1.0,
+      "novel_view_displacement_px": 12.1,
+      "render_time_sec": 0.38,
+      "flicker_score": 0.02
+    },
+    "mode_b_hybrid": {
+      "source_view_fidelity_ssim": 0.995,
+      "novel_view_displacement_px": 28.2,
+      "render_time_sec": 0.38,
+      "flicker_score": 0.02
+    },
+    "mode_c_inferred_3d": {
+      "source_view_fidelity_ssim": 0.988,
+      "novel_view_displacement_px": 28.9,
+      "render_time_sec": 0.35,
+      "flicker_score": 0.04
+    }
+  }
+}

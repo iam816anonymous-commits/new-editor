@@ -1,0 +1,25 @@
+Loading models on device: cpu
+Warning: You are sending unauthenticated requests to the HF Hub. Please set a HF_TOKEN to enable higher rate limits and faster downloads.
+Loading weights:   0%|          | 0/287 [00:00<?, ?it/s]Loading weights:  63%|██████▎   | 181/287 [00:00<00:00, 1801.34it/s]Loading weights: 100%|██████████| 287/287 [00:00<00:00, 1845.40it/s]
+[1/10] Processing Mode B Category: portrait_human (Portrait / human subject)
+  Completed Mode B portrait_human in 0.87s (102,400 3D points, 201,118 triangles)
+[2/10] Processing Mode B Category: temple_architecture (Temple / architecture)
+  Completed Mode B temple_architecture in 1.59s (699,392 3D points, 1,370,494 triangles)
+[3/10] Processing Mode B Category: landscape (Landscape)
+  Completed Mode B landscape in 1.65s (699,392 3D points, 1,385,546 triangles)
+[4/10] Processing Mode B Category: interior (Interior)
+  Completed Mode B interior in 1.96s (699,392 3D points, 1,389,462 triangles)
+[5/10] Processing Mode B Category: vehicle_object (Vehicle / large object)
+  Completed Mode B vehicle_object in 1.46s (699,392 3D points, 1,389,260 triangles)
+[6/10] Processing Mode B Category: dense_foliage (Dense foliage)
+  Completed Mode B dense_foliage in 1.47s (699,392 3D points, 1,395,364 triangles)
+[7/10] Processing Mode B Category: multiple_overlapping (Multiple overlapping objects)
+  Completed Mode B multiple_overlapping in 1.36s (699,392 3D points, 1,390,640 triangles)
+[8/10] Processing Mode B Category: strong_fg_bg_separation (Strong foreground/background separation)
+  Completed Mode B strong_fg_bg_separation in 1.98s (699,392 3D points, 1,391,482 triangles)
+[9/10] Processing Mode B Category: low_depth_variation (Low-depth-variation scene)
+  Completed Mode B low_depth_variation in 2.09s (699,392 3D points, 1,395,372 triangles)
+[10/10] Processing Mode B Category: highly_complex (Highly complex scene)
+  Completed Mode B highly_complex in 1.93s (699,392 3D points, 1,342,440 triangles)
+
+[✓] Mode B Forensics Complete! Results saved to real_world_viewpoint_sweep.json and report written to docs/PHASE_3_MODE_B_3D_FORENSICS.md

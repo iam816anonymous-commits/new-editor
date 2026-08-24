@@ -1,0 +1,29 @@
+Loading models on device: cpu
+Warning: You are sending unauthenticated requests to the HF Hub. Please set a HF_TOKEN to enable higher rate limits and faster downloads.
+Loading weights:   0%|          | 0/287 [00:00<?, ?it/s]Loading weights:  62%|██████▏   | 179/287 [00:00<00:00, 1762.58it/s]Loading weights: 100%|██████████| 287/287 [00:00<00:00, 1993.81it/s]
+[1/10] Processing Category: portrait_human (Portrait / human subject)
+  Completed category portrait_human in 6.05s
+[2/10] Processing Category: temple_architecture (Temple / architecture)
+  Completed category temple_architecture in 9.33s
+[3/10] Processing Category: landscape (Landscape)
+  Completed category landscape in 9.15s
+[4/10] Processing Category: interior (Interior)
+  [Notice] Subject selection ambiguous for interior: SUBJECT SELECTION: AMBIGUOUS - Final subject confidence too low (0.45 < 0.45). Using central depth fallback mask.
+  Completed category interior in 12.61s
+[5/10] Processing Category: vehicle_object (Vehicle / large object)
+  Completed category vehicle_object in 9.22s
+[6/10] Processing Category: dense_foliage (Dense foliage)
+  [Notice] Subject selection ambiguous for dense_foliage: SUBJECT SELECTION: AMBIGUOUS - Final subject confidence too low (0.29 < 0.45). Using central depth fallback mask.
+  Completed category dense_foliage in 10.76s
+[7/10] Processing Category: multiple_overlapping (Multiple overlapping objects)
+  Completed category multiple_overlapping in 10.86s
+[8/10] Processing Category: strong_fg_bg_separation (Strong foreground/background separation)
+  Completed category strong_fg_bg_separation in 9.48s
+[9/10] Processing Category: low_depth_variation (Low-depth-variation scene)
+  [Notice] Subject selection ambiguous for low_depth_variation: SUBJECT SELECTION: AMBIGUOUS - Final subject confidence too low (0.40 < 0.45); Ambiguous top candidate selection (score margin 0.009 < 0.020). Using central depth fallback mask.
+  Completed category low_depth_variation in 9.18s
+[10/10] Processing Category: highly_complex (Highly complex scene)
+  [Notice] Subject selection ambiguous for highly_complex: SUBJECT SELECTION: AMBIGUOUS - Final subject confidence too low (0.37 < 0.45). Using central depth fallback mask.
+  Completed category highly_complex in 12.63s
+
+[✓] Mode A Forensics Complete! Results saved to real_world_mode_a_results.json and report written to docs/PHASE_3_MODE_A_2_5D_FORENSICS.md

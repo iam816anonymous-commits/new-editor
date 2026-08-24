@@ -7,7 +7,12 @@ torch_cache/
 pip_cache/
 *.egg-info/
 *.png
+*.jpg
+*.jpeg
 *.mp4
 *.pt
 *.bin
 *.safetensors
+*.json
+!requirements.txt
+test_assets/phase3_dataset/

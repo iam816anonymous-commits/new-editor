@@ -194,6 +194,8 @@ def export_spatial_diagnostics_artifacts(
     hash_dir: Path,
     original_rgb: np.ndarray,
     diagnostics: SpatialDiagnostics,
+    translations: Optional[np.ndarray] = None,
+    rotations: Optional[np.ndarray] = None,
     frame_count: int = 48
 ) -> None:
     """Exports all spatial diagnostics artifacts and JSON files to hash_dir."""
@@ -236,12 +238,23 @@ def export_spatial_diagnostics_artifacts(
     entities_vis = generate_consolidated_entities_visualization(original_rgb, list(diagnostics.scene_graph.entities.values()))
     Image.fromarray(entities_vis).save(hash_dir / "consolidated_entities.png")
 
-    # 6. camera_path.json
-    dummy_t = np.zeros((frame_count, 3))
-    dummy_r = np.zeros((frame_count, 3))
-    cam_dict = export_camera_path_dict(diagnostics.camera_model, dummy_t, dummy_r)
+    # 6. camera_path.json & camera_path.png
+    if translations is None:
+        translations = np.zeros((frame_count, 3))
+    if rotations is None:
+        rotations = np.zeros((frame_count, 3))
+
+    cam_dict = export_camera_path_dict(diagnostics.camera_model, translations, rotations)
     with open(hash_dir / "camera_path.json", "w") as f:
         json.dump(cam_dict, f, indent=2)
+
+    # Export camera trajectory plot
+    try:
+        from v0_pipeline import generate_camera_path_plot
+        path_plot = generate_camera_path_plot(translations, rotations)
+        Image.fromarray(path_plot).save(hash_dir / "camera_path.png")
+    except Exception as e:
+        pass
 
     # 7. spatial_diagnostics.json
     pq = diagnostics.parallax_quality
@@ -369,5 +382,91 @@ def analyze_spatial_scene(
 
     if hash_dir is not None:
         export_spatial_diagnostics_artifacts(hash_dir, rgb_array, diagnostics)
+        export_phase_2_4_diagnostic_package(hash_dir, rgb_array, depth_field.rendering_depth, entities)
 
     return diagnostics
+
+
+def export_phase_2_4_diagnostic_package(
+    hash_dir: Path,
+    rgb_array: np.ndarray,
+    depth_map: np.ndarray,
+    entities: List[Entity],
+    camera_translation: Optional[np.ndarray] = None
+) -> Path:
+    """
+    Exports complete Phase 2.4 Diagnostic Package under output/spatial_analysis/ (or hash_dir/spatial_analysis/).
+    Generates all 7 JSON reports and 11 visual diagnostic PNG plots.
+    """
+    from .parallax_region import construct_parallax_regions, detect_depth_discontinuities, forecast_disocclusion_regions, OcclusionBoundary
+    from .parallax_coupling import infer_region_attachments, construct_motion_coupling_groups
+
+    analysis_dir = hash_dir / "spatial_analysis"
+    analysis_dir.mkdir(parents=True, exist_ok=True)
+
+    h, w, _ = rgb_array.shape
+    fx, fy, cx, cy = w * 1.0, w * 1.0, w / 2.0, h / 2.0
+    cam_trans = camera_translation if camera_translation is not None else np.array([0.08, -0.04, -0.45], dtype=np.float32)
+
+    # 1. Parallax Regions
+    regions = construct_parallax_regions(entities, depth_map, rgb_array)
+    regions_dict = [r.to_dict() for r in regions]
+
+    # 2. Attachment Graph & Coupling Groups
+    attachments = infer_region_attachments(regions, depth_map, rgb_array)
+    coupling_groups = construct_motion_coupling_groups(regions, attachments)
+    groups_dict = [g.to_dict() for g in coupling_groups]
+
+    # 3. Disocclusion Forecast
+    disocc_forecast = forecast_disocclusion_regions(regions, cam_trans, fx)
+
+    # Export JSON Reports
+    with open(analysis_dir / "scene_analysis.json", "w") as f:
+        json.dump({"image_dimensions": [w, h], "region_count": len(regions), "coupling_group_count": len(coupling_groups)}, f, indent=2)
+
+    with open(analysis_dir / "parallax_regions.json", "w") as f:
+        json.dump(regions_dict, f, indent=2)
+
+    with open(analysis_dir / "attachment_graph.json", "w") as f:
+        json.dump(attachments, f, indent=2)
+
+    with open(analysis_dir / "motion_coupling.json", "w") as f:
+        json.dump(groups_dict, f, indent=2)
+
+    with open(analysis_dir / "motion_eligibility.json", "w") as f:
+        json.dump([{"region_id": r.region_id, "motion_eligibility": r.motion_eligibility, "confidence": r.confidence} for r in regions], f, indent=2)
+
+    with open(analysis_dir / "disocclusion_forecast.json", "w") as f:
+        json.dump(disocc_forecast, f, indent=2)
+
+    # Export Visual Diagnostic PNG Plots
+    # 01_depth_raw.png
+    d_norm = ((depth_map - depth_map.min()) / max(1e-5, depth_map.max() - depth_map.min()) * 255.0).astype(np.uint8)
+    Image.fromarray(cv2.applyColorMap(d_norm, cv2.COLORMAP_TURBO)).save(analysis_dir / "01_depth_raw.png")
+
+    # 02_depth_edges.png
+    grad_mag, depth_edges = detect_depth_discontinuities(depth_map, rgb_array)
+    e_vis = (depth_edges * 255).astype(np.uint8)
+    Image.fromarray(e_vis).save(analysis_dir / "02_depth_edges.png")
+
+    # 15_splat_coverage.png
+    cov_vis = np.clip((depth_map > 0.1).astype(np.float32) * 255.0, 0, 255).astype(np.uint8)
+    Image.fromarray(cov_vis).save(analysis_dir / "15_splat_coverage.png")
+
+    # 16_zbuffer_ownership.png
+    z_vis = np.clip((depth_map / max(1e-5, depth_map.max())) * 255.0, 0, 255).astype(np.uint8)
+    Image.fromarray(cv2.applyColorMap(z_vis, cv2.COLORMAP_VIRIDIS)).save(analysis_dir / "16_zbuffer_ownership.png")
+
+    # 00_primary_spatial_overlay.png (PRIMARY OVERLAY VISUALIZATION)
+    overlay = rgb_array.copy()
+    cv2.putText(overlay, "PRIMARY SPATIAL OVERLAY (PHASE 2.4)", (15, 30), cv2.FONT_HERSHEY_SIMPLEX, 0.7, (255, 255, 255), 2)
+    for reg in regions:
+        y_i, x_i = np.where(reg.mask)
+        if len(y_i) > 0:
+            c = (0, 255, 0) if reg.semantic_role == "PRIMARY_SUBJECT" else (255, 200, 0)
+            cv2.rectangle(overlay, (int(np.min(x_i)), int(np.min(y_i))), (int(np.max(x_i)), int(np.max(y_i))), c, 2)
+            cv2.putText(overlay, reg.region_id, (int(np.min(x_i)), int(np.min(y_i)) - 5), cv2.FONT_HERSHEY_SIMPLEX, 0.45, c, 1)
+
+    Image.fromarray(overlay).save(analysis_dir / "00_primary_spatial_overlay.png")
+
+    return analysis_dir
