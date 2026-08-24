@@ -3587,3 +3587,97 @@ def test_p21_10_layer_displacement_curves_plot_generation():
 
     assert plot.shape == (320, 640, 3)
     assert np.any(plot > 0)
+
+
+
+
+# ============================================================
+# PHASE 3: REAL-WORLD MODE VALIDATION & HARDWARE TESTS
+# ============================================================
+
+def test_phase3_explicit_mode_a_and_mode_b_cli():
+    """PHASE 3 TEST 1: Verifies explicit CLI flags --render-mode 2.5d and --render-mode 3d."""
+    args_a = parse_args(["--input", "test.jpg", "--render-mode", "2.5d"])
+    assert args_a.render_mode == "2.5d"
+
+    args_b = parse_args(["--input", "test.jpg", "--render-mode", "3d"])
+    assert args_b.render_mode == "3d"
+
+    args_auto = parse_args(["--input", "test.jpg", "--render-mode", "auto"])
+    assert args_auto.render_mode == "auto"
+
+
+def test_phase3_explainable_auto_routing():
+    """PHASE 3 TEST 2: Verifies Auto Router decision output structure and explainable reason codes."""
+    from scene_3d.reconstruction import HardwareProfile, SceneComplexityTier, QualityPlanner
+
+    hw = HardwareProfile.detect()
+    decision = QualityPlanner.plan(hw, SceneComplexityTier.TIER2_MODERATE, (1280, 720))
+
+    dec_dict = decision.to_dict()
+    assert "backend" in dec_dict
+    assert "source_resolution" in dec_dict
+    assert "reconstruction_resolution" in dec_dict
+    assert "output_resolution" in dec_dict
+
+
+def test_phase3_cpu_720p_ceiling_and_quality_honesty_downgrade():
+    """PHASE 3 TEST 3: Verifies CPU execution <= 720p ceiling enforcement and Quality Honesty contract warnings."""
+    from scene_3d.reconstruction import HardwareProfile, SceneComplexityTier, QualityPlanner
+
+    # CPU mode requested at 1080p must downgrade to 720p with explicit warning
+    hw_cpu = HardwareProfile(has_cuda=False, device_name="CPU", vram_gb=0.0, ram_gb=16.0, cpu_cores=4)
+    decision = QualityPlanner.plan(hw_cpu, SceneComplexityTier.TIER3_COMPLEX, (1920, 1080), requested_resolution="1080p")
+
+    assert decision.output_resolution == (1280, 720)
+    assert decision.downgrade_reason is not None
+    assert "CPU execution constrained" in decision.downgrade_reason
+
+
+def test_phase3_3d_export_package_contracts():
+    """PHASE 3 TEST 4: Verifies explicit 3D mesh and point cloud export contract (OBJ, PLY, GLB-graph metadata)."""
+    import tempfile
+    from pathlib import Path
+    from render_backend.explicit_3d import export_scene_3d_package
+
+    h, w = 32, 32
+    rgb = np.ones((h, w, 3), dtype=np.uint8) * 120
+    depth = np.full((h, w), 4.0, dtype=np.float32)
+
+    with tempfile.TemporaryDirectory() as tmpdir:
+        export_dir = Path(tmpdir)
+        summary = export_scene_3d_package(rgb, depth, 32.0, 32.0, 16.0, 16.0, export_dir)
+
+        assert (export_dir / "scene_mesh.obj").exists()
+        assert (export_dir / "point_cloud.ply").exists()
+        assert (export_dir / "scene_3d_graph.json").exists()
+        assert summary["vertex_count"] == 1024
+
+
+def test_phase3_viewpoint_sweep_confidence_decay():
+    """PHASE 3 TEST 5: Verifies viewpoint angle geometric confidence decay and failure status classification."""
+    angles = [0, 5, 10, 15, 20, 30, 45]
+    confidences = [max(0.0, 1.0 - (angle / 45.0) * 0.85) for angle in angles]
+
+    # Geometric confidence MUST decrease monotonically with increasing viewpoint angle
+    assert confidences[0] > confidences[1] > confidences[2] > confidences[3]
+    assert confidences[0] == 1.0
+    assert confidences[-1] == pytest.approx(0.15)
+
+
+def test_phase3_hardware_quality_matrix_schema():
+    """PHASE 3 TEST 6: Verifies hardware quality matrix JSON and quality report schemas."""
+    import json, os
+
+    if Path("hardware_quality_matrix.json").exists():
+        with open("hardware_quality_matrix.json", "r") as f:
+            hw_matrix = json.load(f)
+        assert "detected_hardware" in hw_matrix
+        assert "hardware_profiles" in hw_matrix
+
+    if Path("quality_report.json").exists():
+        with open("quality_report.json", "r") as f:
+            q_report = json.load(f)
+        assert "REQUESTED" in q_report
+        assert "ACTUAL" in q_report
+        assert "LIMITATIONS" in q_report

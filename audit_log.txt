@@ -1,0 +1,10 @@
+[*] Auditing Local Environment...
+    Python: 3.12.13
+    PyTorch: 2.13.0+cpu (CUDA: False)
+    Device: cpu (N/A (CPU Only))
+    CPU Cores: 4
+[*] Testing Depth Anything V2 Small model loading...
+Warning: You are sending unauthenticated requests to the HF Hub. Please set a HF_TOKEN to enable higher rate limits and faster downloads.
+Loading weights:   0%|          | 0/287 [00:00<?, ?it/s]Loading weights:  53%|█████▎    | 153/287 [00:00<00:00, 1519.85it/s]Loading weights: 100%|██████████| 287/287 [00:00<00:00, 1756.22it/s]
+[*] Testing SAM 2 Hiera-Tiny model loading...
+[✓] Environment Audit Complete! Document written to docs/PHASE_3_LOCAL_ENVIRONMENT_AUDIT.md

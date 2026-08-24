@@ -7,11 +7,12 @@ torch_cache/
 pip_cache/
 *.egg-info/
 *.png
+*.jpg
+*.jpeg
 *.mp4
 *.pt
 *.bin
 *.safetensors
-hardware_benchmark.json
-reconstruction_comparison.json
-viewpoint_failure.json
-backend_decision.json
+*.json
+!requirements.txt
+test_assets/phase3_dataset/
