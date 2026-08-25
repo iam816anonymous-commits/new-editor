@@ -1,7 +1,3 @@
-"""
-Typed Pipeline Contracts and Dataclasses.
-"""
-
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Dict, Any, List, Optional, Tuple
@@ -51,17 +47,17 @@ class SceneRepresentation:
 @dataclass
 class CameraPose:
     frame_index: int
-    translation: np.ndarray  # [tx, ty, tz]
-    rotation: np.ndarray     # [pitch, yaw, roll] in radians
-    R_matrix: np.ndarray     # 3x3 rotation matrix
+    translation: np.ndarray
+    rotation: np.ndarray
+    R_matrix: np.ndarray
 
 @dataclass
 class CameraTrajectory:
     style: str
     strength: str
     num_frames: int
-    translations: np.ndarray  # (N, 3)
-    rotations: np.ndarray     # (N, 3)
+    translations: np.ndarray
+    rotations: np.ndarray
     magnitude_scale: float
     disparity_ceiling_px: float
 

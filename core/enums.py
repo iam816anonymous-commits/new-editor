@@ -1,7 +1,3 @@
-"""
-Core Enumerations for Renderer Pipeline.
-"""
-
 from enum import Enum
 
 class RenderMode(str, Enum):
