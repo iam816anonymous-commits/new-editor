@@ -17,6 +17,7 @@ from output.artifacts import (
     setup_output_directories,
     save_phase_b_diagnostic_artifacts,
     save_phase_c_diagnostic_artifacts,
+    validate_output_contract,
 )
 from inference.device import get_device
 from inference.model_manager import (
@@ -478,6 +479,9 @@ def run_pipeline(args) -> Dict[str, Any]:
         trans_plan, rot_plan, subject_mask, refined_depth, fx, fy, cx, cy, motion_amplitude=args.motion_amplitude
     )
     Image.fromarray(disp_plot).save(hash_dir / "layer_displacement_curves.png")
+
+    # Enforce Hard Output Contract Validation
+    validate_output_contract(hash_dir, render_video=args.render_video)
 
     t_total = time.time() - t_start_total
     print(f"\n[✓] Render Pipeline completed in {t_total:.2f}s")
