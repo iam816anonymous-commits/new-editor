@@ -58,6 +58,16 @@ def render_full_frame_sequence(
             R_mat, t_vec, fx, fy, cx, cy, layer_motion_map=motion_map
         )
 
+        # Temporal Subject Reprojection & Blending inside subject mask
+        if i > 0 and len(rendered_frames) > 0:
+            prev_rgb = rendered_frames[-1].astype(np.float32)
+            curr_rgb = syn_rgb.astype(np.float32)
+
+            # High confidence inside subject core: 85% current frame + 15% previous frame for zero-flicker stability
+            blended_subj = 0.85 * curr_rgb + 0.15 * prev_rgb
+            syn_rgb = syn_rgb.copy()
+            syn_rgb[subject_mask] = np.clip(blended_subj[subject_mask], 0, 255).astype(np.uint8)
+
         # Save individual frame PNG with 4-digit zero padding
         frame_filename = f"frame_{i:04d}.png"
         frame_path = frames_dir / frame_filename

@@ -1,5 +1,6 @@
 import cv2
 import numpy as np
+from typing import Tuple
 
 def reconstruct_background_rgb(
     rgb_array: np.ndarray,
@@ -99,3 +100,26 @@ def extrapolate_edge_padding(
     kernel = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (pad_size * 2 + 1, pad_size * 2 + 1))
     dilated_edges = cv2.dilate((edge_mask.astype(bool) * 255).astype(np.uint8), kernel) > 0
     return inpaint_hidden_regions(image, dilated_edges, method="telea", radius=pad_size)
+
+
+class PersistentBackgroundCanvas:
+    """
+    Maintains a persistent background plate across frame rendering to eliminate
+    disocclusion inpainting flicker and temporal texture instability.
+    """
+    def __init__(self, initial_bg_rgb: np.ndarray, initial_bg_depth: np.ndarray):
+        self.bg_rgb = initial_bg_rgb.copy()
+        self.bg_depth = initial_bg_depth.copy()
+        self.updated_mask = np.zeros(initial_bg_rgb.shape[:2], dtype=bool)
+
+    def update_canvas(self, new_rgb: np.ndarray, new_depth: np.ndarray, newly_exposed_mask: np.ndarray):
+        """Updates persistent background canvas with newly observed/inpainted pixels."""
+        if not np.any(newly_exposed_mask):
+            return
+        m = newly_exposed_mask.astype(bool)
+        self.bg_rgb[m] = new_rgb[m]
+        self.bg_depth[m] = new_depth[m]
+        self.updated_mask[m] = True
+
+    def get_canvas(self) -> Tuple[np.ndarray, np.ndarray]:
+        return self.bg_rgb, self.bg_depth
