@@ -33,14 +33,24 @@ def validate_output_contract(hash_dir: Path, render_video: bool = False) -> bool
 
     if render_video:
         video_dir = hash_dir / "output_video"
-        cinematic_dir = hash_dir / "cinematic"
-        frames_dir = cinematic_dir / "frames"
-        if not frames_dir.exists() or not any(frames_dir.glob("*.png")):
-            raise OutputContractError(f"Expected frame sequence PNGs missing in: {frames_dir}")
+        has_frames = False
+        for lvl in ["subtle", "cinematic", "strong"]:
+            f_dir = hash_dir / lvl / "frames"
+            if f_dir.exists() and any(f_dir.glob("*.png")):
+                has_frames = True
+                break
 
-        video_files = list(video_dir.glob("*.mp4")) if video_dir.exists() else []
-        cinematic_mp4 = cinematic_dir / "output.mp4"
-        if not video_files and (not cinematic_mp4.exists() or cinematic_mp4.stat().st_size == 0):
+        if not has_frames:
+            raise OutputContractError(f"Expected frame sequence PNGs missing under {hash_dir}")
+
+        video_files = [f for f in video_dir.glob("*.mp4") if f.stat().st_size > 0] if video_dir.exists() else []
+        if not video_files:
+            for lvl in ["subtle", "cinematic", "strong"]:
+                lvl_mp4 = hash_dir / lvl / "output.mp4"
+                if lvl_mp4.exists() and lvl_mp4.stat().st_size > 0:
+                    video_files.append(lvl_mp4)
+
+        if not video_files:
             raise OutputContractError(f"Expected final output MP4 video file missing or empty in {hash_dir}")
 
     return True
