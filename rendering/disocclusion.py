@@ -58,3 +58,44 @@ def compute_provenance_map(dilated_mask: np.ndarray) -> np.ndarray:
     provenance = np.ones(dilated_mask.shape, dtype=np.float32)
     provenance[dilated_mask] = 0.0
     return provenance
+
+
+def inpaint_hidden_regions(
+    image: np.ndarray,
+    mask: np.ndarray,
+    method: str = "telea",
+    radius: int = 5
+) -> np.ndarray:
+    """
+    Pre-animation inpainting of hidden/disoccluded regions prior to camera movement.
+    Supports 'telea' (Fast Marching) and 'ns' (Navier-Stokes).
+    Handles both 3-channel RGB images and single-channel depth/gray arrays.
+    """
+    mask_uint8 = (mask.astype(bool) * 255).astype(np.uint8)
+    inpaint_flag = cv2.INPAINT_NS if method.lower() == "ns" else cv2.INPAINT_TELEA
+
+    if image.ndim == 3 and image.shape[2] == 3:
+        bgr = cv2.cvtColor(image, cv2.COLOR_RGB2BGR)
+        inpainted_bgr = cv2.inpaint(bgr, mask_uint8, inpaintRadius=radius, flags=inpaint_flag)
+        return cv2.cvtColor(inpainted_bgr, cv2.COLOR_BGR2RGB)
+    else:
+        # Single channel (depth map or grayscale)
+        d_min, d_max = float(image.min()), float(image.max())
+        d_span = max(d_max - d_min, 1e-5)
+        norm = ((image - d_min) / d_span * 255.0).astype(np.uint8)
+        inpainted_norm = cv2.inpaint(norm, mask_uint8, inpaintRadius=radius, flags=inpaint_flag)
+        return (d_min + (inpainted_norm.astype(np.float32) / 255.0) * d_span).astype(image.dtype)
+
+
+def extrapolate_edge_padding(
+    image: np.ndarray,
+    edge_mask: np.ndarray,
+    pad_size: int = 15
+) -> np.ndarray:
+    """
+    Extrapolates texture into occlusion edge zones to prevent tearing during camera movement.
+    Dilates the edge mask by pad_size and inpaints using background texture features.
+    """
+    kernel = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (pad_size * 2 + 1, pad_size * 2 + 1))
+    dilated_edges = cv2.dilate((edge_mask.astype(bool) * 255).astype(np.uint8), kernel) > 0
+    return inpaint_hidden_regions(image, dilated_edges, method="telea", radius=pad_size)

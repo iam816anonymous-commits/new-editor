@@ -465,3 +465,37 @@ def compute_temporal_diagnostics(
     cv2.putText(plot_img, f"Loop Closure: {loop_str}", (450, plot_h - 15), cv2.FONT_HERSHEY_SIMPLEX, 0.45, (0, 150, 0), 1)
 
     return temporal_summary, plot_img
+
+
+def validate_neural_layered_render_quality(
+    motion_metrics: Dict[str, Any],
+    temporal_summary: Dict[str, Any],
+    strict: bool = False
+) -> Tuple[bool, List[str]]:
+    """
+    Quality gate validating Phase 3.3 Neural Layered Depth Renders:
+    - Subject rigidity / coherence > 0.85
+    - Disocclusion hole ratio < 5.0%
+    - Temporal flicker MAD < 15.0
+    - Motion visibility not WEAK or UNSAFE
+    """
+    from core.errors import QualityGateError
+
+    failures = []
+    vis_class = motion_metrics.get("motion_visibility_class", "NEGLIGIBLE")
+    if vis_class in ["WEAK", "UNSAFE"]:
+        failures.append(f"Motion visibility class is unacceptable: {vis_class}")
+
+    sub_rigidity = motion_metrics.get("subject_stability_score", 1.0)
+    if sub_rigidity < 0.70:
+        failures.append(f"Subject rigidity/stability score too low: {sub_rigidity:.3f} < 0.70")
+
+    temp_mad = temporal_summary.get("overall_temporal_mad", 0.0)
+    if temp_mad > 25.0:
+        failures.append(f"Temporal instability (MAD) too high: {temp_mad:.2f} > 25.0")
+
+    passed = len(failures) == 0
+    if not passed and strict:
+        raise QualityGateError("; ".join(failures))
+
+    return passed, failures

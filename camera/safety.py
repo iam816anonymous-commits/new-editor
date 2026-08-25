@@ -232,3 +232,21 @@ def plan_safe_motion_trajectory(
     }
 
     return translations, rotations, magnitude_scale, plan_summary
+
+
+def compute_overscan_crop(
+    image_shape: Tuple[int, int],
+    max_disparity_px: float,
+    overscan_margin_factor: float = 1.2
+) -> Tuple[int, int, int, int]:
+    """
+    Computes overscan crop bounding box (crop_y1, crop_x1, crop_y2, crop_x2) to remove
+    unrendered / invalid canvas border regions caused by maximum camera trajectory disparity.
+    """
+    h, w = image_shape[:2]
+    pad = int(np.ceil(max_disparity_px * overscan_margin_factor))
+    crop_y1 = min(pad, h // 4)
+    crop_x1 = min(pad, w // 4)
+    crop_y2 = max(h - pad, h * 3 // 4)
+    crop_x2 = max(w - pad, w * 3 // 4)
+    return crop_y1, crop_x1, crop_y2, crop_x2
