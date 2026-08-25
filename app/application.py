@@ -309,13 +309,21 @@ def run_pipeline(args) -> Dict[str, Any]:
         rendered_frames = m25_res["frames"]
         per_frame_metrics = m25_res.get("per_frame_metrics", [])
 
-    # Encode video
-    output_mp4_path = level_dir / "output.mp4"
+    # Encode video into dedicated output_video/ directory with unique timestamped filename
+    import shutil
+    output_video_dir = hash_dir / "output_video"
+    output_video_dir.mkdir(parents=True, exist_ok=True)
+    timestamp_str = time.strftime("%Y%m%d_%H%M%S")
+    unique_video_name = f"cinematic_{short_hash}_{timestamp_str}.mp4"
+    output_mp4_path = output_video_dir / unique_video_name
+
     video_meta = encode_and_verify_mp4(
         frames_dir, output_mp4_path, fps=24, expected_frames=requested_frame_count,
         expected_resolution=(pil_img.width, pil_img.height)
     )
-    print(f"[✓] MP4 video encoded & verified successfully: {output_mp4_path} ({video_meta['file_size_bytes']} bytes)")
+    # Maintain level_dir / "output.mp4" for backward compatibility
+    shutil.copy2(output_mp4_path, level_dir / "output.mp4")
+    print(f"[✓] MP4 video encoded & verified successfully in output_video/: {output_mp4_path} ({video_meta['file_size_bytes']} bytes)")
 
     # Temporal & visual review diagnostics
     temp_summary, temp_plot = compute_temporal_diagnostics(rendered_frames, subject_mask)
