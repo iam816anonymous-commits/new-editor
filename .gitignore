@@ -1,7 +1,9 @@
 __pycache__/
 *.pyc
 .pytest_cache/
-output/
+output/*
+!output/__init__.py
+!output/*.py
 hf_cache/
 torch_cache/
 pip_cache/
@@ -13,6 +15,5 @@ pip_cache/
 *.pt
 *.bin
 *.safetensors
-*.json
 !requirements.txt
 test_assets/phase3_dataset/
