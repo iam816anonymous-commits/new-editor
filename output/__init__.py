@@ -12,6 +12,7 @@ from .artifacts import (
     save_phase_d_validation_artifacts,
     save_phase_d_diagnostic_artifacts,
     save_phase_e_artifacts,
+    validate_output_contract,
 )
 from .video import verify_video_output
 from .manifests import export_render_manifest
@@ -26,6 +27,7 @@ __all__ = [
     "save_phase_d_validation_artifacts",
     "save_phase_d_diagnostic_artifacts",
     "save_phase_e_artifacts",
+    "validate_output_contract",
     "verify_video_output",
     "export_render_manifest",
 ]

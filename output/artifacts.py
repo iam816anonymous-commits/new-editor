@@ -6,6 +6,44 @@ from pathlib import Path
 from PIL import Image
 from typing import Tuple, Dict, Any, Optional
 from quality.diagnostics import generate_subject_coherence_diagnostics, generate_phase_e_keyframe_contact_sheet
+from core.errors import OutputContractError
+
+def validate_output_contract(hash_dir: Path, render_video: bool = False) -> bool:
+    """
+    Validates that required output directories and diagnostic artifacts exist.
+    Raises OutputContractError if any expected artifact or directory is missing.
+    """
+    if not hash_dir.exists() or not hash_dir.is_dir():
+        raise OutputContractError(f"Output hash directory missing: {hash_dir}")
+
+    required_files = ["metrics.json", "original.png", "depth.png", "subject_mask.png", "confidence_map.png"]
+    for fname in required_files:
+        p = hash_dir / fname
+        if not p.exists() or p.stat().st_size == 0:
+            raise OutputContractError(f"Required output artifact missing or empty: {p}")
+
+    required_dirs = ["debug", "spatial_analysis"]
+    if render_video:
+        required_dirs.extend(["subtle", "cinematic", "strong"])
+
+    for dname in required_dirs:
+        p = hash_dir / dname
+        if not p.exists() or not p.is_dir():
+            raise OutputContractError(f"Required output directory missing: {p}")
+
+    if render_video:
+        video_dir = hash_dir / "output_video"
+        cinematic_dir = hash_dir / "cinematic"
+        frames_dir = cinematic_dir / "frames"
+        if not frames_dir.exists() or not any(frames_dir.glob("*.png")):
+            raise OutputContractError(f"Expected frame sequence PNGs missing in: {frames_dir}")
+
+        video_files = list(video_dir.glob("*.mp4")) if video_dir.exists() else []
+        cinematic_mp4 = cinematic_dir / "output.mp4"
+        if not video_files and (not cinematic_mp4.exists() or cinematic_mp4.stat().st_size == 0):
+            raise OutputContractError(f"Expected final output MP4 video file missing or empty in {hash_dir}")
+
+    return True
 
 def compute_image_sha256(image_path: Path) -> str:
     """Computes SHA-256 hash of the input image file."""
@@ -41,8 +79,12 @@ def setup_output_directories(base_dir: Path, short_hash: str, create_subdirs: bo
     hash_dir = base_dir / short_hash
     hash_dir.mkdir(parents=True, exist_ok=True)
 
+    # Always ensure core diagnostic subdirectories exist
+    (hash_dir / "debug").mkdir(parents=True, exist_ok=True)
+    (hash_dir / "spatial_analysis").mkdir(parents=True, exist_ok=True)
+
     if create_subdirs:
-        for level in ["subtle", "cinematic", "strong", "output_video", "debug", "spatial_analysis"]:
+        for level in ["subtle", "cinematic", "strong", "output_video"]:
             (hash_dir / level).mkdir(parents=True, exist_ok=True)
 
     return hash_dir

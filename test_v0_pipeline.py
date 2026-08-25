@@ -3681,3 +3681,16 @@ def test_phase3_hardware_quality_matrix_schema():
         assert "REQUESTED" in q_report
         assert "ACTUAL" in q_report
         assert "LIMITATIONS" in q_report
+
+
+def test_nonzero_motion_generates_nonzero_trajectory():
+    """Verify that non-zero camera motion requests produce non-zero camera trajectories."""
+    import camera
+    from camera.trajectories import generate_c1_smooth_trajectory
+
+    for style in ["Cinematic Push-In", "Dolly In", "Dolly Out", "Horizontal Pan", "Vertical Pan", "Orbit"]:
+        trans, rots = generate_c1_smooth_trajectory(style, magnitude_scale=1.0, num_frames=24)
+        assert trans.shape == (24, 3)
+        assert rots.shape == (24, 3)
+        max_trans = float(np.max(np.abs(trans)))
+        assert max_trans > 0.0, f"Trajectory for style '{style}' collapsed to zero"
