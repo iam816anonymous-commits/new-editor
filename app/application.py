@@ -133,6 +133,7 @@ def run_pipeline(args) -> Dict[str, Any]:
         motion_style=getattr(args, "motion", "Cinematic Push-In"),
         motion_strength=getattr(args, "strength", "Cinematic")
     )
+    print(f"[✓] Mode Routing Decision: Selected '{selected_mode.upper()}' pipeline")
 
     fx, fy, cx, cy = derive_camera_intrinsics(pil_img.width, pil_img.height)
     requested_frame_count = getattr(args, "frames", 48)
@@ -158,42 +159,43 @@ def run_pipeline(args) -> Dict[str, Any]:
         output_dir=base_output
     )
 
-    if args.render_video:
-        frames_dir = hash_dir / args.strength.lower() / "frames"
-
-        if selected_mode == "3d":
-            # Mode B: Explicit Inferred 3D Scene Pipeline
-            mode_3d = Mode3DPipeline(render_req)
-            m3d_res = mode_3d.execute(rgb_array, refined_depth, subject_mask)
-            rendered_frames = m3d_res["frames"]
-            # Save frames to disk
+    if selected_mode == "3d":
+        print("[*] Executing Mode B (Inferred 3D Scene Pipeline)...")
+        mode_3d = Mode3DPipeline(render_req)
+        m3d_res = mode_3d.execute(rgb_array, refined_depth, subject_mask)
+        rendered_frames = m3d_res["frames"]
+        if args.render_video:
+            frames_dir = hash_dir / args.strength.lower() / "frames"
             frames_dir.mkdir(parents=True, exist_ok=True)
             for i, f_img in enumerate(rendered_frames):
                 Image.fromarray(f_img).save(frames_dir / f"frame_{i:04d}.png")
-        else:
-            # Mode A: 2.5D Parallax Pipeline
-            mode_2_5d = Mode25DPipeline(render_req)
-            m25_res = mode_2_5d.execute(
-                rgb_array=rgb_array,
-                depth_map=refined_depth,
-                subject_mask=subject_mask,
-                bg_plate=background_plate,
-                bg_depth=background_depth,
-                provenance_map=provenance_map,
-                boundary_risk_map=boundary_risk_map,
-                translations=trans_plan,
-                rotations=rot_plan,
-                fx=fx, fy=fy, cx=cx, cy=cy,
-                disparity_ceiling_px=plan_summary["disparity_ceiling_target_px"],
-                frames_dir=frames_dir,
-                spatial_diagnostics=spatial_diagnostics,
-                motion_amplitude=getattr(args, "motion_amplitude", "MEDIUM")
-            )
-            rendered_frames = m25_res["frames"]
-            per_frame_metrics = m25_res.get("per_frame_metrics", [])
-
-        output_mp4_path = hash_dir / args.strength.lower() / "cinematic.mp4"
-        video_meta = encode_and_verify_mp4(frames_dir, output_mp4_path, fps=24, expected_frames=requested_frame_count)
+            output_mp4_path = hash_dir / args.strength.lower() / "cinematic.mp4"
+            video_meta = encode_and_verify_mp4(frames_dir, output_mp4_path, fps=24, expected_frames=requested_frame_count)
+    else:
+        print("[*] Executing Mode A (2.5D Parallax Pipeline)...")
+        mode_2_5d = Mode25DPipeline(render_req)
+        frames_dir = hash_dir / args.strength.lower() / "frames" if args.render_video else hash_dir / "frames"
+        m25_res = mode_2_5d.execute(
+            rgb_array=rgb_array,
+            depth_map=refined_depth,
+            subject_mask=subject_mask,
+            bg_plate=background_plate,
+            bg_depth=background_depth,
+            provenance_map=provenance_map,
+            boundary_risk_map=boundary_risk_map,
+            translations=trans_plan,
+            rotations=rot_plan,
+            fx=fx, fy=fy, cx=cx, cy=cy,
+            disparity_ceiling_px=plan_summary["disparity_ceiling_target_px"],
+            frames_dir=frames_dir,
+            spatial_diagnostics=spatial_diagnostics,
+            motion_amplitude=getattr(args, "motion_amplitude", "MEDIUM")
+        )
+        rendered_frames = m25_res["frames"]
+        per_frame_metrics = m25_res.get("per_frame_metrics", [])
+        if args.render_video:
+            output_mp4_path = hash_dir / args.strength.lower() / "cinematic.mp4"
+            video_meta = encode_and_verify_mp4(frames_dir, output_mp4_path, fps=24, expected_frames=requested_frame_count)
 
     t_total = time.time() - t_start_total
     metrics_json_path = hash_dir / "metrics.json"
