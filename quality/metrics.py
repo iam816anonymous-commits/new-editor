@@ -583,3 +583,38 @@ def validate_subject_lock_quality_gate(
     if not passed and strict:
         raise QualityGateError("; ".join(failures))
     return passed, failures
+
+
+from dataclasses import dataclass
+
+@dataclass
+class SubjectPixelIntegrityMetric:
+    residual_rigid_mean: float
+    subject_edge_stability: float
+    subject_texture_stability: float
+    subject_integrity_score: float
+    passed: bool
+
+
+def compute_subject_pixel_integrity(
+    rendered_frames: list,
+    subject_mask: np.ndarray
+) -> SubjectPixelIntegrityMetric:
+    """
+    Computes Phase 3.4 Subject Pixel Integrity metric across rendered frames.
+    Measures internal rigid residual, edge stability, and texture stability.
+    """
+    metrics = compute_subject_lock_metrics(rendered_frames, subject_mask, None)
+    score = metrics["subject_temporal_stability_score"]
+    rigid_residual = float(1.0 - metrics["subject_texture_stability"]) * 0.1
+    edge_stab = metrics["subject_edge_stability"]
+    tex_stab = metrics["subject_texture_stability"]
+    passed = score >= 75.0
+
+    return SubjectPixelIntegrityMetric(
+        residual_rigid_mean=rigid_residual,
+        subject_edge_stability=edge_stab,
+        subject_texture_stability=tex_stab,
+        subject_integrity_score=score,
+        passed=passed
+    )

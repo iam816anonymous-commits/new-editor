@@ -195,3 +195,24 @@ def render_single_frame_forward_splatting(
 
     syn_rgb = np.clip(syn_rgb, 0.0, 255.0).astype(np.uint8)
     return syn_rgb, rendered_z, output_prov
+
+
+def warp_subject_layer_rigid_subpixel(
+    rgba_subject: np.ndarray,
+    affine_matrix: np.ndarray,
+    output_shape: Tuple[int, int]
+) -> np.ndarray:
+    """
+    Applies a float32 subpixel affine transformation to a subject RGBA layer.
+    Ensures internal subject texture stability without rubber-sheet spatial distortion.
+    """
+    h, w = output_shape
+    warped_rgba = cv2.warpAffine(
+        rgba_subject,
+        affine_matrix[:2, :],
+        (w, h),
+        flags=cv2.INTER_LINEAR,
+        borderMode=cv2.BORDER_CONSTANT,
+        borderValue=(0, 0, 0, 0)
+    )
+    return warped_rgba
