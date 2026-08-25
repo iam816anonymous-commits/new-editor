@@ -1,7 +1,7 @@
 __pycache__/
 *.pyc
 .pytest_cache/
-output/*
+output/**
 !output/__init__.py
 !output/*.py
 hf_cache/

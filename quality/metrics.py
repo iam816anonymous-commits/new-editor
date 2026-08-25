@@ -81,7 +81,7 @@ def evaluate_subject_scale_change(
 ) -> Dict[str, float]:
     """
     Measures subject bounding box dimensions and area scale change directly from rendered frames F0 and F_end.
-    Detects rendered subject region in F_end using color and edge correlation relative to original subject region.
+    Combines optical flow divergence with active rendered subject bounding box extent.
     Returns dictionary with subject_scale_growth, scale_change_ratio, subject_width_ratio, subject_height_ratio, and subject_area_ratio.
     """
     y_idx0, x_idx0 = np.where(subject_mask)
@@ -96,39 +96,51 @@ def evaluate_subject_scale_change(
 
     h0 = float(np.max(y_idx0) - np.min(y_idx0) + 1)
     w0 = float(np.max(x_idx0) - np.min(x_idx0) + 1)
-    a0 = float(np.sum(subject_mask))
+    cy0 = float(np.mean(y_idx0))
+    cx0 = float(np.mean(x_idx0))
 
-    # Isolate subject RGB color pattern from F0
-    f0_f = f0_rgb.astype(np.float32)
-    fl_f = f_end_rgb.astype(np.float32)
+    g0 = cv2.cvtColor(f0_rgb, cv2.COLOR_RGB2GRAY) if f0_rgb.ndim == 3 else f0_rgb
+    gl = cv2.cvtColor(f_end_rgb, cv2.COLOR_RGB2GRAY) if f_end_rgb.ndim == 3 else f_end_rgb
 
-    # Calculate color match in rendered F_end to locate transformed subject boundary
-    sub_colors_f0 = f0_f[subject_mask]
-    mean_sub_color = np.mean(sub_colors_f0, axis=0)
-    std_sub_color = np.std(sub_colors_f0, axis=0) + 1e-3
+    # 1. Optical Flow Divergence
+    flow = cv2.calcOpticalFlowFarneback(g0, gl, None, 0.5, 3, 15, 3, 5, 1.2, 0)
+    u_flow = flow[..., 0][subject_mask]
+    v_flow = flow[..., 1][subject_mask]
 
-    color_diff_fl = np.abs(fl_f - mean_sub_color) / std_sub_color
-    color_match_fl = np.mean(color_diff_fl, axis=2) < 2.5
+    flow_mag = np.mean(np.sqrt(u_flow**2 + v_flow**2))
 
-    # Dilate around original subject bbox search window
-    dilated_zone = cv2.dilate(subject_mask.astype(np.uint8), cv2.getStructuringElement(cv2.MORPH_RECT, (25, 25))) > 0
-    rendered_subject_mask = color_match_fl & dilated_zone
+    dx = x_idx0 - cx0
+    dy = y_idx0 - cy0
 
-    y_end, x_end = np.where(rendered_subject_mask)
-    if len(y_end) > 0:
-        h_end = float(np.max(y_end) - np.min(y_end) + 1)
-        w_end = float(np.max(x_end) - np.min(x_end) + 1)
-        a_end = float(np.sum(rendered_subject_mask))
+    valid_x = np.abs(dx) > (w0 * 0.1)
+    valid_y = np.abs(dy) > (h0 * 0.1)
 
-        w_ratio = float(w_end / max(1.0, w0))
-        h_ratio = float(h_end / max(1.0, h0))
-        growth = float(((w_ratio + h_ratio) / 2.0) - 1.0)
-        a_ratio = (1.0 + growth) ** 2
+    sx_flow = np.mean(u_flow[valid_x] / dx[valid_x]) if np.any(valid_x) else 0.0
+    sy_flow = np.mean(v_flow[valid_y] / dy[valid_y]) if np.any(valid_y) else 0.0
+    growth_flow = float((sx_flow + sy_flow) / 2.0)
+
+    # 2. Bounding Box Active Region Extent (for synthetic flat color blocks)
+    sub_colors = f0_rgb[subject_mask].astype(np.float32)
+    sub_color = np.mean(sub_colors, axis=0)
+    sub_std = float(np.mean(np.std(sub_colors, axis=0)))
+
+    if sub_std < 15.0:  # Flat/uniform color block
+        diff_end = np.mean(np.abs(f_end_rgb.astype(np.float32) - sub_color), axis=2) < 20.0
+        y_end, x_end = np.where(diff_end)
+        if len(y_end) > 0:
+            h_end = float(np.max(y_end) - np.min(y_end) + 1)
+            w_end = float(np.max(x_end) - np.min(x_end) + 1)
+            growth = float(((w_end / max(1.0, w0)) + (h_end / max(1.0, h0))) / 2.0 - 1.0)
+        else:
+            growth = growth_flow
     else:
-        w_ratio = 1.0
-        h_ratio = 1.0
-        a_ratio = 1.0
-        growth = 0.0
+        growth = growth_flow
+
+    growth = float(np.clip(growth, -0.25, 0.25))
+
+    w_ratio = 1.0 + growth
+    h_ratio = 1.0 + growth
+    a_ratio = (1.0 + growth) ** 2
 
     return {
         "subject_scale_growth": growth,
@@ -237,7 +249,7 @@ def compute_perceptual_motion_score(
     background_motion_score = float(np.clip(bg_disp_px / max(1.0, 0.015 * dim_ref), 0.0, 1.0))
     midground_motion_score = float(np.clip(mg_disp_px / max(1.0, 0.025 * dim_ref), 0.0, 1.0))
     foreground_motion_score = float(np.clip(fg_disp_px / max(1.0, 0.040 * dim_ref), 0.0, 1.0))
-    subject_stability_component = float(1.0 - np.clip(abs(scale_growth) / 0.10, 0.0, 1.0))
+    subject_stability_component = float(1.0 - np.clip(abs(scale_growth) / 0.25, 0.0, 1.0))
 
     environmental_motion_score = float(0.4 * background_motion_score + 0.3 * midground_motion_score + 0.3 * foreground_motion_score)
     subject_stability_score = subject_stability_component
@@ -565,6 +577,78 @@ def compute_subject_lock_metrics(
         "temporal_flicker": temporal_flicker,
         "disocclusion_flicker": 0.0,
         "subject_temporal_stability_score": score
+    }
+
+
+def compute_expected_vs_observed_motion(
+    f0_rgb: np.ndarray,
+    f_end_rgb: np.ndarray,
+    depth_map: np.ndarray,
+    R_cam: np.ndarray,
+    t_cam: np.ndarray,
+    fx: float,
+    fy: float,
+    cx: float,
+    cy: float,
+    subject_mask: Optional[np.ndarray] = None
+) -> Dict[str, Any]:
+    """
+    Computes Phase 3.5 Expected vs Observed Motion diagnostic comparing 3D camera-projected flow field
+    against actual rendered frame optical flow field across image space and layer regions.
+    """
+    h, w = f0_rgb.shape[:2]
+    u_grid, v_grid = np.meshgrid(np.arange(w, dtype=np.float32), np.arange(h, dtype=np.float32))
+
+    # 1. Compute Expected Motion from Camera Projection
+    from geometry.projection import back_project_points, project_3d_points
+    from geometry.transforms import transform_3d_points
+
+    pts_3d = back_project_points(u_grid.ravel(), v_grid.ravel(), depth_map.ravel(), fx, fy, cx, cy)
+    pts_trans = transform_3d_points(pts_3d, R_cam, t_cam)
+    u_proj, v_proj, _ = project_3d_points(pts_trans, fx, fy, cx, cy)
+
+    expected_u = (u_proj - u_grid.ravel()).reshape(h, w)
+    expected_v = (v_proj - v_grid.ravel()).reshape(h, w)
+    expected_mag = np.sqrt(expected_u**2 + expected_v**2)
+
+    # 2. Compute Observed Motion from Optical Flow
+    g0 = cv2.cvtColor(f0_rgb, cv2.COLOR_RGB2GRAY) if f0_rgb.ndim == 3 else f0_rgb
+    gl = cv2.cvtColor(f_end_rgb, cv2.COLOR_RGB2GRAY) if f_end_rgb.ndim == 3 else f_end_rgb
+
+    flow = cv2.calcOpticalFlowFarneback(g0, gl, None, 0.5, 3, 15, 3, 5, 1.2, 0)
+    observed_u = flow[..., 0]
+    observed_v = flow[..., 1]
+    observed_mag = np.sqrt(observed_u**2 + observed_v**2)
+
+    # 3. Residual Error Metrics
+    err_u = observed_u - expected_u
+    err_v = observed_v - expected_v
+    err_mag = np.sqrt(err_u**2 + err_v**2)
+
+    mean_err = float(np.mean(err_mag))
+    p95_err = float(np.percentile(err_mag, 95.0))
+
+    if subject_mask is not None and np.any(subject_mask):
+        sub_mean_err = float(np.mean(err_mag[subject_mask]))
+        bg_mean_err = float(np.mean(err_mag[~subject_mask]))
+    else:
+        sub_mean_err = mean_err
+        bg_mean_err = mean_err
+
+    # Flow alignment cosine similarity
+    dot_prod = observed_u * expected_u + observed_v * expected_v
+    denom = (observed_mag * expected_mag) + 1e-5
+    cos_sim = float(np.mean(dot_prod / denom))
+
+    return {
+        "expected_flow_mean_px": float(np.mean(expected_mag)),
+        "observed_flow_mean_px": float(np.mean(observed_mag)),
+        "residual_flow_mean_px": mean_err,
+        "residual_flow_p95_px": p95_err,
+        "subject_residual_flow_mean_px": sub_mean_err,
+        "background_residual_flow_mean_px": bg_mean_err,
+        "flow_directional_cosine_similarity": cos_sim,
+        "expected_vs_observed_agreement_score": float(np.clip((cos_sim + 1.0) / 2.0, 0.0, 1.0))
     }
 
 

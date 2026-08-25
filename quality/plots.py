@@ -417,3 +417,40 @@ def generate_layer_displacement_curve_plot(
     cv2.putText(plot_img, f"FG: {fg_disps[-1]:.1f}px", (380, plot_h - 15), cv2.FONT_HERSHEY_SIMPLEX, 0.45, (0, 0, 255), 1)
 
     return plot_img
+
+
+def create_contact_sheet(
+    images: List[np.ndarray],
+    cols: int = 3,
+    thumb_size: Tuple[int, int] = (240, 240)
+) -> np.ndarray:
+    """
+    Creates a grid contact sheet image from a list of RGB image arrays.
+    """
+    if not images:
+        return np.zeros((thumb_size[1], thumb_size[0], 3), dtype=np.uint8)
+
+    num_imgs = len(images)
+    rows = int(np.ceil(num_imgs / cols))
+    tw, th = thumb_size
+
+    sheet_w = cols * tw
+    sheet_h = rows * th
+    contact_sheet = np.zeros((sheet_h, sheet_w, 3), dtype=np.uint8)
+
+    for i, img in enumerate(images):
+        if img.ndim == 2:
+            img_rgb = cv2.cvtColor(img, cv2.COLOR_GRAY2RGB)
+        else:
+            img_rgb = img
+        resized = cv2.resize(img_rgb, (tw, th), interpolation=cv2.INTER_AREA)
+
+        r = i // cols
+        c = i % cols
+
+        y1, y2 = r * th, (r + 1) * th
+        x1, x2 = c * tw, (c + 1) * tw
+
+        contact_sheet[y1:y2, x1:x2] = resized
+
+    return contact_sheet

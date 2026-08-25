@@ -42,7 +42,7 @@ def generate_c1_smooth_trajectory(
         pass  # All zeros
     elif style_upper in ["SUBTLE_PUSH_IN", "CINEMATIC_PUSH_IN", "CINEMATIC_PUSHIN", "PUSH_IN", "PUSHIN"]:
         # Progressive Push-In: smooth camera travel toward scene with progressive lateral & vertical move
-        translations[:, 2] = -s_quintic * magnitude_scale * 0.35
+        translations[:, 2] = -s_quintic * magnitude_scale * 0.25
         translations[:, 1] = -s_quintic * magnitude_scale * 0.04
         translations[:, 0] = s_quintic * magnitude_scale * 0.08
         rotations[:, 0] = -s_quintic * magnitude_scale * np.radians(0.8)
@@ -72,9 +72,9 @@ def generate_c1_smooth_trajectory(
         rotations[:, 0] = -s_quintic * magnitude_scale * np.radians(0.8)
         rotations[:, 1] = s_quintic * magnitude_scale * np.radians(1.0)
     elif style_upper in ["DOLLY_IN", "DOLLYIN"]:
-        translations[:, 2] = -s_quintic * magnitude_scale * 0.30
+        translations[:, 2] = -s_quintic * magnitude_scale * 0.20
     elif style_upper in ["DOLLY_OUT", "DOLLYOUT"]:
-        translations[:, 2] = s_quintic * magnitude_scale * 0.30
+        translations[:, 2] = s_quintic * magnitude_scale * 0.20
     elif style_upper in ["CONTROL_50PX", "CONTROL_100PX", "CONTROL_200PX", "CONTROL_400PX"]:
         px_targets = {"CONTROL_50PX": 50.0, "CONTROL_100PX": 100.0, "CONTROL_200PX": 200.0, "CONTROL_400PX": 400.0}
         target_shift = px_targets[style_upper] * magnitude_scale

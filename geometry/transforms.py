@@ -77,18 +77,23 @@ def compute_subject_rigid_transform(
     R_cam: np.ndarray,
     t_cam: np.ndarray,
     subject_depth: float,
-    subject_motion_scale: float = 0.35
+    subject_motion_scale: float = 0.75
 ) -> Tuple[np.ndarray, np.ndarray]:
     """
-    Computes a restrained, temporally smooth SE(3) rigid transformation (R_subj, t_subj)
+    Computes a temporally smooth SE(3) rigid transformation (R_subj, t_subj)
     for the primary subject derived from the main camera trajectory.
-    Restrains subject scale expansion and lateral drift while allowing natural 3D parallax.
+    Uncouples internal texture rigidity from global camera movement:
+    - Z-translation (scale growth for push-in/dolly) uses full camera translation (1.0x).
+    - Lateral XY translations use subject_motion_scale (0.75x) to maintain stable focal anchor while enabling strong relative parallax.
     """
-    # Restrain camera translation for primary subject
-    t_subj = t_cam * float(subject_motion_scale)
+    t_subj = t_cam.copy()
+    # Apply 0.75x scale for lateral XY moves while preserving 1.0x Z camera movement for perspective scale change
+    t_subj[0] *= float(subject_motion_scale)
+    t_subj[1] *= float(subject_motion_scale)
+    # Full Z translation for scale expansion
+    t_subj[2] *= 1.0
 
-    # Restrain rotation angles slightly (e.g. 50% of camera rotation)
-    # Using small angle approximation for smooth interpolation
-    R_subj = np.eye(3, dtype=np.float64) + 0.50 * (R_cam - np.eye(3, dtype=np.float64))
+    # Smooth rotation coupling (75% of camera rotation)
+    R_subj = np.eye(3, dtype=np.float64) + 0.75 * (R_cam - np.eye(3, dtype=np.float64))
 
     return R_subj, t_subj
