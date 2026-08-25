@@ -123,3 +123,24 @@ class PersistentBackgroundCanvas:
 
     def get_canvas(self) -> Tuple[np.ndarray, np.ndarray]:
         return self.bg_rgb, self.bg_depth
+
+
+def protect_primary_subject_interior(
+    subject_rgba: np.ndarray,
+    subject_mask: np.ndarray,
+    interior_erosion_size: int = 5
+) -> np.ndarray:
+    """
+    Enforces PRIMARY_SUBJECT_INTERIOR protection invariant.
+    Primary subject interior pixels must never be subjected to background inpainting
+    or disocclusion hole filling.
+    """
+    kernel = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (interior_erosion_size * 2 + 1, interior_erosion_size * 2 + 1))
+    interior_mask = cv2.erode((subject_mask.astype(bool) * 255).astype(np.uint8), kernel) > 0
+
+    protected_rgba = subject_rgba.copy()
+    # Fully opaque alpha inside rigid interior core
+    if protected_rgba.shape[2] == 4:
+        protected_rgba[..., 3][interior_mask] = 255
+
+    return protected_rgba

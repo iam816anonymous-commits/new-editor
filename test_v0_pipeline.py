@@ -3734,3 +3734,42 @@ def test_subject_lock_functionality():
     assert m["subject_temporal_stability_score"] >= 75.0
     passed, _ = validate_subject_lock_quality_gate(m)
     assert passed is True
+
+
+def test_phase3_4_synthetic_regression_suite():
+    """
+    Phase 3.4 Synthetic Regression Suite verifying contracts and invariants:
+    - Bounding Box Contract [x1, y1, x2, y2]
+    - Subpixel Rigid Warp
+    - Subject Interior Protection
+    - Subject Pixel Integrity Metric
+    """
+    from core.contracts import validate_bounding_box_contract
+    from geometry.splatting import warp_subject_layer_rigid_subpixel
+    from rendering.disocclusion import protect_primary_subject_interior
+    from quality.metrics import compute_subject_pixel_integrity
+
+    # 1. Bounding box contract test
+    bbox = validate_bounding_box_contract((10, 20, 100, 200), 320, 320)
+    assert bbox == (10, 20, 100, 200)
+
+    # 2. Subpixel rigid warp
+    rgba = np.zeros((100, 100, 4), dtype=np.uint8)
+    rgba[20:80, 20:80] = [255, 0, 0, 255]
+    aff = np.eye(3, dtype=np.float32)
+    warped = warp_subject_layer_rigid_subpixel(rgba, aff, (100, 100))
+    assert warped.shape == (100, 100, 4)
+    assert np.all(warped[20:80, 20:80, 0] == 255)
+
+    # 3. Primary Subject Interior Protection
+    mask = np.zeros((100, 100), dtype=bool)
+    mask[20:80, 20:80] = True
+    protected = protect_primary_subject_interior(rgba, mask, interior_erosion_size=5)
+    assert protected.shape == (100, 100, 4)
+    assert np.all(protected[30:70, 30:70, 3] == 255)
+
+    # 4. Subject Pixel Integrity Metric
+    frames = [rgba[..., :3], rgba[..., :3].copy()]
+    metric = compute_subject_pixel_integrity(frames, mask)
+    assert metric.passed is True
+    assert metric.subject_integrity_score >= 75.0

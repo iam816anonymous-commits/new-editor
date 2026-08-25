@@ -83,3 +83,20 @@ class RenderResult:
     metrics_json_path: Optional[Path] = None
     frame_count: int = 0
     duration_seconds: float = 0.0
+
+
+def validate_bounding_box_contract(
+    bbox: Tuple[int, int, int, int],
+    width: int,
+    height: int
+) -> Tuple[int, int, int, int]:
+    """
+    Enforces canonical bounding box contract [x1, y1, x2, y2].
+    Requires: 0 <= x1 < x2 <= width and 0 <= y1 < y2 <= height.
+    """
+    x1, y1, x2, y2 = bbox
+    x1 = max(0, min(int(x1), width - 1))
+    y1 = max(0, min(int(y1), height - 1))
+    x2 = max(x1 + 1, min(int(x2), width))
+    y2 = max(y1 + 1, min(int(y2), height))
+    return (x1, y1, x2, y2)
