@@ -3694,3 +3694,43 @@ def test_nonzero_motion_generates_nonzero_trajectory():
         assert rots.shape == (24, 3)
         max_trans = float(np.max(np.abs(trans)))
         assert max_trans > 0.0, f"Trajectory for style '{style}' collapsed to zero"
+
+
+def test_subject_lock_functionality():
+    from modes.mode_2_5d.scene import SubjectAnchor, extract_subject_anchor
+    from geometry.transforms import regularize_subject_depth, compute_subject_rigid_transform
+    from rendering.disocclusion import PersistentBackgroundCanvas
+    from quality.metrics import compute_subject_lock_metrics, validate_subject_lock_quality_gate
+
+    # Synthetic 64x64 mask & depth
+    mask = np.zeros((64, 64), dtype=bool)
+    mask[20:40, 20:40] = True
+    depth = np.full((64, 64), 5.0, dtype=np.float32)
+
+    # 1. Subject Anchor
+    anchor = extract_subject_anchor(mask, depth)
+    assert anchor is not None
+    assert anchor.centroid == (29.5, 29.5)
+
+    # 2. Regularization
+    reg_depth = regularize_subject_depth(depth, mask)
+    assert reg_depth.shape == depth.shape
+
+    # 3. Rigid transform
+    R_cam = np.eye(3, dtype=np.float64)
+    t_cam = np.array([0.1, 0.0, -0.2], dtype=np.float64)
+    R_sub, t_sub = compute_subject_rigid_transform(R_cam, t_cam, 5.0)
+    assert t_sub[0] < t_cam[0]
+
+    # 4. Canvas
+    rgb = np.full((64, 64, 3), 100, dtype=np.uint8)
+    canvas = PersistentBackgroundCanvas(rgb, depth)
+    c_rgb, c_d = canvas.get_canvas()
+    assert c_rgb.shape == (64, 64, 3)
+
+    # 5. Lock Metrics & Gate
+    frames = [rgb, rgb.copy()]
+    m = compute_subject_lock_metrics(frames, mask, depth)
+    assert m["subject_temporal_stability_score"] >= 75.0
+    passed, _ = validate_subject_lock_quality_gate(m)
+    assert passed is True

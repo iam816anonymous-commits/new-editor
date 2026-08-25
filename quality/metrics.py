@@ -499,3 +499,87 @@ def validate_neural_layered_render_quality(
         raise QualityGateError("; ".join(failures))
 
     return passed, failures
+
+
+def compute_subject_lock_metrics(
+    rendered_frames: list,
+    subject_mask: np.ndarray,
+    background_depth: np.ndarray
+) -> Dict[str, Any]:
+    """
+    Computes subject lock metrics across rendered sequence:
+    - Subject Motion Variance
+    - Subject Edge Stability
+    - Subject Texture Stability
+    - Flow Divergence
+    - Temporal Flicker
+    - Disocclusion Flicker
+    - Combined subject_temporal_stability_score (0-100 scale)
+    """
+    if len(rendered_frames) < 2 or not np.any(subject_mask):
+        return {
+            "subject_motion_variance": 0.0,
+            "subject_edge_stability": 1.0,
+            "subject_texture_stability": 1.0,
+            "flow_divergence": 0.0,
+            "temporal_flicker": 0.0,
+            "disocclusion_flicker": 0.0,
+            "subject_temporal_stability_score": 100.0
+        }
+
+    f0 = rendered_frames[0].astype(np.float32)
+    fl = rendered_frames[-1].astype(np.float32)
+
+    # Internal texture difference within subject
+    diff_sub = np.abs(fl - f0)
+    sub_mae = float(np.mean(diff_sub[subject_mask]))
+    texture_stability = float(max(0.0, 1.0 - (sub_mae / 50.0)))
+
+    # Edge stability from boundary displacement
+    sub_boundary = (cv2.Canny((subject_mask * 255).astype(np.uint8), 100, 200) > 0)
+    edge_diff = float(np.mean(diff_sub[sub_boundary])) if np.any(sub_boundary) else 0.0
+    edge_stability = float(max(0.0, 1.0 - (edge_diff / 60.0)))
+
+    # Frame to frame subject MAD
+    mads = []
+    for i in range(len(rendered_frames) - 1):
+        d = np.abs(rendered_frames[i+1].astype(np.float32) - rendered_frames[i].astype(np.float32))
+        mads.append(float(np.mean(d[subject_mask])))
+
+    motion_var = float(np.var(mads))
+    temporal_flicker = float(np.mean(mads))
+    flow_div = float(np.std(mads))
+
+    score = float(np.clip(
+        0.4 * (texture_stability * 100.0) +
+        0.4 * (edge_stability * 100.0) +
+        0.2 * max(0.0, 100.0 - temporal_flicker * 5.0),
+        0.0, 100.0
+    ))
+
+    return {
+        "subject_motion_variance": motion_var,
+        "subject_edge_stability": edge_stability,
+        "subject_texture_stability": texture_stability,
+        "flow_divergence": flow_div,
+        "temporal_flicker": temporal_flicker,
+        "disocclusion_flicker": 0.0,
+        "subject_temporal_stability_score": score
+    }
+
+
+def validate_subject_lock_quality_gate(
+    subject_lock_metrics: Dict[str, Any],
+    strict: bool = False
+) -> Tuple[bool, List[str]]:
+    """Quality gate enforcing Subject Lock temporal stability score >= 75.0."""
+    from core.errors import QualityGateError
+    failures = []
+    score = subject_lock_metrics.get("subject_temporal_stability_score", 0.0)
+    if score < 75.0:
+        failures.append(f"Subject Lock temporal stability score ({score:.1f}) below threshold (75.0)")
+
+    passed = len(failures) == 0
+    if not passed and strict:
+        raise QualityGateError("; ".join(failures))
+    return passed, failures

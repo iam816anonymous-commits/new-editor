@@ -3,8 +3,21 @@
 """
 
 from dataclasses import dataclass, field
-from typing import List, Dict, Any, Optional
+from typing import List, Dict, Any, Optional, Tuple
 import numpy as np
+
+@dataclass
+class SubjectAnchor:
+    """Anchor representation enforcing rigid temporal stability for primary subject."""
+    mask: np.ndarray
+    soft_mask: np.ndarray
+    bounding_box: Tuple[int, int, int, int]  # (ymin, xmin, ymax, xmax)
+    centroid: Tuple[float, float]
+    reference_depth: float
+    scale: float
+    orientation: float
+    confidence: float
+
 
 @dataclass
 class SceneLayer:
@@ -19,6 +32,7 @@ class SceneLayer:
     z_min: float
     z_max: float
     priority: int
+    anchor: Optional[SubjectAnchor] = None
 
 @dataclass
 class LayeredScene:
@@ -109,6 +123,7 @@ def construct_layered_scene(
         subj_depth = depth_map.copy()
         subj_z_min = float(np.min(depth_map[subj_mask_bool]))
         subj_z_max = float(np.max(depth_map[subj_mask_bool]))
+        anchor = extract_subject_anchor(subj_mask_bool, depth_map)
         layers.append(SceneLayer(
             layer_id="primary_subject",
             semantic_role="PRIMARY_SUBJECT",
@@ -119,7 +134,8 @@ def construct_layered_scene(
             inpaint_mask=np.zeros((h, w), dtype=bool),
             z_min=subj_z_min,
             z_max=subj_z_max,
-            priority=1
+            priority=1,
+            anchor=anchor
         ))
 
     return LayeredScene(
@@ -130,4 +146,49 @@ def construct_layered_scene(
         occlusion_edge_map=occlusion_edges,
         convergence_depth=convergence_depth,
         metadata={"layer_count": len(layers)}
+    )
+
+
+def extract_subject_anchor(
+    subject_mask: np.ndarray,
+    depth_map: np.ndarray,
+    confidence_map: Optional[np.ndarray] = None
+) -> Optional[SubjectAnchor]:
+    """Extracts a SubjectAnchor from binary subject mask and depth map."""
+    import cv2
+    subj_bool = subject_mask.astype(bool)
+    if not np.any(subj_bool):
+        return None
+
+    y_indices, x_indices = np.where(subj_bool)
+    ymin, ymax = int(np.min(y_indices)), int(np.max(y_indices))
+    xmin, xmax = int(np.min(x_indices)), int(np.max(x_indices))
+    bbox = (ymin, xmin, ymax, xmax)
+
+    cy = float(np.mean(y_indices))
+    cx = float(np.mean(x_indices))
+    centroid = (cy, cx)
+
+    ref_depth = float(np.median(depth_map[subj_bool]))
+    area = float(np.sum(subj_bool))
+    scale = float(np.sqrt(area))
+    orientation = 0.0
+
+    # Soft mask via distance transform
+    mask_uint8 = (subj_bool * 255).astype(np.uint8)
+    dist = cv2.distanceTransform(mask_uint8, cv2.DIST_L2, 5)
+    max_d = np.max(dist)
+    soft_mask = np.clip(dist / max(max_d, 1.0), 0.0, 1.0).astype(np.float32)
+
+    conf = float(np.mean(confidence_map[subj_bool])) if confidence_map is not None else 1.0
+
+    return SubjectAnchor(
+        mask=subj_bool,
+        soft_mask=soft_mask,
+        bounding_box=bbox,
+        centroid=centroid,
+        reference_depth=ref_depth,
+        scale=scale,
+        orientation=orientation,
+        confidence=conf
     )
