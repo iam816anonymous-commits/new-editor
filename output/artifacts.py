@@ -42,7 +42,7 @@ def setup_output_directories(base_dir: Path, short_hash: str, create_subdirs: bo
     hash_dir.mkdir(parents=True, exist_ok=True)
 
     if create_subdirs:
-        for level in ["subtle", "cinematic", "strong"]:
+        for level in ["subtle", "cinematic", "strong", "output_video", "debug", "spatial_analysis"]:
             (hash_dir / level).mkdir(parents=True, exist_ok=True)
 
     return hash_dir
