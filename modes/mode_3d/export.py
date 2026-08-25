@@ -1,12 +1,6 @@
-"""
-3D Asset Exporter (OBJ, PLY, GLB).
-"""
-
-from render_backend.explicit_3d import export_explicit_3d_assets
+from render_backend.explicit_3d import export_scene_3d_package
 
 class Exporter3D:
-    """Exports 3D mesh and point cloud packages."""
-
     @staticmethod
     def export(rgb_array, depth_map, output_dir):
-        return export_explicit_3d_assets(rgb_array, depth_map, output_dir)
+        return export_scene_3d_package(rgb_array, depth_map, output_dir)
